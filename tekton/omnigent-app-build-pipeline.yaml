@@ -100,8 +100,10 @@ spec:
         steps:
           - name: restart
             image: alpine/k8s:1.31.4
+            # alpine/k8s runs as root by default (unlike bitnami/kubectl,
+            # which docmost's copy of this pattern used and is banned by
+            # this platform's image policy) — no runAsNonRoot here.
             securityContext:
-              runAsNonRoot: true
               allowPrivilegeEscalation: false
               capabilities:
                 drop: ["ALL"]
