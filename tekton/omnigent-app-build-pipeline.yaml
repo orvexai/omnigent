@@ -1,0 +1,121 @@
+---
+# Tekton Pipeline: build the Omnigent server image and roll it out.
+#
+# Dockerfile-based build (deploy/docker/Dockerfile, context = repo root) via
+# the shared buildah-with-args Task. Pushes to the in-cluster Harbor bypass
+# endpoint (repos-direct.*) — the Deployment still pulls through the
+# Cloudflare proxy (repos.eu-central-1.myidp.cloud), same split docmost uses.
+#
+# Built from the "orvex" branch only — that branch carries our own patches on
+# top of upstream and is kept current by a daily merge-from-upstream workflow
+# (see .github/workflows/sync-upstream.yml). main tracks upstream unmodified.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: omnigent-app-build
+  namespace: tekton-pipelines
+  labels:
+    app.kubernetes.io/name: omnigent-app-build-pipeline
+    app.kubernetes.io/component: ci-cd
+    app.kubernetes.io/part-of: omnigent
+spec:
+  description: Build and push the Omnigent server image, then restart its consumers.
+  params:
+    - name: repo-url
+      type: string
+      default: https://github.com/orvexai/omnigent.git
+    - name: revision
+      type: string
+      default: orvex
+    - name: image-registry
+      type: string
+      default: repos-direct.eu-central-1.myidp.cloud
+    - name: image-namespace
+      type: string
+      default: omnigent
+    - name: image-name
+      type: string
+      default: omnigent
+    - name: image-tag
+      type: string
+      default: orvex
+  workspaces:
+    - name: source
+      description: Workspace for the cloned source tree
+    - name: dockerconfig
+      description: Harbor registry credentials (.dockerconfigjson)
+  tasks:
+    - name: clone-repo
+      taskRef:
+        kind: Task
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: source
+      params:
+        - name: url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.revision)
+        - name: deleteExisting
+          value: "true"
+    - name: build-and-push
+      runAfter:
+        - clone-repo
+      taskRef:
+        kind: Task
+        name: buildah-with-args
+      workspaces:
+        - name: source
+          workspace: source
+        - name: dockerconfig
+          workspace: dockerconfig
+      params:
+        - name: IMAGE
+          value: "$(params.image-registry)/$(params.image-namespace)/$(params.image-name):$(params.image-tag)"
+        - name: DOCKERFILE
+          value: "deploy/docker/Dockerfile"
+        - name: CONTEXT
+          value: "."
+        - name: TLS_VERIFY
+          value: "false"
+  finally:
+    # The image is a MOVING tag (:orvex) pulled with imagePullPolicy: Always,
+    # so a rollout restart (patches the pod-template restartedAt annotation)
+    # is sufficient to pick up the freshly-pushed image — no manifest change
+    # required. ArgoCD selfHeal does not revert this because it does not own
+    # the restartedAt annotation.
+    - name: rollout-restart
+      when:
+        - input: $(tasks.build-and-push.status)
+          operator: in
+          values: ["Succeeded"]
+      params:
+        - name: image-tag
+          value: $(params.image-tag)
+      taskSpec:
+        params:
+          - name: image-tag
+            type: string
+        steps:
+          - name: restart
+            image: alpine/k8s:1.31.4
+            securityContext:
+              runAsNonRoot: true
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+            script: |
+              #!/bin/bash
+              set -eu
+              TAG="$(params.image-tag)"
+              case "$TAG" in
+                orvex) TARGETS="omnigent" ;;
+                *)     echo "No rollout targets for tag '$TAG' — skipping"; exit 0 ;;
+              esac
+              rc=0
+              for NS in $TARGETS; do
+                echo "Restarting deployment/omnigent in $NS"
+                kubectl rollout restart deployment/omnigent -n "$NS" || rc=1
+              done
+              exit $rc
