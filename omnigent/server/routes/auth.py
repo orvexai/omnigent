@@ -777,6 +777,43 @@ def _claim_is_verified_true(value: object) -> bool:
     return isinstance(value, str) and value.strip().lower() == "true"
 
 
+def _fetch_jwks_signing_key(jwks_uri: str, id_token: str) -> object | None:
+    """Fetch the signing key for ``id_token`` from ``jwks_uri`` via httpx.
+
+    Deliberately does NOT use ``jwt.PyJWKClient`` — its built-in HTTP
+    fetch uses ``urllib.request``, whose TLS fingerprint Cloudflare's bot
+    protection blocks (403 / error 1010) even though ordinary browser
+    traffic and this codebase's own ``httpx`` calls to the same host are
+    unaffected. Reproduced 2026-08-14: ``httpx.get()`` to the realm's
+    JWKS endpoint succeeds from the same pod where ``PyJWKClient`` fails.
+
+    :param jwks_uri: The IdP's JWKS endpoint URL.
+    :param id_token: The ``id_token`` JWT whose ``kid`` header names the
+        key to use.
+    :returns: A key object usable as the ``key=`` argument to
+        :func:`jwt.decode`, or ``None`` if the token has no recognized
+        ``kid``, the JWKS fetch fails, or no matching key is found.
+    """
+    try:
+        kid = jwt.get_unverified_header(id_token).get("kid")
+    except jwt.InvalidTokenError:
+        return None
+    if not kid:
+        return None
+
+    try:
+        resp = httpx.get(jwks_uri, timeout=10.0)
+        resp.raise_for_status()
+        jwk_set = resp.json()
+    except httpx.HTTPError:
+        return None
+
+    for raw_jwk in jwk_set.get("keys", []):
+        if raw_jwk.get("kid") == kid:
+            return jwt.PyJWK(raw_jwk).key
+    return None
+
+
 def _resolve_oidc_email(
     token_json: dict[str, object],
     config: OIDCConfig,
@@ -822,12 +859,14 @@ def _resolve_oidc_email(
         _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
         return None
 
+    signing_key = _fetch_jwks_signing_key(config.jwks_uri, id_token)
+    if signing_key is None:
+        _logger.warning("Rejecting id_token: could not resolve a JWKS signing key")
+        return None
     try:
-        jwks_client = jwt.PyJWKClient(config.jwks_uri)
-        signing_key = jwks_client.get_signing_key_from_jwt(id_token)
         claims = jwt.decode(
             id_token,
-            signing_key.key,
+            signing_key,
             algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
@@ -923,12 +962,13 @@ def _resolve_oidc_groups(
     if not isinstance(id_token, str) or not id_token or config.jwks_uri is None:
         return frozenset()
 
+    signing_key = _fetch_jwks_signing_key(config.jwks_uri, id_token)
+    if signing_key is None:
+        return frozenset()
     try:
-        jwks_client = jwt.PyJWKClient(config.jwks_uri)
-        signing_key = jwks_client.get_signing_key_from_jwt(id_token)
         claims = jwt.decode(
             id_token,
-            signing_key.key,
+            signing_key,
             algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
