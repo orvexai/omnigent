@@ -345,13 +345,23 @@ def create_auth_router(
             )
 
         # Ensure user exists in the permission store, then apply the
-        # file-backed admin list. Promotion is additive (never demotes)
-        # and is OIDC's only path to admin — the IdP doesn't tell us
-        # who is an operator. ensure_user must run first so the
-        # set_admin UPDATE inside promote_if_listed matches a row.
+        # file-backed admin list plus group-based admin (OMNIGENT_OIDC_
+        # ADMIN_GROUPS). Both are additive (never demote) and are OIDC's
+        # only paths to admin — the IdP doesn't otherwise tell us who is
+        # an operator. ensure_user must run first so the set_admin
+        # UPDATE matches a row.
         if permission_store is not None:
             permission_store.ensure_user(email)
-            promote_if_listed(admin_list, permission_store, email)
+            promoted = promote_if_listed(admin_list, permission_store, email)
+            if not promoted and config.admin_groups and not permission_store.is_admin(email):
+                user_groups = _resolve_oidc_groups(token_json, config)
+                if user_groups & config.admin_groups:
+                    permission_store.set_admin(email, True)
+                    _logger.info(
+                        "oidc_admin_groups: promoted %s to admin via group membership (%s)",
+                        email,
+                        sorted(user_groups & config.admin_groups),
+                    )
 
         # Mint session cookie.
         session_jwt = mint_session_cookie(
@@ -882,6 +892,54 @@ def _resolve_oidc_email(
         return None
 
     return email
+
+
+def _resolve_oidc_groups(
+    token_json: dict[str, object],
+    config: OIDCConfig,
+) -> frozenset[str]:
+    """Extract the ``groups`` claim from the OIDC ``id_token``, lowercased.
+
+    Used only for :attr:`OIDCConfig.admin_groups` promotion — a
+    separate, best-effort read of the same token
+    :func:`_resolve_oidc_email` already validated. Decoded independently
+    (rather than threading claims through the return value) to keep
+    the well-exercised email path untouched.
+
+    :param token_json: The token endpoint response JSON containing
+        ``id_token``.
+    :param config: The OIDC configuration with JWKS URI and expected
+        issuer/audience.
+    :returns: Lowercased group names from the ``groups`` claim, or an
+        empty set if the token is missing/invalid, unsigned, or the
+        claim is absent. Never raises — group admin is an additive
+        bonus, not an auth gate, so a decode failure here must not
+        break login (the email path already validated the token once).
+    """
+    if not config.admin_groups:
+        return frozenset()
+
+    id_token = token_json.get("id_token")
+    if not isinstance(id_token, str) or not id_token or config.jwks_uri is None:
+        return frozenset()
+
+    try:
+        jwks_client = jwt.PyJWKClient(config.jwks_uri)
+        signing_key = jwks_client.get_signing_key_from_jwt(id_token)
+        claims = jwt.decode(
+            id_token,
+            signing_key.key,
+            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+            audience=config.client_id,
+            issuer=config.issuer,
+        )
+    except jwt.InvalidTokenError:
+        return frozenset()
+
+    groups = claims.get("groups")
+    if not isinstance(groups, list):
+        return frozenset()
+    return frozenset(g.strip().lower() for g in groups if isinstance(g, str) and g.strip())
 
 
 def _json_object(value: object) -> dict[str, object] | None:
