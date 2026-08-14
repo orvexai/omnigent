@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: runners
     steps:
       - name: Checkout orvex
         uses: actions/checkout@v4
