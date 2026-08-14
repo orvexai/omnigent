@@ -22,7 +22,7 @@ permissions:
 jobs:
   gate:
     name: Security Gate
-    runs-on: ubuntu-latest
+    runs-on: runners
     timeout-minutes: 12
     steps:
       - name: Check out trust check from main
