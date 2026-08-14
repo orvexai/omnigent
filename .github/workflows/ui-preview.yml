@@ -42,7 +42,7 @@ jobs:
       && contains(github.event.pull_request.labels.*.name, 'ui-preview')
       && github.event.pull_request.draft == false
       && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     permissions:
       pull-requests: write
     timeout-minutes: 5
@@ -83,7 +83,7 @@ jobs:
         && github.event.pull_request.draft == false
         && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
       )
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     permissions:
       contents: read
     timeout-minutes: 30
@@ -197,9 +197,9 @@ jobs:
 
   deploy:
     needs: build
-    # Use ubuntu-latest. If the Databricks workspace IP-allowlists, register a
+    # Use the public-runners pool. If the Databricks workspace IP-allowlists, register a
     # static-IP runner and switch `runs-on` to it.
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     permissions:
       pull-requests: write
     timeout-minutes: 30
@@ -364,7 +364,7 @@ jobs:
     if: >-
       github.event_name != 'push'
       && github.event.action == 'closed'
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     permissions:
       pull-requests: write
     timeout-minutes: 10

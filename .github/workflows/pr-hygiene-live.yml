@@ -31,7 +31,7 @@ concurrency:
 jobs:
   hygiene:
     if: github.repository == 'omnigent-ai/omnigent' && !github.event.pull_request.draft
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 5
     permissions:
       # Job-level permissions REPLACE the workflow-level block, so restate read.

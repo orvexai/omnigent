@@ -242,7 +242,7 @@ jobs:
     name: Pytest (stores-postgres)
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: public-runners
+    runs-on: public-dind-runners
     timeout-minutes: 30
     services:
       postgres:
@@ -288,7 +288,7 @@ jobs:
     name: Pytest (stores-mysql)
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: public-runners
+    runs-on: public-dind-runners
     timeout-minutes: 30
     services:
       mysql:

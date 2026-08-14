@@ -30,7 +30,7 @@ permissions:
 jobs:
   build:
     name: Build unsigned AAB
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     defaults:
       run:
         working-directory: web/android

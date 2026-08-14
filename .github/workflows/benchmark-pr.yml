@@ -35,7 +35,7 @@ jobs:
   benchmark-pr:
     name: Benchmark regression check (sqlite)
     if: github.repository == 'omnigent-ai/omnigent' && !github.event.pull_request.draft
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 40
 
     steps:
