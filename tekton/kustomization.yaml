@@ -1,0 +1,25 @@
+---
+# CI resources for the omnigent-app-build pipeline, deployed into
+# tekton-pipelines.
+#
+# This repo's default branch (main) tracks upstream unmodified, and our own
+# changes + this tekton/ directory live only on the `orvex` branch — so the
+# platform's default-branch-only CI ApplicationSet (ci-appset in
+# my-idp-apps) can't auto-discover it (same situation as orvexai/teleport's
+# `dev` branch). Instead there's a dedicated Application,
+# my-idp-apps/applications/eu-central-1/omnigent-ci.yaml, pointed at this
+# path on targetRevision: orvex.
+#
+# Deliberately NOT included (shared platform/CI infra already owned by other
+# Applications — re-declaring them would cause ArgoCD SharedResourceWarnings):
+#   - git-clone / buildah-with-args Tasks   (platform tekton install)
+#   - tekton-smoke-test-builder SA, tekton-harbor-credentials, github-webhook-secret
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: tekton-pipelines
+
+resources:
+  - rollout-rbac.yaml
+  - omnigent-app-build-pipeline.yaml
+  - trigger.yaml

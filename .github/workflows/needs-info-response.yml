@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   clear-needs-info:
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     outputs:
       removed: ${{ steps.remove-label.outputs.removed }}
     # Only when a NON-bot commenter who IS the issue author comments on an OPEN

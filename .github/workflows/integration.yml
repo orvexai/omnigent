@@ -49,7 +49,7 @@ jobs:
   setup:
     name: setup
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -76,7 +76,7 @@ jobs:
     # leg runs (and thus no skipped placeholder check). Fork PRs DO run (mock
     # LLM, no secrets) -- same as ci.yml.
     needs: setup
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     # Per-leg ceiling; inner test step caps at 25 min, rest covers install +
     # junit upload. Legs run in parallel; longest gates wall-time.
     timeout-minutes: 30

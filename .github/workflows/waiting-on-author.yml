@@ -30,7 +30,7 @@ concurrency:
 jobs:
   hygiene:
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 10
     permissions:
       contents: read
