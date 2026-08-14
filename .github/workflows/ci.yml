@@ -44,7 +44,7 @@ jobs:
     name: Pytest (${{ matrix.group }})
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: runners
+    runs-on: public-runners
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -242,7 +242,7 @@ jobs:
     name: Pytest (stores-postgres)
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: runners
+    runs-on: public-runners
     timeout-minutes: 30
     services:
       postgres:
@@ -288,7 +288,7 @@ jobs:
     name: Pytest (stores-mysql)
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: runners
+    runs-on: public-runners
     timeout-minutes: 30
     services:
       mysql:
@@ -336,7 +336,7 @@ jobs:
     name: Pytest (codex-parity)
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: runners
+    runs-on: public-runners
     timeout-minutes: 30
     steps:
       - name: Check out repo
@@ -433,7 +433,7 @@ jobs:
     # and a red run gets re-run anyway, re-triggering this.
     needs: pytest
     if: ${{ success() && !github.event.pull_request.draft }}
-    runs-on: runners
+    runs-on: public-runners
     timeout-minutes: 10
     steps:
       - name: Check out repo

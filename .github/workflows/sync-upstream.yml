@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   sync:
-    runs-on: runners
+    runs-on: public-runners
     steps:
       - name: Checkout orvex
         uses: actions/checkout@v4
