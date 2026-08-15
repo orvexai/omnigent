@@ -176,6 +176,25 @@ def test_get_info_description_does_not_promise_stall_detection() -> None:
     assert "does not advance during a single long tool call" in description
 
 
+def test_send_schema_description_is_async_in_both_modes() -> None:
+    """
+    Neither ``sys_session_send`` description promises the child's output.
+
+    The schema carries TWO descriptions: the full named-mode text when
+    the agent declares sub-agents, and a separate session_id-only text
+    when it declares none. The session_id-only branch is what an MCP
+    caller with no declared sub-agents actually reads, so fixing only
+    the other one leaves the wrong contract on the live surface.
+    """
+    from omnigent.tools.builtins.spawn import _build_sys_session_send_schema
+
+    named = {"claude": AgentSpec(spec_version=1, name="claude", description="Review helper.")}
+    for sub_specs, mode in (({}, "session_id-only"), (named, "named")):
+        description = _build_sys_session_send_schema(sub_specs)["function"]["description"]
+        assert "Returns the child's output" not in description, mode
+        assert "sys_read_inbox" in description, mode
+
+
 def test_send_description_documents_the_async_handle_contract() -> None:
     """
     ``sys_session_send``'s description must not promise the child's output.
