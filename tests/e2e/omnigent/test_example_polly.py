@@ -402,8 +402,8 @@ def test_subagent_cancellation_guidance_present() -> None:
 def test_orchestrator_guardrails(polly_spec: AgentSpec) -> None:
     """
     The orchestrator carries the spawn bound, the headless-purpose guard, and
-    the blast-radius gate. ``spawn_bounds`` counts the sub-agent dispatch tool
-    (``sys_session_send``) or fan-out is unbounded.
+    the blast-radius gate. ``spawn_bounds`` bounds the fan-out, counting both
+    dispatch tools by default, or fan-out is unbounded.
     """
     assert polly_spec.guardrails is not None
     names = sorted(p.name for p in polly_spec.guardrails.policies)
@@ -413,9 +413,10 @@ def test_orchestrator_guardrails(polly_spec: AgentSpec) -> None:
         "spawn_bounds",
     ]
     spawn = next(p for p in polly_spec.guardrails.policies if p.name == "spawn_bounds")
-    dispatch_tools = spawn.function.arguments.get("dispatch_tools")
-    assert dispatch_tools is not None
-    assert "sys_session_send" in dispatch_tools  # sub-agent sends are bounded
+    assert spawn.function.arguments.get("max_dispatches_per_turn") == 6
+    # The config leaves dispatch_tools unset so it inherits the policy default,
+    # which counts sys_session_send AND sys_session_create.
+    assert spawn.function.arguments.get("dispatch_tools") is None
 
 
 def test_subagent_guardrails(polly_spec: AgentSpec) -> None:

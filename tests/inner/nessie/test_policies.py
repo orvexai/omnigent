@@ -288,6 +288,37 @@ def test_spawn_bounds_caps_then_resets_per_turn() -> None:
     assert _result(evaluate(send)) == "ALLOW"  # counter cleared at turn boundary
 
 
+def test_spawn_bounds_counts_session_create_by_default() -> None:
+    """
+    ``sys_session_create`` consumes the per-turn budget without opt-in.
+
+    Create is the other way to launch a worker, so counting only sends
+    leaves the cap trivially bypassable by an agent that creates
+    self-defined children instead — and every in-tree consumer had to add
+    it to ``dispatch_tools`` by hand to close that hole.
+    """
+    evaluate = spawn_bounds(max_dispatches_per_turn=2)
+    create = _tool_call("sys_session_create", agent_id="ag_abc", message="go")
+
+    assert _result(evaluate(create)) == "ALLOW"
+    assert _result(evaluate(create)) == "ALLOW"
+    assert _result(evaluate(create)) == "DENY"
+
+
+def test_spawn_bounds_counts_both_dispatch_paths_against_one_budget() -> None:
+    """
+    Sends and creates share the budget rather than each getting their own.
+
+    Two independent counters would let an agent dispatch double the cap by
+    alternating between the two tools.
+    """
+    evaluate = spawn_bounds(max_dispatches_per_turn=2)
+
+    assert _result(evaluate(_tool_call("sys_session_send", agent="impl"))) == "ALLOW"
+    assert _result(evaluate(_tool_call("sys_session_create", agent_id="ag_abc"))) == "ALLOW"
+    assert _result(evaluate(_tool_call("sys_session_send", agent="impl"))) == "DENY"
+
+
 def test_spawn_bounds_only_counts_dispatches() -> None:
     """
     Only ``sys_session_send`` calls consume the per-turn budget; other tool

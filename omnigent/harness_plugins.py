@@ -333,6 +333,11 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        # Live-verified (n=2): a message sent during a long tool call lands
+        # only after that call completes — input is injected at a turn
+        # boundary, so it queues rather than redirecting the active turn.
+        steering=False,
+        live_queue=True,
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
@@ -347,6 +352,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        # Live-verified (n=2): a message sent during a long tool call
+        # abandons that call and redirects the turn — the transcript
+        # carries no output for the abandoned call.
+        steering=True,
         fork_history=_FH.REBUILD,
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,

@@ -20,8 +20,9 @@ from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
-    CLOSED_TITLE_INFIX,
     is_session_closed,
+    title_without_closed_marker,
+    tombstoned_title,
 )
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
@@ -46,11 +47,6 @@ _ACTIVITY_MAX_CHARS = 2000
 # letting the LLM request a substantial slice for triage.
 _HISTORY_DEFAULT_TAIL = 10
 _HISTORY_MAX_TAIL = 50
-
-# sys_session_close still rewrites the stored title internally to free
-# the DB's ``(parent_conversation_id, title)`` unique slot. API display
-# paths strip this marker and expose ``omnigent.closed=true`` instead.
-_CLOSED_TITLE_INFIX = CLOSED_TITLE_INFIX
 
 
 class SysSessionSendTool(Tool):
@@ -80,9 +76,12 @@ class SysSessionSendTool(Tool):
     Returns a JSON handle in the same shape as
     :class:`omnigent.runtime.workflow._AsyncToolHandle`:
     ``{task_id, kind: "sub_agent", agent, title, conversation_id,
-    status, message}``. The result auto-delivers via the unified
-    ``async_work_complete`` topic; the LLM can abort with
-    ``sys_cancel_task`` if it wants to stop early.
+    work_id, status, message}``. ``task_id`` / ``conversation_id`` are
+    the child's session id and repeat across every send to it;
+    ``work_id`` identifies this dispatch and is echoed on the inbox
+    result, so a reply can be matched to the request that caused it.
+    The result auto-delivers via the unified ``async_work_complete``
+    topic; the LLM can abort with ``sys_cancel_task`` to stop early.
 
     Errors:
 
@@ -125,7 +124,10 @@ class SysSessionSendTool(Tool):
             "session you created (e.g. via sys_session_create) — this "
             "is confined to your direct children. Provide exactly one "
             "of (agent + title) or session_id, always with args. "
-            "Returns the child's output when its turn completes. To run "
+            "Returns a handle immediately, not the child's output: the "
+            "turn runs asynchronously and its result is delivered to "
+            "your inbox — poll sys_read_inbox to collect it, or "
+            "sys_cancel_task to interrupt. To run "
             "multiple sessions in parallel, emit multiple "
             "sys_session_send tool_calls in the same response with a "
             "distinct task-based title for each independent session — "
@@ -600,11 +602,12 @@ class SysSessionGetInfoTool(Tool):
     status, title, agent binding (id + name), runner binding and live
     connectivity, host, reasoning effort, effective model, parent
     linkage, workspace / git branch, persisted last-activity time, and
-    the count of outstanding approval prompts. Comparing
-    ``last_activity_at`` across polls distinguishes a running session that
-    is advancing from one whose persisted output has stalled. For the
-    conversation transcript, use
-    ``sys_session_get_history`` instead.
+    the count of outstanding approval prompts. ``last_activity_at``
+    stamps the last *persisted conversation item*, so it stands still
+    for the whole of a single long-running tool call — an unchanged
+    value across polls is not on its own evidence of a stall, and must
+    be read together with ``status`` and ``runner_online``. For the
+    conversation transcript, use ``sys_session_get_history`` instead.
 
     ``session_id`` is optional — when omitted, the caller's own
     session is described.
@@ -627,9 +630,18 @@ class SysSessionGetInfoTool(Tool):
         return (
             "Return a session's metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
-            "host, reasoning effort, model, parent session, workspace, "
-            "persisted last-activity time, and outstanding approval "
-            "prompts. Global read — any "
+            "host, reasoning effort, model, parent session, workspace "
+            "(a child with no placement of its own reports the tree "
+            "root's, flagged by placement_inherited), "
+            "last-activity time (the last persisted conversation item — "
+            "it does not advance during a single long tool call, so do "
+            "not read an unchanged value as a stall on its own), and "
+            "outstanding approval prompts. Also returns "
+            "supports_midturn_steer: true when a message sent to this "
+            "session mid-turn redirects the running turn, false when it "
+            "waits for the turn to finish, null when unknown — check it "
+            "before counting on a correction landing promptly. "
+            "Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "
             "use sys_session_get_history for the conversation transcript."
@@ -858,7 +870,10 @@ class SysSessionCreateTool(Tool):
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
             "message. The new session is always a child of the calling "
-            "session (you cannot create top-level or sibling sessions). "
+            "session (you cannot create top-level or sibling sessions), "
+            "but it need not run on your machine: pass host_id (with "
+            "workspace) to place it on another host, or omit both to "
+            "co-locate it with you. "
             "Returns {conversation_id, agent_id, title, status}; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
@@ -931,6 +946,22 @@ class SysSessionCreateTool(Tool):
                                 "or 'provider-local-model-id'. Sets the harness "
                                 "model at session creation; omit to use the "
                                 "agent's default."
+                            ),
+                        },
+                        "host_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional host that should run the child, "
+                                "e.g. 'host_a1b2c3d4'. Omit to co-locate it "
+                                "with you (the default). Requires workspace."
+                            ),
+                        },
+                        "workspace": {
+                            "type": "string",
+                            "description": (
+                                "Absolute path on the chosen host where the "
+                                "child should start, e.g. '/srv/work/repo'. "
+                                "Required when host_id is set."
                             ),
                         },
                     },
@@ -1090,12 +1121,14 @@ class _AgentTitle:
     Decomposed sub-agent identity recovered from a conversation title.
 
     :param agent: Sub-agent name (the part before the first ``":"`` in
-        the stored title), e.g. ``"researcher"``.
+        the stored title), e.g. ``"researcher"``; ``None`` when the
+        title carries no ``":"``.
     :param title: LLM-facing session title with any tombstone marker
-        stripped, e.g. ``"draft-1"``.
+        stripped, e.g. ``"draft-1"``. Carries the whole title when
+        ``agent`` is ``None``.
     """
 
-    agent: str
+    agent: str | None
     title: str
 
 
@@ -1123,24 +1156,19 @@ def _agent_title_from_conversation(child: Conversation) -> _AgentTitle:
     ``"<agent>:<title>:closed:<conv_id>"`` when closed). Both forms
     split on the first ``":"`` to recover the LLM-facing components.
 
-    :param child: The child :class:`Conversation`. Must have a
-        non-empty title containing at least one ``":"``.
+    The convention is not an invariant: ``sys_session_create`` accepts a
+    free-form ``title``, so a genuine sub-agent can be colon-less. Those
+    degrade to ``agent=None`` with the whole title preserved rather than
+    failing the caller.
+
+    :param child: The child :class:`Conversation`.
     :returns: An :class:`_AgentTitle` with the closed marker stripped
-        from the title side when present.
-    :raises RuntimeError: If the title is missing or doesn't contain
-        a ``":"`` separator — both indicate a framework invariant
-        broken upstream (sub-agent conversations are always created
-        with ``"<agent>:<title>"``). Failing loud here surfaces the
-        bug at its source instead of letting empty fields propagate
-        into JSON results and rebuilt tombstone titles.
+        before the split, so a tombstoned colon-less title round-trips.
     """
-    if not child.title or ":" not in child.title:
-        raise RuntimeError(
-            f"sub-agent conversation {child.id!r} has malformed title "
-            f"{child.title!r} — expected '<agent>:<title>' format"
-        )
-    sa_agent, _, remainder = child.title.partition(":")
-    sa_title, _, _closed_marker = remainder.partition(_CLOSED_TITLE_INFIX)
+    stripped = title_without_closed_marker(child.title) or ""
+    if ":" not in stripped:
+        return _AgentTitle(agent=None, title=stripped)
+    sa_agent, _, sa_title = stripped.partition(":")
     return _AgentTitle(agent=sa_agent, title=sa_title)
 
 
@@ -1239,11 +1267,9 @@ def _resolve_session_call(
             }
         )
     if target.parent_conversation_id is None:
-        # Top-level conversations don't carry the
-        # ``<agent>:<title>`` invariant on ``title`` that
-        # downstream :func:`_agent_title_from_conversation`
-        # depends on. Refuse here with a typed error rather
-        # than letting the title parse blow up.
+        # Peek/close operate on sub-agents only, so a session
+        # with no parent is refused with a typed error — this
+        # is the gate, not the title's shape.
         return json.dumps(
             {
                 "error": "session_not_a_sub_agent",
@@ -1328,9 +1354,11 @@ class SysSessionGetHistoryTool(Tool):
     tool results, and message text, each truncated to
     ``_ACTIVITY_MAX_CHARS``.
 
-    Returns ``session_not_found`` when the conversation_id does
-    not exist, ``session_out_of_tree`` when the server denies the read
-    (in-process: a different spawn tree).
+    Returns ``session_not_found`` when the conversation_id does not
+    exist, ``access_denied`` when the server refuses the read, and
+    ``session_out_of_tree`` on the in-process path when the target
+    belongs to a different spawn tree. The two are distinct outcomes:
+    one is an ACL decision, the other a tree violation.
     """
 
     @classmethod
@@ -1349,7 +1377,7 @@ class SysSessionGetHistoryTool(Tool):
             "tail of conversation items (assistant/user messages, tool "
             "calls, tool results) in chronological order. Returns "
             "session_not_found if conversation_id is unknown, or "
-            "session_out_of_tree if the server denies read access."
+            "access_denied if the server refuses the read."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -1552,10 +1580,9 @@ class SysSessionCloseTool(Tool):
         if busy_error is not None:
             return busy_error
         labelled = _agent_title_from_conversation(resolution.child)
-        # Re-build the tombstoned title from the parsed components so
-        # the marker lands in the canonical position even if the
-        # original title used uncommon characters around the colon.
-        new_title = f"{labelled.agent}:{labelled.title}{_CLOSED_TITLE_INFIX}{resolution.child.id}"
+        # Tombstone the stored title itself, so a child whose title is
+        # free-form (or absent) still frees its unique slot on close.
+        new_title = tombstoned_title(resolution.child.title, resolution.child.id)
         resolution.conv_store.update_conversation(resolution.child.id, title=new_title)
         resolution.conv_store.set_labels(
             resolution.child.id,

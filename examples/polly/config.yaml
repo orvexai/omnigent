@@ -356,11 +356,9 @@ guardrails:
       function:
         path: omnigent.inner.nessie.policies.spawn_bounds
         arguments:
+          # With spawn: true polly can launch self-defined children, so both
+          # dispatch tools must count — that is the policy's default.
           max_dispatches_per_turn: 6
-          # sys_session_create counts too: with spawn: true polly can
-          # launch self-defined children, and an uncounted create would
-          # bypass the per-turn fan-out cap.
-          dispatch_tools: [sys_session_send, sys_session_create]
     headless_subagent_purpose_guard:
       type: function
       function:

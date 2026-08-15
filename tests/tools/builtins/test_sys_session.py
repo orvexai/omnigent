@@ -21,18 +21,22 @@ import pytest
 
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import pending_elicitations
-from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from omnigent.session_lifecycle import (
+    CLOSED_LABEL_KEY,
+    CLOSED_LABEL_VALUE,
+    CLOSED_TITLE_INFIX,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins.spawn import (
-    _CLOSED_TITLE_INFIX,
     _HISTORY_DEFAULT_TAIL,
     _HISTORY_MAX_TAIL,
     SysSessionCloseTool,
     SysSessionGetHistoryTool,
+    SysSessionGetInfoTool,
     SysSessionListTool,
     SysSessionSendTool,
 )
@@ -156,6 +160,34 @@ def session_fixture(
 
 
 # ── Schema tests ──────────────────────────────────────────
+
+
+def test_get_info_description_does_not_promise_stall_detection() -> None:
+    """
+    ``sys_session_get_info`` must not sell ``last_activity_at`` as a stall signal.
+
+    It stamps the last persisted conversation item, so it stands still
+    for the duration of one long tool call. An orchestrator told it
+    detects a non-advancing session will kill healthy work.
+    """
+    description = SysSessionGetInfoTool.description()
+
+    assert "last persisted conversation item" in description
+    assert "does not advance during a single long tool call" in description
+
+
+def test_send_description_documents_the_async_handle_contract() -> None:
+    """
+    ``sys_session_send``'s description must not promise the child's output.
+
+    The call returns a launching handle and the result arrives later in
+    the inbox. A description promising output makes a calling model wait
+    on, or misread, a handle it already has.
+    """
+    description = SysSessionSendTool.description()
+
+    assert "Returns the child's output when its turn completes" not in description
+    assert "sys_read_inbox" in description
 
 
 def test_send_schema_advertises_plain_string_and_purpose_object_args() -> None:
@@ -661,7 +693,7 @@ def test_close_top_level_conversation_in_tree_is_rejected(
         session_fixture.parent_conv_id,
     )
     assert parent_after is not None
-    assert _CLOSED_TITLE_INFIX not in (parent_after.title or "")
+    assert CLOSED_TITLE_INFIX not in (parent_after.title or "")
 
 
 # ── Close invoke tests ────────────────────────────────────
@@ -700,7 +732,7 @@ def test_close_marks_closed_and_tombstones_internal_title(session_fixture: _Fixt
         limit=100,
     )
     titles = [c.title for c in children.data]
-    expected = f"researcher:auth{_CLOSED_TITLE_INFIX}{session_fixture.child_conv_id}"
+    expected = f"researcher:auth{CLOSED_TITLE_INFIX}{session_fixture.child_conv_id}"
     assert expected in titles, (
         f"expected title {expected!r} in {titles!r} — close did not "
         "rewrite the child's title with the conv_id suffix."
@@ -711,6 +743,61 @@ def test_close_marks_closed_and_tombstones_internal_title(session_fixture: _Fixt
     refreshed = session_fixture.conv_store.get_conversation(session_fixture.child_conv_id)
     assert refreshed is not None
     assert refreshed.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+
+
+def test_close_tombstones_child_with_free_form_title(session_fixture: _Fixture) -> None:
+    """
+    A child whose title carries no ``":"`` still closes.
+
+    ``sys_session_create`` takes an arbitrary ``title``, so a genuine
+    sub-agent can be titled ``"my-worker"``. Close must gate on the
+    parent relationship, not the title's shape — otherwise such a
+    session can never be cleaned up.
+    """
+    child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="my-worker",
+        parent_conversation_id=session_fixture.parent_conv_id,
+    )
+    payload = json.loads(
+        SysSessionCloseTool().invoke(
+            json.dumps({"conversation_id": child.id}),
+            session_fixture.ctx,
+        )
+    )
+    assert payload == {
+        "closed": True,
+        "conversation_id": child.id,
+        "agent": None,
+        "title": "my-worker",
+    }
+    refreshed = session_fixture.conv_store.get_conversation(child.id)
+    assert refreshed is not None
+    assert refreshed.title == f"my-worker{CLOSED_TITLE_INFIX}{child.id}"
+    assert refreshed.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+
+
+def test_peek_child_with_free_form_title_returns_items(session_fixture: _Fixture) -> None:
+    """
+    Peek on a colon-less sub-agent returns its transcript.
+
+    The title split used to fail loud on this shape, so peeking a
+    ``sys_session_create`` child raised instead of answering.
+    """
+    child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="my-worker",
+        parent_conversation_id=session_fixture.parent_conv_id,
+    )
+    payload = json.loads(
+        SysSessionGetHistoryTool().invoke(
+            json.dumps({"conversation_id": child.id}),
+            session_fixture.ctx,
+        )
+    )
+    assert "error" not in payload
+    assert payload["agent"] is None
+    assert payload["title"] == "my-worker"
 
 
 def test_close_then_peek_by_id_still_resolves_tombstoned_row(
@@ -742,7 +829,7 @@ def test_close_then_peek_by_id_still_resolves_tombstoned_row(
     assert "error" not in payload
     # The agent/title fields come from the post-tombstone title
     # (``"researcher:auth:closed:<id>"``); the helper splits at
-    # ``_CLOSED_TITLE_INFIX`` so the bare ``"auth"`` is recovered.
+    # ``CLOSED_TITLE_INFIX`` so the bare ``"auth"`` is recovered.
     assert payload["agent"] == "researcher"
     assert payload["title"] == "auth"
 
