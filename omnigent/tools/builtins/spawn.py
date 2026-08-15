@@ -249,10 +249,16 @@ def _build_sys_session_send_schema(
             "conversation, visible in the session tree) — not your "
             "harness's built-in subagent/Task tool, which remains the "
             "right choice for quick in-context delegation. "
-            "Confined to your direct children. Returns the child's "
-            "output when its turn completes. To run multiple sessions "
-            "in parallel, emit multiple sys_session_send tool_calls in "
-            "the same response — they dispatch concurrently."
+            "Confined to your direct children. Returns a handle "
+            "immediately, not the child's output: the turn runs "
+            "asynchronously and its result is delivered to your inbox "
+            "— poll sys_read_inbox to collect it, or sys_cancel_task "
+            "to interrupt. The handle's work_id identifies this "
+            "dispatch and is echoed on the inbox result, so a reply "
+            "can be matched to the request that caused it. To run "
+            "multiple sessions in parallel, emit multiple "
+            "sys_session_send tool_calls in the same response — they "
+            "dispatch concurrently."
         )
     )
     # ``args.harness`` is allowlist-gated (design D.4): advertise it only when
