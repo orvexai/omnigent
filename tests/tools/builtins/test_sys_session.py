@@ -764,6 +764,54 @@ def test_close_marks_closed_and_tombstones_internal_title(session_fixture: _Fixt
     assert refreshed.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
 
 
+def test_session_list_surfaces_free_form_titled_child(session_fixture: _Fixture) -> None:
+    """
+    A colon-less child appears in the caller's own sub_agents view.
+
+    ``sys_session_create`` accepts a free-form title, so filtering the list
+    on the ``"<agent>:<title>"`` convention hid every MCP-created child
+    from the parent that launched it. It reports ``agent: null`` with its
+    own title, which is enough to drive and close it.
+    """
+    child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="my-worker",
+        parent_conversation_id=session_fixture.parent_conv_id,
+    )
+    payload = json.loads(SysSessionListTool().invoke("{}", session_fixture.ctx))
+
+    listed = {entry["conversation_id"]: entry for entry in payload["sub_agents"]}
+    assert child.id in listed, payload["sub_agents"]
+    assert listed[child.id] == {
+        "agent": None,
+        "title": "my-worker",
+        "conversation_id": child.id,
+    }
+    # The conventional child is unaffected.
+    assert listed[session_fixture.child_conv_id]["agent"] == "researcher"
+
+
+def test_session_list_still_hides_closed_free_form_child(session_fixture: _Fixture) -> None:
+    """
+    Closing a colon-less child removes it from the list.
+
+    Surfacing free-form children must not resurrect tombstoned ones — the
+    caller would otherwise be handed sessions it already finished with.
+    """
+    child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="my-worker",
+        parent_conversation_id=session_fixture.parent_conv_id,
+    )
+    SysSessionCloseTool().invoke(
+        json.dumps({"conversation_id": child.id}),
+        session_fixture.ctx,
+    )
+    payload = json.loads(SysSessionListTool().invoke("{}", session_fixture.ctx))
+
+    assert child.id not in {entry["conversation_id"] for entry in payload["sub_agents"]}
+
+
 def test_close_tombstones_child_with_free_form_title(session_fixture: _Fixture) -> None:
     """
     A child whose title carries no ``":"`` still closes.
