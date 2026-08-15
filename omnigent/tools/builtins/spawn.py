@@ -571,24 +571,26 @@ class SysSessionListTool(Tool):
             # would lose track regardless.
             limit=100,
         )
-        result: list[dict[str, str]] = []
+        # ``agent`` is None for a free-form-titled child, which has no
+        # "<agent>:" prefix to recover a name from.
+        result: list[dict[str, str | None]] = []
         for child in children.data:
-            # Title is "<agent>:<title>" — split into the LLM-
-            # friendly fields. Skip rows whose title doesn't
-            # match the convention (defensive — Phase-3
-            # anonymous spawns left None titles, but those have
-            # NULL parent_conversation_id and won't appear in
-            # this query at all). Also skip closed rows so they
+            # Named children store "<agent>:<title>"; a
+            # sys_session_create child stores a free-form title
+            # with no prefix. Both are real children the caller
+            # may drive, so both are listed — dropping the
+            # colon-less form hid every MCP-created session from
+            # its own parent. Closed rows stay hidden so they
             # never re-surface to the LLM.
-            if child.title is None or ":" not in child.title:
+            if child.title is None:
                 continue
             if is_session_closed(child.labels, child.title):
                 continue
-            sa_agent, _, sa_title = child.title.partition(":")
+            labelled = _agent_title_from_conversation(child)
             result.append(
                 {
-                    "agent": sa_agent,
-                    "title": sa_title,
+                    "agent": labelled.agent,
+                    "title": labelled.title,
                     "conversation_id": child.id,
                 }
             )

@@ -5148,8 +5148,13 @@ def _session_query_client(
 async def test_session_list_maps_children_and_skips_closed() -> None:
     """
     ``sys_session_list`` maps ``child_sessions`` rows to
-    ``{agent, title, conversation_id}`` and drops closed and
-    colonless rows, matching ``SysSessionListTool``.
+    ``{agent, title, conversation_id}`` and drops closed rows,
+    matching ``SysSessionListTool``.
+
+    Colon-less rows are surfaced, not dropped: ``sys_session_create``
+    children carry a free-form title, so hiding them left an
+    orchestrator unable to enumerate the sessions it had just launched.
+    They report their own title as the label.
     """
     from omnigent.runner.tool_dispatch import _execute_session_query_tool
 
@@ -5208,13 +5213,14 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                 "sys_session_list", "{}", conversation_id="conv_parent", server_client=client
             )
         )
-    # c3 (explicitly closed despite its mixed-type label map), c5
-    # (legacy title tombstone), and c4
-    # (no colon) dropped; the ui:-added child surfaces under its bound
-    # agent + label.
+    # c3 (explicitly closed despite its mixed-type label map) and c5
+    # (legacy title tombstone) dropped; the ui:-added child surfaces under
+    # its bound agent + label; c4 (no colon) surfaces under its own title
+    # so a free-form child stays reachable by name.
     assert out["sub_agents"] == [
         {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
         {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2"},
+        {"agent": "legacy-untyped", "title": "legacy-untyped", "conversation_id": "c4"},
     ]
 
 
@@ -6687,6 +6693,200 @@ def test_subagent_inbox_line_omits_dispatch_when_absent() -> None:
 
     assert "dispatch" not in line
     assert "sub-agent task conv_child completed —" in line
+
+
+def test_child_rows_surface_free_form_titled_children() -> None:
+    """
+    ``sys_session_list``'s sub_agents view includes colon-less children.
+
+    ``sys_session_create`` accepts a free-form title, and skipping rows
+    without a ``":"`` hid every MCP-created child from the caller's own
+    sub-agent view — an orchestrator could not enumerate the sessions it
+    had just launched. Closed rows stay hidden either way.
+    """
+    from omnigent.runner.tool_dispatch import _child_rows_to_entries
+
+    entries = _child_rows_to_entries(
+        [
+            {
+                "id": "conv_named",
+                "title": "researcher:auth",
+                "tool": "researcher",
+                "session_name": "auth",
+                "labels": {},
+            },
+            {
+                "id": "conv_freeform",
+                "title": "my-worker",
+                "tool": "my-worker",
+                "session_name": None,
+                "agent_name": "codex-native-ui",
+                "labels": {},
+            },
+            {
+                "id": "conv_closed",
+                "title": "gone:closed:conv_closed",
+                "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+            },
+        ]
+    )
+
+    by_id = {e["conversation_id"]: e for e in entries}
+    assert set(by_id) == {"conv_named", "conv_freeform"}
+    assert by_id["conv_named"] == {
+        "agent": "researcher",
+        "title": "auth",
+        "conversation_id": "conv_named",
+    }
+    assert by_id["conv_freeform"] == {
+        "agent": "codex-native-ui",
+        "title": "my-worker",
+        "conversation_id": "conv_freeform",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_classifies_opaque_500_as_title_clash() -> None:
+    """
+    A bare 500 on a duplicate title is reported as ``session_title_exists``.
+
+    Servers predating the typed 409 surface a per-parent title clash as an
+    opaque internal error. Left unclassified it reads as a transport fault
+    and invites a retry loop on a request that can never succeed, so the
+    runner asks the parent's children who holds the title and names them.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(500, json={"error": {"code": "internal_error"}})
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "conv_holder", "title": "worker", "labels": {}},
+                        {"id": "conv_other", "title": "unrelated", "labels": {}},
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_abc", "title": "worker"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "session_title_exists"
+    assert info["conversation_id"] == "conv_holder"
+    assert "sys_session_close" in info["message"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_500_stays_opaque_when_title_is_free() -> None:
+    """
+    A 500 unrelated to a title clash is reported as the status it was.
+
+    Classification must not swallow genuine server faults: if no open
+    sibling holds the title, the caller needs the real error, and a closed
+    sibling has already freed its slot so it is never the cause.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(500, json={"error": {"code": "internal_error"}})
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "conv_closed",
+                            "title": "worker:closed:conv_closed",
+                            "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_abc", "title": "worker"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "sys_session_create returned 500"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_labels_a_free_form_titled_child() -> None:
+    """
+    A send to a colon-less child names it by agent + its own title.
+
+    ``sys_session_create`` children have no ``"<agent>:"`` prefix, so the
+    parsed halves are empty and the handle used to report the anonymous
+    ``agent`` / ``null``. The parent then cannot tell which child a result
+    came from by name — only by opaque id.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "parent_session_id": "conv_caller",
+                    "title": "my-worker",
+                    "agent_name": "codex-native-ui",
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_child", "args": "go"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[]),
+                session_inbox=session_inbox,
+            )
+            work = runner_app.get_subagent_work("conv_child")
+            assert work is not None
+            assert work.agent == "codex-native-ui"
+            assert work.title == "my-worker"
+        finally:
+            runner_app.unregister_subagent_work("conv_child")
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    handle = json.loads(output)
+    assert handle["agent"] == "codex-native-ui"
+    assert handle["title"] == "my-worker"
 
 
 @pytest.mark.asyncio

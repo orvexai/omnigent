@@ -2198,7 +2198,14 @@ async def _send_to_existing_session(
             }
         )
     parsed = _parse_session_title(snap_data.get("title"))
-    agent_label = parsed.agent or "agent"
+    # A child created via sys_session_create carries a free-form title with
+    # no "<agent>:" prefix, so the parsed halves are empty. Falling back to
+    # the bound agent name and the raw title keeps the handle and the inbox
+    # line naming the child the caller actually knows, instead of the
+    # anonymous "agent" / null it would otherwise report.
+    raw_title = title_without_closed_marker(_optional_string(snap_data.get("title"))) or ""
+    agent_label = parsed.agent or _optional_string(snap_data.get("agent_name")) or "agent"
+    child_label = parsed.title if parsed.agent is not None else (raw_title or None)
     # A harness that steers redirects its active turn, so a mid-turn send is
     # the whole point of sending. Refusing only where the message would sit
     # until the turn ends keeps the busy interlock meaningful without
@@ -2225,13 +2232,13 @@ async def _send_to_existing_session(
         parent_session_id=conversation_id,
         title=snap_data.get("title") or "",
         tool=agent_label,
-        session_name=parsed.title or "",
+        session_name=child_label or "",
     )
     work_entry = _runner_app.register_subagent_work(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
         agent=agent_label,
-        title=parsed.title or "",
+        title=child_label or "",
         wrapper_label=_session_wrapper_label(snap_data),
         created_by=created_by,
     )
@@ -2240,7 +2247,7 @@ async def _send_to_existing_session(
         child_session_id=target_session_id,
         title=snap_data.get("title") or "",
         tool=agent_label,
-        session_name=parsed.title or "",
+        session_name=child_label or "",
         publish_event=publish_event,
     )
 
@@ -2274,15 +2281,107 @@ async def _send_to_existing_session(
             "work_id": work_entry.work_id,
             "kind": "sub_agent",
             "agent": agent_label,
-            "title": parsed.title,
+            "title": child_label,
             "status": "launching",
             "message": (
-                f"[System: sub-agent {agent_label} title {parsed.title!r} "
+                f"[System: sub-agent {agent_label} title {child_label!r} "
                 f"launching as task {target_session_id}. Result will appear in "
                 "your inbox; call sys_read_inbox to check or sys_cancel_task "
                 "to interrupt it.]"
             ),
         }
+    )
+
+
+async def _live_sibling_with_title(
+    parent_session_id: str,
+    title: str,
+    server_client: httpx.AsyncClient,
+) -> str | None:
+    """
+    Find an open child of *parent_session_id* already holding *title*.
+
+    Sibling titles are unique per parent. A server that predates the typed
+    409 surfaces that clash as an opaque 500, which reads as a transport
+    fault and invites a retry loop on a request that can never succeed.
+    Naming the holder turns it into something the caller can act on —
+    close it, or pick another title.
+
+    Best-effort: any read failure returns ``None`` so the original status
+    error is reported unchanged rather than being masked.
+
+    :param parent_session_id: The caller session whose children to scan.
+    :param title: The requested child title, e.g. ``"my-worker"``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: The holder's conversation id, or ``None`` when no open
+        sibling uses that title.
+    """
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{parent_session_id}/child_sessions",
+            params={"limit": 100},
+            timeout=30.0,
+        )
+    except Exception:  # noqa: BLE001 — classification must never mask the real error
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        rows = resp.json().get("data", [])
+    except ValueError:
+        return None
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        stored = _optional_string(row.get("title"))
+        # A closed sibling has been tombstoned, so its slot is free and it
+        # is not the reason this create failed.
+        if is_session_closed(_string_mapping(row.get("labels")), stored):
+            continue
+        if title_without_closed_marker(stored) == title:
+            return _optional_string(row.get("id"))
+    return None
+
+
+async def _session_create_error(
+    resp: httpx.Response,
+    *,
+    title: object,
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+) -> str:
+    """
+    Render a failed ``sys_session_create`` response as a typed error.
+
+    Classifies the per-parent title clash that older servers report as a
+    bare 500, so the caller learns the actionable cause instead of an
+    opaque status.
+
+    :param resp: The non-2xx create response.
+    :param title: The requested title (or non-str when absent).
+    :param conversation_id: The caller session id — the forced parent.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: A JSON error object.
+    """
+    if isinstance(title, str) and title:
+        holder = await _live_sibling_with_title(conversation_id, title, server_client)
+        if holder is not None:
+            return json.dumps(
+                {
+                    "error": "session_title_exists",
+                    "title": title,
+                    "conversation_id": holder,
+                    "message": (
+                        f"a sibling session already uses the title {title!r}; close it with "
+                        "sys_session_close (then this title is reusable) or create with a "
+                        "different title"
+                    ),
+                }
+            )
+    return json.dumps(
+        {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
     )
 
 
@@ -2530,8 +2629,11 @@ async def _execute_session_create(
             }
         )
     if resp.status_code >= 400:
-        return json.dumps(
-            {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
+        return await _session_create_error(
+            resp,
+            title=args.get("title"),
+            conversation_id=conversation_id,
+            server_client=server_client,
         )
     data = resp.json()
     if not isinstance(data.get("id"), str) or not data["id"]:
@@ -2711,8 +2813,11 @@ async def _upload_config_bundle(
             }
         )
     if resp.status_code >= 400:
-        return json.dumps(
-            {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
+        return await _session_create_error(
+            resp,
+            title=metadata.get("title"),
+            conversation_id=conversation_id,
+            server_client=server_client,
         )
     data: _JsonObject = resp.json()
     return data
@@ -4926,9 +5031,15 @@ def _child_rows_to_entries(
     """
     Map ``child_sessions`` rows to ``sys_session_list`` entries.
 
-    Skips closed and titleless/colonless rows. The server already
-    parses ``tool``/``session_name`` from the title (including the
+    Skips closed and titleless rows. The server already parses
+    ``tool``/``session_name`` from the title (including the
     ``"ui:<agent>:<label>"`` form), so those are reused.
+
+    Colon-less rows are included rather than skipped: ``sys_session_create``
+    accepts a free-form title, so dropping them hid every MCP-created child
+    from the caller's own sub-agent view — the orchestrator could not
+    enumerate the sessions it had just launched. Those rows report the bound
+    agent name and their own title instead of the parsed halves.
 
     :param rows: ``data`` rows from ``GET .../child_sessions``.
     :returns: ``[{"agent", "title", "conversation_id"}, ...]``.
@@ -4937,12 +5048,20 @@ def _child_rows_to_entries(
     for row in rows:
         title = _optional_string(row.get("title"))
         labels = _string_mapping(row.get("labels"))
-        if not title or ":" not in title or is_session_closed(labels, title):
+        if not title or is_session_closed(labels, title):
             continue
+        if ":" in title:
+            agent = _optional_string(row.get("tool"))
+            label = _optional_string(row.get("session_name"))
+        else:
+            # ``tool`` degrades to the raw title for these rows, so prefer
+            # the durable agent name and keep the title as the label.
+            agent = _optional_string(row.get("agent_name")) or _optional_string(row.get("tool"))
+            label = title_without_closed_marker(title)
         entries.append(
             {
-                "agent": _optional_string(row.get("tool")),
-                "title": _optional_string(row.get("session_name")),
+                "agent": agent,
+                "title": label,
                 "conversation_id": _optional_string(row.get("id")),
             }
         )
