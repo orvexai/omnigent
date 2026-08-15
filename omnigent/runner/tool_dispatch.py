@@ -64,6 +64,7 @@ from omnigent.session_lifecycle import (
     CLOSED_LABEL_VALUE,
     is_session_closed,
     title_without_closed_marker,
+    tombstoned_title,
 )
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -86,10 +87,8 @@ from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
     # (not duplicated) so the runner's REST-backed peek clamps to the same
-    # bounds the LLM-facing tool schema advertises and tombstones with the
-    # same marker the in-process close writes.
+    # bounds the LLM-facing tool schema advertises.
     _ACTIVITY_MAX_CHARS,
-    _CLOSED_TITLE_INFIX,
     _HISTORY_DEFAULT_TAIL,
     _clamp_tail_items,
 )
@@ -2200,16 +2199,26 @@ async def _send_to_existing_session(
         )
     parsed = _parse_session_title(snap_data.get("title"))
     agent_label = parsed.agent or "agent"
+    # A harness that steers redirects its active turn, so a mid-turn send is
+    # the whole point of sending. Refusing only where the message would sit
+    # until the turn ends keeps the busy interlock meaningful without
+    # blocking the correction an orchestrator is trying to make.
+    can_steer = _session_supports_midturn_steer(snap_data) is True
     existing_work = _runner_app.get_subagent_work(target_session_id)
-    if existing_work is not None and existing_work.status in ("launching", "running", "waiting"):
+    busy_work = existing_work is not None and existing_work.status in (
+        "launching",
+        "running",
+        "waiting",
+    )
+    if busy_work and not can_steer:
         return (
-            f"Error: session {target_session_id!r} already has a launching or running turn; "
-            "wait for completion before sending again"
+            f"Error: session {target_session_id!r} already has a launching or running turn "
+            "and its harness cannot steer mid-turn; wait for completion before sending again"
         )
-    if snap_data.get("busy") is True:
+    if snap_data.get("busy") is True and not can_steer:
         return (
-            f"Error: session {target_session_id!r} is already running; "
-            "wait for completion before sending again"
+            f"Error: session {target_session_id!r} is already running and its harness cannot "
+            "steer mid-turn; wait for completion before sending again"
         )
     _runner_app.register_child_session(
         target_session_id,
@@ -2218,7 +2227,7 @@ async def _send_to_existing_session(
         tool=agent_label,
         session_name=parsed.title or "",
     )
-    _runner_app.register_subagent_work(
+    work_entry = _runner_app.register_subagent_work(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
         agent=agent_label,
@@ -2258,6 +2267,11 @@ async def _send_to_existing_session(
             "task_id": target_session_id,
             "handle_id": target_session_id,
             "conversation_id": target_session_id,
+            # Per-dispatch id. task_id/handle_id/conversation_id are all
+            # the session id, so consecutive sends to one child are
+            # otherwise indistinguishable in the inbox; work_id is what
+            # matches a delivered result back to the send that caused it.
+            "work_id": work_entry.work_id,
             "kind": "sub_agent",
             "agent": agent_label,
             "title": parsed.title,
@@ -2278,6 +2292,8 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
+    host_id: object = None,
+    workspace: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -2296,6 +2312,10 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
+    :param host_id: Optional host to place the child on, e.g.
+        ``"host_a1b2c3d4"``. Omitted means co-located with the parent.
+    :param workspace: Absolute start directory on that host; the server
+        rejects a ``host_id`` without one.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -2306,6 +2326,12 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    # Placement is independent of parentage: the child stays contained in
+    # the caller's subtree while running on a host of the caller's choice.
+    if isinstance(host_id, str) and host_id:
+        body["host_id"] = host_id
+    if isinstance(workspace, str) and workspace:
+        body["workspace"] = workspace
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2323,6 +2349,7 @@ def _finalize_created_session(
     agent_id: str,
     title: object,
     publish_event: Callable[[str, _JsonObject], None] | None,
+    starts_turn: bool = False,
 ) -> str:
     """
     Register fan-out, emit ``session.created``, and build the handle.
@@ -2339,6 +2366,11 @@ def _finalize_created_session(
     :param title: The caller-supplied title (or non-str when absent).
     :param publish_event: Callback that enqueues an SSE event on the
         caller's outbound queue; ``None`` for in-process callers.
+    :param starts_turn: Whether the create queued an initial message, so
+        the child begins a turn immediately. Registers that turn as
+        sub-agent work — without it the busy interlock cannot see a
+        create-started turn and mid-turn sends behave differently
+        depending on how the turn began.
     :returns: JSON handle ``{conversation_id, kind, agent_id,
         agent_name, title, status}``.
     """
@@ -2358,6 +2390,15 @@ def _finalize_created_session(
         tool=agent_label,
         session_name=label,
     )
+    work_id: str | None = None
+    if starts_turn:
+        work_id = _runner_app.register_subagent_work(
+            parent_session_id=conversation_id,
+            child_session_id=child_id,
+            agent=agent_label,
+            title=label,
+            wrapper_label=_session_wrapper_label(data),
+        ).work_id
     evt = SessionCreatedEvent(
         type="session.created",
         conversation_id=conversation_id,
@@ -2367,16 +2408,19 @@ def _finalize_created_session(
     )
     if publish_event is not None:
         publish_event(conversation_id, evt.model_dump())
-    return json.dumps(
-        {
-            "conversation_id": child_id,
-            "kind": "sub_agent",
-            "agent_id": agent_id,
-            "agent_name": data.get("agent_name"),
-            "title": title if isinstance(title, str) else None,
-            "status": data.get("status") or "created",
-        }
-    )
+    handle: _JsonObject = {
+        "conversation_id": child_id,
+        "kind": "sub_agent",
+        "agent_id": agent_id,
+        "agent_name": data.get("agent_name"),
+        "title": title if isinstance(title, str) else None,
+        "status": data.get("status") or "created",
+    }
+    if work_id is not None:
+        # Only a create that queued a message starts a turn, so only that
+        # form has a dispatch to correlate a later inbox result against.
+        handle["work_id"] = work_id
+    return json.dumps(handle)
 
 
 async def _execute_session_create(
@@ -2408,7 +2452,8 @@ async def _execute_session_create(
     ``conversation_id``) — unlike named-mode send, it does NOT block on
     the child turn.
 
-    Maps a 404 to ``agent_not_found`` and 401/403 to ``access_denied``.
+    Maps a 404 to ``agent_not_found``, 401/403 to ``access_denied``, and
+    a 409 (sibling title already taken) to ``session_title_exists``.
 
     :param args: Parsed arguments; exactly one of ``agent_id`` /
         ``config_path`` required, ``title`` / ``message`` optional.
@@ -2460,6 +2505,8 @@ async def _execute_session_create(
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        host_id=args.get("host_id"),
+        workspace=args.get("workspace"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -2469,6 +2516,19 @@ async def _execute_session_create(
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "agent_id": agent_id})
+    if resp.status_code == 409:
+        # Sibling titles are unique per parent, so a repeat create under a
+        # title still held by an earlier child needs a distinct name.
+        return json.dumps(
+            {
+                "error": "session_title_exists",
+                "title": args.get("title"),
+                "message": (
+                    "a sibling session already uses this title; close it with "
+                    "sys_session_close or create with a different title"
+                ),
+            }
+        )
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
@@ -2482,6 +2542,7 @@ async def _execute_session_create(
         agent_id=str(agent_id),
         title=args.get("title"),
         publish_event=publish_event,
+        starts_turn=bool(body.get("initial_items")),
     )
 
 
@@ -2637,6 +2698,18 @@ async def _upload_config_bundle(
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "config_path": config_path})
+    if resp.status_code == 409:
+        # Same per-parent title uniqueness as the agent_id create path.
+        return json.dumps(
+            {
+                "error": "session_title_exists",
+                "title": metadata.get("title"),
+                "message": (
+                    "a sibling session already uses this title; close it with "
+                    "sys_session_close or create with a different title"
+                ),
+            }
+        )
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
@@ -2719,6 +2792,7 @@ async def _session_create_from_config_path(
         agent_id=created_agent_id,
         title=args.get("title"),
         publish_event=publish_event,
+        starts_turn=isinstance(message, str) and bool(message),
     )
 
 
@@ -3705,12 +3779,14 @@ async def _execute_session_query_tool(
     - ``sys_session_share`` → ``PUT /v1/sessions/{target}/permissions``
       with the grantee + numeric level
 
-    Output shapes mirror the in-process tools in
-    :mod:`omnigent.tools.builtins.spawn` so the LLM sees identical
-    results regardless of executor. No new identity handling is
-    introduced: access control is whatever the server already enforces
-    on those endpoints for ``server_client`` — the same posture as
-    :func:`_execute_subagent_tool`.
+    Output *shapes* mirror the in-process tools in
+    :mod:`omnigent.tools.builtins.spawn`; scoping deliberately does not.
+    The in-process reads are confined to the caller's spawn tree, while
+    the read tools here are global by design — bounded only by what the
+    server's per-user ACL allows ``server_client`` to fetch, the same
+    posture as :func:`_execute_subagent_tool`. The write tools
+    (``sys_session_close``, ``sys_session_send``) do enforce the tree on
+    both executors; only reads differ.
 
     :param tool_name: ``"sys_session_get_history"``, ``"sys_session_list"``,
         ``"sys_session_close"``, ``"sys_session_get_info"``, or
@@ -3830,13 +3906,16 @@ async def _session_get_info_via_rest(
     pending = pending_value if isinstance(pending_value, list) else []
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
+    placement = await _effective_placement(snap, server_client)
     return json.dumps(
         {
             "session_id": snap.get("id"),
             "status": snap.get("status"),
-            # Persisted conversation activity is distinct from lifecycle
-            # status: repeated polls with an unchanged value let an
-            # orchestrator detect a running session that is not advancing.
+            # Timestamp of the last PERSISTED conversation item, not a
+            # liveness heartbeat: a single long tool call appends nothing
+            # until it returns, so an unchanged value does not by itself
+            # mean the session is stuck. Pair it with ``status`` and
+            # ``runner_online`` before concluding anything.
             "last_activity_at": snap.get("updated_at"),
             "title": snap.get("title"),
             "agent_id": snap.get("agent_id"),
@@ -3848,15 +3927,18 @@ async def _session_get_info_via_rest(
             "agent_name": public_agent_name(snap_agent_name),
             "runner_id": snap.get("runner_id"),
             "runner_online": await _runner_online_or_none(snap_runner_id, server_client),
-            "host_id": snap.get("host_id"),
+            "host_id": placement.host_id,
             "parent_session_id": snap.get("parent_session_id"),
             "sub_agent_name": snap.get("sub_agent_name"),
             "reasoning_effort": snap.get("reasoning_effort"),
             # Effective model: a per-session override wins over the
             # agent spec's default; both may be None when unset.
             "model": snap.get("model_override") or snap.get("llm_model"),
-            "workspace": snap.get("workspace"),
-            "git_branch": snap.get("git_branch"),
+            "workspace": placement.workspace,
+            "git_branch": placement.git_branch,
+            # Whether placement came from this session's own row or was
+            # inherited from the tree root it runs alongside.
+            "placement_inherited": placement.inherited,
             # The outstanding approval prompts themselves (original
             # elicitation-request event dicts), plus a count for quick
             # status checks. Surfacing the prompts — not just a tally —
@@ -3864,8 +3946,129 @@ async def _session_get_info_via_rest(
             # waiting on.
             "pending_elicitations": pending,
             "pending_elicitation_count": len(pending),
+            # Whether a message sent while this session is busy redirects
+            # the active turn or waits for it. Without this a caller
+            # cannot tell if a correction lands in seconds or minutes.
+            # ``None`` when the harness makes no declared claim.
+            "supports_midturn_steer": _session_supports_midturn_steer(snap),
         }
     )
+
+
+# How far up the parent chain a metadata read will look for placement.
+_PLACEMENT_ANCESTOR_HOPS = 5
+
+
+@dataclass
+class _Placement:
+    """
+    Where a session actually runs.
+
+    :param host_id: Host running the session, e.g. ``"host_a1b2c3d4"``;
+        ``None`` when neither the session nor its tree root is
+        host-bound (a CLI-launched tree).
+    :param workspace: Start directory on that host.
+    :param git_branch: Branch checked out in that workspace.
+    :param inherited: ``True`` when the values came from the tree root
+        rather than the session's own row.
+    """
+
+    host_id: str | None
+    workspace: str | None
+    git_branch: str | None
+    inherited: bool
+
+
+async def _effective_placement(
+    snap: _JsonObject,
+    server_client: httpx.AsyncClient,
+) -> _Placement:
+    """
+    Resolve where a session runs, inheriting from its nearest placed ancestor.
+
+    A child created without explicit placement stores no ``host_id`` of
+    its own — it runs on the parent's runner — so its own columns are
+    ``NULL`` and answer "which machine is this on?" with silence. It runs
+    wherever its parent runs, so walk up until an ancestor carries
+    placement. Walking to the *nearest* placed ancestor rather than the
+    tree root matters once a child is given an explicit ``host_id``: its
+    own children live on that host, not on the root's.
+
+    Best-effort: any failure reading an ancestor leaves the session's own
+    (empty) values rather than failing the whole metadata read.
+
+    :param snap: Session snapshot from ``GET /v1/sessions/{id}``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: The effective placement and whether it was inherited.
+    """
+    own = _Placement(
+        host_id=_optional_string(snap.get("host_id")),
+        workspace=_optional_string(snap.get("workspace")),
+        git_branch=_optional_string(snap.get("git_branch")),
+        inherited=False,
+    )
+    if own.host_id is not None or own.workspace is not None:
+        return own
+    ancestor_id = _optional_string(snap.get("parent_session_id"))
+    seen = {_optional_string(snap.get("id"))}
+    # Bounded: deep trees are rare and this runs on a metadata read, so
+    # give up rather than pay an unbounded chain of round trips.
+    for _hop in range(_PLACEMENT_ANCESTOR_HOPS):
+        if ancestor_id is None or ancestor_id in seen:
+            return own
+        seen.add(ancestor_id)
+        try:
+            resp = await server_client.get(
+                f"/v1/sessions/{ancestor_id}",
+                params={"include_items": "false", "include_liveness": "false"},
+                timeout=30.0,
+            )
+        except Exception:  # noqa: BLE001 — placement is descriptive, not load-bearing
+            return own
+        if resp.status_code != 200:
+            return own
+        ancestor = _string_object_dict(resp.json())
+        if ancestor is None:
+            return own
+        host = _optional_string(ancestor.get("host_id"))
+        workspace = _optional_string(ancestor.get("workspace"))
+        if host is not None or workspace is not None:
+            return _Placement(
+                host_id=host,
+                workspace=workspace,
+                git_branch=_optional_string(ancestor.get("git_branch")),
+                inherited=True,
+            )
+        ancestor_id = _optional_string(ancestor.get("parent_session_id"))
+    return own
+
+
+def _session_supports_midturn_steer(snap: _JsonObject) -> bool | None:
+    """
+    Resolve a session's declared mid-turn steering capability.
+
+    Resolves the harness from the session's native-wrapper label (falling
+    back to its agent name) and reads that harness's declared
+    ``steering`` capability.
+
+    :param snap: Session snapshot from ``GET /v1/sessions/{id}``.
+    :returns: ``True`` when a mid-turn message redirects the active turn,
+        ``False`` when it waits for a turn boundary, ``None`` when the
+        harness is unknown or makes no claim.
+    """
+    from omnigent.harness_plugins import harness_capabilities
+    from omnigent.native_coding_agents import (
+        native_coding_agent_for_agent_name,
+        native_coding_agent_for_wrapper_label,
+    )
+
+    native = native_coding_agent_for_wrapper_label(_session_wrapper_label(snap))
+    if native is None:
+        native = native_coding_agent_for_agent_name(_optional_string(snap.get("agent_name")))
+    if native is None:
+        return None
+    capabilities = harness_capabilities().get(native.harness)
+    return None if capabilities is None else capabilities.steering
 
 
 def _omnigent_error_message(resp: httpx.Response) -> str | None:
@@ -4781,10 +4984,11 @@ async def _session_get_history_via_rest(
     Mirrors :class:`SysSessionGetHistoryTool`: returns
     ``{"conversation_id", "agent", "title", "items"}`` with items in
     chronological order. The target's ``agent``/``title`` come from its
-    session snapshot. Maps a 404 to ``session_not_found`` and a
-    403/401 to ``session_out_of_tree`` (the server denied read access,
-    so from the caller's vantage the target is outside the sessions it
-    may read).
+    session snapshot. Maps a 404 to ``session_not_found`` and a 403/401
+    to ``access_denied``. This read is global — it is bounded by
+    the server's per-user ACL, not by the caller's spawn tree — so a
+    denial is an access decision and must not be reported as a tree
+    violation the caller could fix by picking a sibling.
 
     :param args: Parsed tool arguments; requires ``conversation_id``,
         optional ``tail_items``.
@@ -4810,7 +5014,7 @@ async def _session_get_history_via_rest(
     if resp.status_code == 404:
         return json.dumps({"error": "session_not_found", "conversation_id": target_id})
     if resp.status_code in (401, 403):
-        return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
+        return json.dumps({"error": "access_denied", "conversation_id": target_id})
     if resp.status_code != 200:
         return json.dumps({"error": f"sys_session_get_history returned {resp.status_code}"})
     data: list[_JsonObject] = resp.json().get("data", [])
@@ -4964,10 +5168,11 @@ async def _session_close_via_rest(
     )
     if scope_error is not None:
         return scope_error
-    parsed = _parse_session_title(_optional_string(target_snap.get("title")))
-    if parsed.agent is None or parsed.title is None:
-        return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
-    new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
+    raw_title = _optional_string(target_snap.get("title"))
+    parsed = _parse_session_title(raw_title)
+    # Tombstone the stored title itself: a child created with a
+    # free-form title (or none) is still a sub-agent and must close.
+    new_title = tombstoned_title(raw_title, target_id)
     try:
         patch = await server_client.patch(
             f"/v1/sessions/{target_id}",
@@ -4986,7 +5191,11 @@ async def _session_close_via_rest(
             "closed": True,
             "conversation_id": target_id,
             "agent": parsed.agent,
-            "title": parsed.title,
+            "title": (
+                parsed.title
+                if parsed.agent is not None
+                else (title_without_closed_marker(raw_title) or "")
+            ),
         }
     )
 
@@ -6377,17 +6586,28 @@ def _format_async_task_item(payload: _JsonObject) -> str:
         agent = payload.get("agent") or payload.get("tool_name", "sub_agent")
         title = payload.get("title", "")
         target = f"{agent}:{title}" if title else str(agent)
+        # Name the dispatch, not just the session: every send to one child
+        # reuses the session id, so without work_id the parent cannot tell
+        # which of its requests this result answers.
+        work_id = payload.get("work_id")
+        dispatch = f" (dispatch {work_id})" if work_id else ""
         if status == "completed":
             if not has_output:
                 return (
-                    f"[System: sub-agent task {handle_id} completed — {target} produced no output]"
+                    f"[System: sub-agent task {handle_id} completed{dispatch} — "
+                    f"{target} produced no output]"
                 )
-            return f"[System: sub-agent task {handle_id} completed — {target} returned: {output}]"
+            return (
+                f"[System: sub-agent task {handle_id} completed{dispatch} — "
+                f"{target} returned: {output}]"
+            )
         if status == "failed":
-            return f"[System: sub-agent task {handle_id} failed — {target} error: {output}]"
+            return (
+                f"[System: sub-agent task {handle_id} failed{dispatch} — {target} error: {output}]"
+            )
         if status == "cancelled":
-            return f"[System: sub-agent task {handle_id} cancelled — {target}]"
-        return f"[System: sub-agent task {handle_id} {status} — {target}: {output}]"
+            return f"[System: sub-agent task {handle_id} cancelled{dispatch} — {target}]"
+        return f"[System: sub-agent task {handle_id} {status}{dispatch} — {target}: {output}]"
     if status == "completed":
         if not has_output:
             return f"[System: task {handle_id} completed — {tool} produced no output]"

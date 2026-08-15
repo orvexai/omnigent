@@ -43,6 +43,28 @@ def has_closed_title_marker(title: str | None) -> bool:
     return bool(title and CLOSED_TITLE_INFIX in title)
 
 
+def tombstoned_title(title: str | None, conversation_id: str) -> str:
+    """
+    Build the internal closed-title rewrite for a session.
+
+    The rewrite frees the ``(parent_conversation_id, title)`` unique
+    slot so a later ``sys_session_send`` with the same name creates a
+    fresh child. A title that isn't ``"<agent>:<title>"`` shaped — e.g.
+    the free-form label ``sys_session_create`` accepts — is tombstoned
+    as-is; the shape is a naming convention, not a precondition for
+    closing.
+
+    :param title: Stored conversation title, e.g. ``"researcher:auth"``
+        or ``"my-worker"``; may be ``None`` or already tombstoned.
+    :param conversation_id: The session being closed, e.g.
+        ``"conv_abc123"``, embedded so repeat closes stay unique.
+    :returns: The tombstoned title, e.g.
+        ``"researcher:auth:closed:conv_abc123"``.
+    """
+    base = title_without_closed_marker(title) or ""
+    return f"{base}{CLOSED_TITLE_INFIX}{conversation_id}"
+
+
 def labels_with_closed_status(
     labels: Mapping[str, str] | None,
     title: str | None,

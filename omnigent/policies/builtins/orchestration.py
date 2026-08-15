@@ -422,24 +422,27 @@ def blast_radius(
 def spawn_bounds(
     *,
     max_dispatches_per_turn: int = 5,
-    dispatch_tools: tuple[str, ...] = ("sys_session_send",),
+    dispatch_tools: tuple[str, ...] = ("sys_session_send", "sys_session_create"),
 ) -> Callable[[_Json], _Json]:
     """
     Factory: cap how many workers the orchestrator may dispatch per turn.
 
     Counts the *dispatch_tools* tool calls within a single orchestrator turn
     and DENIES once *max_dispatches_per_turn* is exceeded, forcing fan-out in
-    bounded waves rather than an unbounded fleet. The orchestrator dispatches
-    every worker through a sub-agent send (``sys_session_send``), so that is the
-    default counted tool. The counter resets each turn via the ``reset_turn``
-    hook the runner calls (``omnigent/runner/policy.py``). This is the v1
-    concurrency bound; true cross-turn live-concurrency accounting is a v1.x
-    refinement.
+    bounded waves rather than an unbounded fleet. Both ways of starting a
+    worker count by default: ``sys_session_send`` and ``sys_session_create``.
+    Leaving create out lets an agent launch an unbounded fleet of
+    self-defined children while staying under the cap — every in-tree
+    consumer of this policy had to add it by hand. The counter resets each
+    turn via the ``reset_turn`` hook the runner calls
+    (``omnigent/runner/policy.py``). This is the v1 concurrency bound; true
+    cross-turn live-concurrency accounting is a v1.x refinement.
 
     :param max_dispatches_per_turn: Maximum worker dispatches allowed in one
         turn, e.g. ``5``.
     :param dispatch_tools: Tool names that count as a worker dispatch, e.g.
-        ``("sys_session_send",)``. A YAML list is accepted (coerced to a set).
+        ``("sys_session_send", "sys_session_create")``. A YAML list is
+        accepted (coerced to a set).
     :returns: A stateful evaluator ``fn(event)`` carrying a ``reset_turn``
         attribute, returning a V0 decision dict.
     """

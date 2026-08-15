@@ -41,6 +41,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import tempfile
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
@@ -125,6 +126,25 @@ def _assume_harness_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
         "omnigent.onboarding.harness_install.missing_harness_cli",
         lambda harness: None,
     )
+
+
+@pytest.fixture(autouse=True)
+def _clean_subagent_work_registry() -> Any:
+    """
+    Clear the process-global sub-agent work registry around each test.
+
+    Both dispatch paths that start a child turn register work there, and
+    in production the entry clears when the terminal inbox item drains —
+    which never happens in these tests. Without a reset, one test's
+    registration makes the next one's send look busy.
+    """
+    from omnigent.runner import app as runner_app
+
+    runner_app._subagent_work_by_child.clear()
+    runner_app._subagent_work_by_parent.clear()
+    yield
+    runner_app._subagent_work_by_child.clear()
+    runner_app._subagent_work_by_parent.clear()
 
 
 @asynccontextmanager
@@ -4877,9 +4897,13 @@ async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
         "task_id": "conv_child_cancel",
         "status": "cancelled",
     }
-    assert inbox_output == (
-        "[System: sub-agent task conv_child_cancel cancelled — runner:phase-c]"
-    ), "Cancelled sub-agent work must produce exactly one cancelled inbox item."
+    # The dispatch id is minted per send, so match its shape rather than a
+    # literal — it is what lets the parent tell one dispatch from the next.
+    assert re.fullmatch(
+        r"\[System: sub-agent task conv_child_cancel cancelled "
+        r"\(dispatch subagent_[0-9a-f]+\) — runner:phase-c\]",
+        inbox_output,
+    ), f"Cancelled sub-agent work must produce exactly one cancelled inbox item: {inbox_output!r}"
 
 
 @pytest.mark.asyncio
@@ -5384,10 +5408,16 @@ async def test_session_peek_appends_pending_elicitation_from_snapshot() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "status,expected_error",
-    [(404, "session_not_found"), (403, "session_out_of_tree")],
+    [(404, "session_not_found"), (403, "access_denied")],
 )
 async def test_session_peek_maps_access_errors(status: int, expected_error: str) -> None:
-    """A 404/403 from ``GET /items`` maps to the in-process tool's typed errors."""
+    """
+    A 404/403 from ``GET /items`` maps to typed errors.
+
+    The REST read is global and bounded by the server ACL, so a 403 is
+    an access decision — reporting it as ``session_out_of_tree`` would
+    describe a tree violation the caller cannot act on.
+    """
     from omnigent.runner.tool_dispatch import _execute_session_query_tool
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -5469,6 +5499,74 @@ async def test_session_close_patches_tombstoned_title() -> None:
         "conversation_id": "conv_target",
         "agent": "researcher",
         "title": "auth",
+    }
+
+
+@pytest.mark.parametrize(
+    ("stored_title", "expected_base", "expected_title"),
+    [
+        ("my-worker", "my-worker", "my-worker"),
+        (None, "", ""),
+    ],
+    ids=["free_form_title", "title_absent_from_snapshot"],
+)
+@pytest.mark.asyncio
+async def test_session_close_tombstones_child_without_agent_prefix(
+    stored_title: str | None,
+    expected_base: str,
+    expected_title: str,
+) -> None:
+    """
+    ``sys_session_close`` closes a child whose title isn't
+    ``"<agent>:<title>"`` shaped.
+
+    ``sys_session_create`` accepts an arbitrary ``title``, so gating
+    close on the title's shape left those sessions permanently
+    uncloseable. The parent relationship is the gate; the tombstone
+    still frees the ``(parent, title)`` slot. A snapshot carrying no
+    title at all degrades the same way instead of erroring.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    patched: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": stored_title,
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": "conv_caller",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(
+                200,
+                json={"id": "conv_caller", "root_conversation_id": "conv_root"},
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_target":
+            patched.update(json.loads(request.content))
+            return httpx.Response(200, json={"id": "conv_target"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert patched["title"] == f"{expected_base}:closed:conv_target"
+    assert patched["labels"] == {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
+    assert out == {
+        "closed": True,
+        "conversation_id": "conv_target",
+        "agent": None,
+        "title": expected_title,
     }
 
 
@@ -6218,6 +6316,412 @@ async def test_sys_session_create_maps_agent_not_found() -> None:
     info = json.loads(output)
     assert info["error"] == "agent_not_found"
     assert info["agent_id"] == "ag_missing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("create_args", "expect_registered"),
+    [
+        ({"agent_id": "ag_abc", "message": "go"}, True),
+        ({"agent_id": "ag_abc"}, False),
+    ],
+    ids=["with_initial_message", "without_initial_message"],
+)
+async def test_sys_session_create_registers_only_a_turn_it_started(
+    create_args: dict[str, Any],
+    expect_registered: bool,
+) -> None:
+    """
+    A create that queues a message registers that turn as sub-agent work.
+
+    The busy interlock reads this registry. Leaving a create-started turn
+    out of it made mid-turn sends behave differently depending on how the
+    turn began — accepted after a create, refused after a send. A create
+    with no message starts no turn, so it must register nothing.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json={"id": "conv_new", "agent_name": "researcher"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(create_args),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    work = runner_app.get_subagent_work("conv_new")
+    assert (work is not None) is expect_registered
+    if work is not None:
+        assert work.parent_session_id == "conv_caller"
+        # The dispatch id is per-turn, so a result can be matched to it.
+        assert work.work_id.startswith("subagent_")
+
+
+@pytest.mark.asyncio
+async def test_get_info_inherits_placement_from_tree_root() -> None:
+    """
+    A child with no placement of its own reports the root's.
+
+    A co-located child stores no ``host_id`` — it runs on the parent's
+    runner — so its own row answers "which machine is this on?" with
+    nulls. The placement that governs it lives on the tree root.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "status": "running",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": "conv_root",
+                    "host_id": None,
+                    "workspace": None,
+                    "git_branch": None,
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_root":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_root",
+                    "host_id": "host_abc",
+                    "workspace": "/srv/work/repo",
+                    "git_branch": "feature/login",
+                },
+            )
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_info",
+                json.dumps({"session_id": "conv_child"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["host_id"] == "host_abc"
+    assert out["workspace"] == "/srv/work/repo"
+    assert out["git_branch"] == "feature/login"
+    assert out["placement_inherited"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_info_stops_at_nearest_placed_ancestor() -> None:
+    """
+    A grandchild inherits the placed child's host, not the root's.
+
+    Once a child can be given its own ``host_id``, its children run on
+    that host. Jumping straight to the tree root would report the wrong
+    machine for every session under a remotely-placed child.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_grandchild":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_grandchild",
+                    "status": "running",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": "conv_child",
+                    "host_id": None,
+                    "workspace": None,
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": "conv_root",
+                    "host_id": "host_remote",
+                    "workspace": "/srv/remote",
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_root":
+            raise AssertionError("must stop at the nearest placed ancestor")
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_info",
+                json.dumps({"session_id": "conv_grandchild"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["host_id"] == "host_remote"
+    assert out["workspace"] == "/srv/remote"
+    assert out["placement_inherited"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_info_keeps_own_placement_without_extra_lookup() -> None:
+    """
+    A session with its own placement reports it and reads no root.
+
+    The inheritance fallback must not mask an explicitly placed session
+    or add a round trip to the common case.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "status": "running",
+                    "root_conversation_id": "conv_root",
+                    "host_id": "host_own",
+                    "workspace": "/srv/own",
+                },
+            )
+        raise AssertionError(f"must not read {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_info",
+                json.dumps({"session_id": "conv_child"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["host_id"] == "host_own"
+    assert out["placement_inherited"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wrapper_label", "expect_accepted"),
+    [
+        ("codex-native-ui", True),
+        ("claude-code-native-ui", False),
+    ],
+    ids=["steering_harness_accepts", "queueing_harness_refuses"],
+)
+async def test_midturn_send_follows_the_harness_steer_capability(
+    wrapper_label: str,
+    expect_accepted: bool,
+) -> None:
+    """
+    A busy child accepts a mid-turn send only where the harness can steer.
+
+    On a steering harness the message redirects the active turn, which is
+    exactly what an orchestrator wants; on a queueing one it would sit
+    until the turn ends, so the interlock refuses and says why.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_busy":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_busy",
+                    "parent_session_id": "conv_caller",
+                    "title": "researcher:auth",
+                    "busy": True,
+                    "labels": {"omnigent.wrapper": wrapper_label},
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_busy/events":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_busy", "args": "STOP, reply KIWI"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_busy")
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    if expect_accepted:
+        assert json.loads(output)["status"] == "launching"
+    else:
+        assert "cannot steer mid-turn" in output
+
+
+@pytest.mark.parametrize(
+    ("wrapper_label", "expected"),
+    [
+        ("codex-native-ui", True),
+        ("claude-code-native-ui", False),
+        ("not-a-native-wrapper", None),
+    ],
+    ids=["steers", "queues", "unknown_harness"],
+)
+def test_get_info_reports_declared_midturn_steer_capability(
+    wrapper_label: str,
+    expected: bool | None,
+) -> None:
+    """
+    ``supports_midturn_steer`` reflects the harness's declared capability.
+
+    codex-native abandons an in-flight tool call and pivots; claude-native
+    injects at a turn boundary, so the same message waits. An orchestrator
+    cannot choose between correcting and cancelling without knowing which.
+    """
+    from omnigent.runner.tool_dispatch import _session_supports_midturn_steer
+
+    snap = {"labels": {"omnigent.wrapper": wrapper_label}}
+    assert _session_supports_midturn_steer(snap) is expected
+
+
+def test_session_create_body_forwards_placement_but_forces_parentage() -> None:
+    """
+    ``host_id`` / ``workspace`` reach the wire; the parent stays forced.
+
+    Placement and containment are independent: an orchestrator may put a
+    child on another host, but must never be able to retarget its parent
+    and escape its own subtree.
+    """
+    from omnigent.runner.tool_dispatch import _build_session_create_body
+
+    body = _build_session_create_body(
+        "ag_abc",
+        "conv_caller",
+        "worker",
+        "go",
+        host_id="host_remote",
+        workspace="/srv/work/repo",
+    )
+
+    assert body["host_id"] == "host_remote"
+    assert body["workspace"] == "/srv/work/repo"
+    assert body["parent_session_id"] == "conv_caller"
+
+
+def test_session_create_body_omits_placement_when_not_requested() -> None:
+    """
+    Without placement args the body carries neither key.
+
+    Sending ``host_id: null`` would trip the server's "workspace required
+    for host" validator and break the ordinary co-located create.
+    """
+    from omnigent.runner.tool_dispatch import _build_session_create_body
+
+    body = _build_session_create_body("ag_abc", "conv_caller", "worker", "go")
+
+    assert "host_id" not in body
+    assert "workspace" not in body
+
+
+def test_subagent_inbox_line_names_the_dispatch_that_produced_it() -> None:
+    """
+    A delivered sub-agent result names the dispatch, not just the session.
+
+    ``task_id``/``handle_id``/``conversation_id`` are all the child's
+    session id, so two consecutive sends produce indistinguishable inbox
+    lines and a late result reads as an answer to the newer request.
+    ``work_id`` is the per-dispatch discriminator the handle returned.
+    """
+    from omnigent.runner.tool_dispatch import _format_async_task_item
+
+    line = _format_async_task_item(
+        {
+            "type": "sub_agent",
+            "work_id": "subagent_deadbeef1234",
+            "handle_id": "conv_child",
+            "agent": "researcher",
+            "title": "auth",
+            "status": "completed",
+            "output": "ALIVE",
+        }
+    )
+
+    assert "dispatch subagent_deadbeef1234" in line
+    assert "returned: ALIVE" in line
+
+
+def test_subagent_inbox_line_omits_dispatch_when_absent() -> None:
+    """
+    A payload without a ``work_id`` renders without a dangling marker.
+
+    Older queued payloads predate the field; they must not surface an
+    empty ``(dispatch )`` the parent LLM would try to read.
+    """
+    from omnigent.runner.tool_dispatch import _format_async_task_item
+
+    line = _format_async_task_item(
+        {
+            "type": "sub_agent",
+            "handle_id": "conv_child",
+            "agent": "researcher",
+            "title": "auth",
+            "status": "completed",
+            "output": "ALIVE",
+        }
+    )
+
+    assert "dispatch" not in line
+    assert "sub-agent task conv_child completed —" in line
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_maps_duplicate_title_conflict() -> None:
+    """
+    A 409 maps to ``session_title_exists`` naming the offending title.
+
+    Sibling titles are unique per parent, so an orchestrator reusing a
+    title has to rename or close the holder. Falling through to the
+    generic status branch reads as a transport fault and invites a retry
+    loop on a request that can never succeed.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={"error": {"code": "already_exists", "message": "title taken"}},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_abc", "title": "worker"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "session_title_exists"
+    assert info["title"] == "worker"
+    assert "sys_session_close" in info["message"]
 
 
 @pytest.mark.asyncio

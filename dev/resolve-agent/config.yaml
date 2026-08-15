@@ -105,8 +105,8 @@ guardrails:
         arguments:
           gate_pushes: false
     # Bound the fan-out: this agent spawns at most one reviewer child, so a
-    # low per-turn cap is plenty and stops a runaway create loop. sys_session_create
-    # is counted (like polly) so a self-defined child can't bypass the cap.
+    # low per-turn cap is plenty and stops a runaway create loop. Both
+    # dispatch tools are counted by the policy's default.
     spawn_bounds:
       type: function
       on: [tool_call]
@@ -114,7 +114,6 @@ guardrails:
         path: omnigent.inner.nessie.policies.spawn_bounds
         arguments:
           max_dispatches_per_turn: 2
-          dispatch_tools: [sys_session_send, sys_session_create]
     # Require `review` on any sys_session_SEND dispatch. Note this guard only
     # inspects sys_session_send, NOT the sys_session_create that launches the
     # reviewer child (create carries no purpose arg) — so it does not itself
