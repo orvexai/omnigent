@@ -1,0 +1,201 @@
+# Build standalone `omnigent` executables for Linux, Windows and macOS and
+# attach them to a GitHub Release.
+#
+# Why this exists alongside release-omnigent.yml: upstream ships omnigent as
+# pure-Python wheels, so a single artifact already covers every OS *for users
+# who have Python and uv*. This workflow targets the other case — dropping one
+# self-contained file on a machine (a host/runner box, a locked-down laptop)
+# with no Python toolchain at all.
+#
+# Release flow:
+#   1. Push a tag (v*) -> build the three binaries, smoke them, publish a
+#      draft GitHub Release with the archives + SHA256SUMS attached.
+#   2. Review the draft, then publish it by hand.
+#   Manual `workflow_dispatch` builds and uploads run artifacts WITHOUT
+#   touching Releases, so the packaging can be exercised off a tag.
+#
+# The SPA is built by setup.py during `pip install .` (it is skipped only when
+# OMNIGENT_SKIP_WEB_UI=true), so every platform sets up Node + pnpm and the
+# bundle lands in site-packages where --collect-all picks it up.
+name: Release binaries (Linux/Windows/macOS)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      skip_web_ui:
+        description: "Build without the bundled web UI (faster; CLI/host only)."
+        type: boolean
+        default: false
+  # CI-test the workflow on change; the publish job is gated off PR events.
+  pull_request:
+    paths:
+      - ".github/workflows/release-binaries.yml"
+
+permissions:
+  contents: read
+
+# Serialize on the ref so a re-tag can't race itself.
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Gated to this fork; inert upstream and in other mirrors.
+    if: github.repository == 'orvexai/omnigent'
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      # One platform failing must not hide the others' results.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04 # oldest supported glibc -> widest Linux compat
+            target: linux-x86_64
+            archive: tar.gz
+          - os: windows-latest
+            target: windows-x86_64
+            archive: zip
+          - os: macos-14 # Apple silicon
+            target: macos-arm64
+            archive: tar.gz
+          - os: macos-13 # Intel
+            target: macos-x86_64
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version-file: .python-version
+
+      # setup.py shells out to pnpm to build the SPA into
+      # omnigent/server/static/web-ui unless OMNIGENT_SKIP_WEB_UI=true.
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        if: ${{ !inputs.skip_web_ui }}
+        with:
+          version: 9
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        if: ${{ !inputs.skip_web_ui }}
+        with:
+          node-version: 22
+
+      - name: Install omnigent + PyInstaller
+        shell: bash
+        env:
+          OMNIGENT_SKIP_WEB_UI: ${{ inputs.skip_web_ui && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # Install the project itself (not editable): PyInstaller collects
+          # from site-packages, and an editable install leaves the package
+          # behind a path hook that --collect-all cannot walk.
+          python -m pip install .
+          python -m pip install pyinstaller==6.11.1
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python -c "import omnigent.version as v; print(v.VERSION)")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building omnigent $version for ${{ matrix.target }}"
+
+      - name: Build executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --collect-all pulls omnigent's package data (alembic migrations,
+          #   the SPA bundle, bundled agent configs) plus every submodule the
+          #   CLI imports lazily.
+          # --copy-metadata is REQUIRED, not cosmetic: harness_plugins.py
+          #   discovers community harnesses through
+          #   importlib.metadata.entry_points(), which reads dist metadata that
+          #   PyInstaller otherwise drops — without it the harness registry
+          #   silently loses every plugin.
+          pyinstaller \
+            --name omnigent \
+            --onefile \
+            --console \
+            --noconfirm \
+            --clean \
+            --collect-all omnigent \
+            --copy-metadata omnigent \
+            --hidden-import omnigent.cli \
+            --collect-all alembic \
+            --collect-submodules uvicorn \
+            --collect-submodules passlib \
+            scripts/pyinstaller_entry.py
+
+      # A binary that imports but cannot run its own CLI is worse than a build
+      # failure, because it ships. Exercise the real entry point.
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=dist/omnigent
+          # Not `[ ... ] && bin=...`: under `set -e` the false branch returns
+          # non-zero and would abort the step on every non-Windows runner.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            bin=dist/omnigent.exe
+          fi
+          "$bin" --version
+          "$bin" --help > /dev/null
+          echo "smoke OK"
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="omnigent-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          mkdir -p out
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "out/$name.zip" ./dist/omnigent.exe
+          else
+            tar -czf "out/$name.tar.gz" -C dist omnigent
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    # Tag pushes only: a manual run leaves the artifacts on the run and never
+    # creates or mutates a Release.
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'orvexai/omnigent'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the release + upload assets
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          path: dl
+
+      - name: Collect + checksum
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find dl -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} out/ \;
+          cd out
+          sha256sum * > SHA256SUMS
+          ls -la
+
+      # Draft, not published: a human eyeballs the four archives before this
+      # becomes the thing users download.
+      - uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          draft: true
+          generate_release_notes: true
+          files: out/*
