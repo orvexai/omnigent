@@ -585,6 +585,7 @@ class ToolManager:
             BrowserScreenshotTool,
             BrowserSnapshotTool,
             BrowserTypeTool,
+            BrowserWaitForTool,
         )
 
         for _cls in (
@@ -593,6 +594,7 @@ class ToolManager:
             BrowserClickTool,
             BrowserTypeTool,
             BrowserScreenshotTool,
+            BrowserWaitForTool,
         ):
             self._tools[_cls.name()] = _cls()
 

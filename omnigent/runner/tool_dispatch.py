@@ -27,6 +27,7 @@ import mimetypes
 import os
 import re
 import tempfile
+import time as _time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -420,8 +421,22 @@ _BROWSER_TOOLS = frozenset(
         "browser_click",
         "browser_type",
         "browser_screenshot",
+        # Synthesised runner-side from repeated ``snapshot`` actions — the
+        # renderer has no ``wait_for`` verb, and adding one would mean
+        # shipping the SPA the desktop app loads from the SERVER.
+        "browser_wait_for",
     }
 )
+
+# Cap on refs returned by one snapshot. A real page is enormous — Wikipedia's
+# main page yields ~490 refs in a single blob — and the renderer offers no way
+# to scope it, so an unbounded snapshot can consume a large slice of the
+# caller's context for one page. Truncating here is the only layer we control.
+_BROWSER_SNAPSHOT_DEFAULT_MAX_REFS = 120
+
+# Poll cadence and ceiling for the synthesised ``browser_wait_for``.
+_BROWSER_WAIT_POLL_S = 1.0
+_BROWSER_WAIT_MAX_S = 30.0
 
 # Runner-side outer HTTP read timeout for a browser action POST. The read
 # budget (60s) MUST exceed the server-side browser-action await (30s) so the
@@ -4106,6 +4121,180 @@ async def _execute_comment_tool(
         return json.dumps({"error": f"update_comment failed: {exc}"})
 
 
+def _browser_action_guidance(raw: str) -> str:
+    """
+    Turn an opaque renderer/browser failure into something an agent can act on.
+
+    Two failures dominate in practice and neither is self-explanatory:
+
+    - ``UnknownVizError`` is Chromium's compositor refusing to capture. The
+      pane is hidden (``setVisible(false)``), which the desktop app does
+      whenever a dialog or the Workspace panel is up so native paint does not
+      cover them — and that suppression is STICKY. Only ``screenshot`` needs a
+      compositor surface, which is why every other verb keeps working and the
+      raw error looks like a bug in the tool.
+    - The server's timeout text asserts the desktop app is not open. That is
+      often wrong: it fires for any action the renderer failed to answer, so
+      an agent whose other calls are succeeding is sent to debug a connection
+      that demonstrably works.
+
+    :param raw: The verbatim response body from the browser action.
+    :returns: The body, with actionable guidance appended when recognised.
+    """
+    if "UnknownVizError" in raw:
+        return json.dumps(
+            {
+                "error": "browser_pane_not_visible",
+                "message": (
+                    "The browser pane is hidden, so there is no rendered "
+                    "surface to capture. In the Omnigent desktop app close "
+                    "any open dialog and switch away from the Workspace panel "
+                    "so the browser pane is showing, then retry. Other browser "
+                    "tools keep working while it is hidden — only screenshot "
+                    "needs it visible."
+                ),
+                "detail": raw[:200],
+            }
+        )
+    return raw
+
+
+def _truncate_browser_snapshot(raw: str, max_refs: int) -> str:
+    """
+    Bound a snapshot's accessibility tree to *max_refs* elements.
+
+    The renderer returns the whole tree with no scoping, so one ordinary page
+    can cost a large slice of context. Truncation is explicit — the result
+    says how many refs were dropped — because silently returning a partial
+    tree would have the agent conclude an element does not exist when it was
+    merely cut off.
+
+    :param raw: The verbatim snapshot response body.
+    :param max_refs: Most tree lines to keep.
+    :returns: The body, with the tree truncated and annotated when it was too
+        long; unchanged when it already fits or cannot be parsed.
+    """
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return raw
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return raw
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return raw
+    tree = data.get("tree")
+    if not isinstance(tree, str):
+        return raw
+    lines = tree.splitlines()
+    if len(lines) <= max_refs:
+        return raw
+    dropped = len(lines) - max_refs
+    data["tree"] = "\n".join(lines[:max_refs])
+    data["truncated"] = True
+    data["dropped_elements"] = dropped
+    data["truncation_note"] = (
+        f"{dropped} further elements were omitted to bound context. An element "
+        "you expect may simply be below the cut — narrow the page (navigate "
+        "deeper, or use a CSS selector with browser_click/browser_type) rather "
+        "than assuming it is absent."
+    )
+    return json.dumps(payload)
+
+
+async def _browser_wait_for(
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> str:
+    """
+    Poll the page until expected text appears, or a timeout elapses.
+
+    The single biggest gap versus a full browser-automation surface is having
+    no way to await async content: on a redirect-heavy flow an agent otherwise
+    blind-fires snapshots and hopes. The renderer has no ``wait_for`` verb and
+    adding one would mean shipping the SPA — which the desktop app loads from
+    the SERVER, not from this host — so this is synthesised from the
+    ``snapshot`` action we already have.
+
+    :param args: ``{"text": <substring to await>, "timeout_s": <optional>}``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: Session whose browser pane to poll.
+    :returns: JSON reporting whether the text appeared, plus the final url.
+    """
+    text = args.get("text")
+    if not isinstance(text, str) or not text:
+        return json.dumps({"error": "browser_wait_for requires a non-empty 'text'"})
+    raw_timeout = args.get("timeout_s")
+    timeout_s = (
+        float(raw_timeout)
+        if isinstance(raw_timeout, int | float) and not isinstance(raw_timeout, bool)
+        else _BROWSER_WAIT_MAX_S
+    )
+    timeout_s = max(1.0, min(timeout_s, _BROWSER_WAIT_MAX_S))
+    deadline = _time.monotonic() + timeout_s
+    last_url: str | None = None
+    while True:
+        raw = await _post_browser_action("snapshot", {}, server_client, conversation_id)
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = {}
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, dict):
+            last_url = _optional_string(data.get("url")) or last_url
+            tree = data.get("tree")
+            if isinstance(tree, str) and text in tree:
+                return json.dumps({"ok": True, "found": True, "url": last_url, "waited_s": None})
+        if _time.monotonic() >= deadline:
+            return json.dumps(
+                {
+                    "ok": True,
+                    "found": False,
+                    "url": last_url,
+                    "message": (
+                        f"{text!r} did not appear within {timeout_s:.0f}s. The page may "
+                        "still be loading, the text may be inside an iframe the "
+                        "snapshot does not cover, or it may never appear."
+                    ),
+                }
+            )
+        await asyncio.sleep(_BROWSER_WAIT_POLL_S)
+
+
+async def _post_browser_action(
+    action: str,
+    args: _JsonObject,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> str:
+    """
+    POST one browser action and return the raw response body.
+
+    :param action: Bare verb, e.g. ``"snapshot"``.
+    :param args: Action arguments.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: Session whose browser pane to drive.
+    :returns: The response body, or a JSON error string.
+    """
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{conversation_id}/browser/action_request",
+            json={"action": action, "args": args},
+            timeout=_BROWSER_ACTION_TIMEOUT,
+        )
+    except httpx.ReadTimeout:
+        return _BROWSER_TIMEOUT_ERROR
+    except httpx.HTTPError as exc:
+        return json.dumps({"error": f"browser_{action} failed: {type(exc).__name__}: {exc}"})
+    if resp.status_code >= 400:
+        return json.dumps(
+            {"error": f"browser_{action} returned {resp.status_code}: {resp.text[:200]}"}
+        )
+    return resp.text
+
+
 async def _execute_browser_tool(
     tool_name: str,
     args: _JsonObject,
@@ -4145,25 +4334,28 @@ async def _execute_browser_tool(
     if conversation_id is None:
         return json.dumps({"error": f"{tool_name} requires a session id"})
 
+    # ``wait_for`` has no renderer verb — it is synthesised here from repeated
+    # ``snapshot`` actions, because the alternative is shipping the SPA, which
+    # the desktop app loads from the SERVER rather than from this host.
+    if tool_name == "browser_wait_for":
+        return await _browser_wait_for(
+            args, server_client=server_client, conversation_id=conversation_id
+        )
+
     # Strip the ``browser_`` prefix so the wire ``action`` matches the
     # frozen contract (navigate / snapshot / click / type / screenshot).
     action = tool_name[len("browser_") :]
-    try:
-        resp = await server_client.post(
-            f"/v1/sessions/{conversation_id}/browser/action_request",
-            json={"action": action, "args": args},
-            timeout=_BROWSER_ACTION_TIMEOUT,
+    raw = await _post_browser_action(action, args, server_client, conversation_id)
+    if action == "snapshot":
+        raw_max = args.get("max_refs")
+        max_refs = (
+            raw_max
+            if isinstance(raw_max, int) and not isinstance(raw_max, bool) and raw_max > 0
+            else _BROWSER_SNAPSHOT_DEFAULT_MAX_REFS
         )
-    except httpx.ReadTimeout:
-        # The server should return its own clean timeout JSON well before this
-        # fires (read(60) > server await(30)); this is the belt-and-suspenders
-        # path if the server itself stalls.
-        return _BROWSER_TIMEOUT_ERROR
-    except httpx.HTTPError as exc:
-        return json.dumps({"error": f"{tool_name} failed: {type(exc).__name__}: {exc}"})
-    if resp.status_code >= 400:
-        return json.dumps({"error": f"{tool_name} returned {resp.status_code}: {resp.text[:200]}"})
-    return resp.text
+        return _truncate_browser_snapshot(raw, max_refs)
+    # Rewrite the failures whose raw text sends an agent after the wrong cause.
+    return _browser_action_guidance(raw)
 
 
 async def _execute_policy_tool(
