@@ -5038,8 +5038,9 @@ def _child_rows_to_entries(
     Colon-less rows are included rather than skipped: ``sys_session_create``
     accepts a free-form title, so dropping them hid every MCP-created child
     from the caller's own sub-agent view — the orchestrator could not
-    enumerate the sessions it had just launched. Those rows report the bound
-    agent name and their own title instead of the parsed halves.
+    enumerate the sessions it had just launched. Those rows carry no agent
+    half to recover, so they report ``agent: null`` with the whole title as
+    the label, matching the in-process tool.
 
     :param rows: ``data`` rows from ``GET .../child_sessions``.
     :returns: ``[{"agent", "title", "conversation_id"}, ...]``.
@@ -5054,9 +5055,11 @@ def _child_rows_to_entries(
             agent = _optional_string(row.get("tool"))
             label = _optional_string(row.get("session_name"))
         else:
-            # ``tool`` degrades to the raw title for these rows, so prefer
-            # the durable agent name and keep the title as the label.
-            agent = _optional_string(row.get("agent_name")) or _optional_string(row.get("tool"))
+            # ``tool`` degrades to the RAW TITLE on these rows, so reusing it
+            # would report the title as the agent's name — a name no agent
+            # actually has. Report the honest absence instead; the caller
+            # reads the real binding from sys_session_get_info.
+            agent = _optional_string(row.get("agent_name"))
             label = title_without_closed_marker(title)
         entries.append(
             {
