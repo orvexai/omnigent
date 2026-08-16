@@ -5210,7 +5210,14 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
     async with _session_query_client(handler) as client:
         out = json.loads(
             await _execute_session_query_tool(
-                "sys_session_list", "{}", conversation_id="conv_parent", server_client=client
+                "sys_session_list",
+                "{}",
+                conversation_id="conv_parent",
+                server_client=client,
+                # A title's head names an agent only if the caller's spec
+                # declares it; without a spec every non-``ui:`` row is
+                # reported as agent: null.
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
             )
         )
     # c3 (explicitly closed despite its mixed-type label map) and c5
@@ -5270,7 +5277,11 @@ async def test_session_list_adds_main_and_siblings_for_child_caller() -> None:
     async with _session_query_client(handler) as client:
         out = json.loads(
             await _execute_session_query_tool(
-                "sys_session_list", "{}", conversation_id="conv_added", server_client=client
+                "sys_session_list",
+                "{}",
+                conversation_id="conv_added",
+                server_client=client,
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
             )
         )
     # No own children; gains main (its parent) + the sibling, with itself
@@ -6517,29 +6528,27 @@ async def test_get_info_keeps_own_placement_without_extra_lookup() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("wrapper_label", "expect_accepted"),
-    [
-        ("codex-native-ui", True),
-        ("claude-code-native-ui", False),
-    ],
-    ids=["steering_harness_accepts", "queueing_harness_refuses"],
-)
-async def test_midturn_send_follows_the_harness_steer_capability(
-    wrapper_label: str,
-    expect_accepted: bool,
-) -> None:
+async def test_send_to_a_child_with_live_work_is_refused() -> None:
     """
-    A busy child accepts a mid-turn send only where the harness can steer.
+    A second send to a child that already has a live dispatch is refused.
 
-    On a steering harness the message redirects the active turn, which is
-    exactly what an orchestrator wants; on a queueing one it would sit
-    until the turn ends, so the interlock refuses and says why.
+    This is the interlock branch that actually fires in production. The
+    registry keys work by CHILD SESSION ID and ``register_subagent_work``
+    REPLACES, so it cannot represent two outstanding dispatches: letting a
+    second send through orphans the first ``work_id``, and if the outgoing
+    turn ends inside the message-POST window its output is delivered under
+    the NEW dispatch id while the second turn's real output is discarded by
+    the ``delivered`` dedupe.
+
+    Asserted through the registry rather than a ``busy`` snapshot field —
+    ``SessionResponse`` has no ``busy`` key, so a test driving that path
+    proves nothing about the live one.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    posted: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_busy":
@@ -6549,35 +6558,41 @@ async def test_midturn_send_follows_the_harness_steer_capability(
                     "id": "conv_busy",
                     "parent_session_id": "conv_caller",
                     "title": "researcher:auth",
-                    "busy": True,
-                    "labels": {"omnigent.wrapper": wrapper_label},
+                    "sub_agent_name": "researcher",
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_busy/events":
+            posted.append(json.loads(request.content))
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_server_handler),
-        base_url="http://server",
-    ) as server_client:
-        try:
+    runner_app.register_subagent_work(
+        parent_session_id="conv_caller",
+        child_session_id="conv_busy",
+        agent="researcher",
+        title="auth",
+    )
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
             output = await execute_tool(
                 tool_name="sys_session_send",
-                arguments=json.dumps({"session_id": "conv_busy", "args": "STOP, reply KIWI"}),
+                arguments=json.dumps({"session_id": "conv_busy", "args": "second message"}),
                 server_client=server_client,
                 conversation_id="conv_caller",
                 agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
                 session_inbox=session_inbox,
             )
-        finally:
-            runner_app.unregister_subagent_work("conv_busy")
-            runner_app._session_inboxes_ref.pop("conv_caller", None)
+    finally:
+        runner_app.unregister_subagent_work("conv_busy")
+        runner_app._session_inboxes_ref.pop("conv_caller", None)
 
-    if expect_accepted:
-        assert json.loads(output)["status"] == "launching"
-    else:
-        assert "cannot steer mid-turn" in output
+    assert "already has a launching or running turn" in output
+    # The refusal must be total: no message may reach the child, or the
+    # child runs work the parent believes was rejected.
+    assert posted == []
 
 
 @pytest.mark.parametrize(
@@ -6606,43 +6621,73 @@ def test_get_info_reports_declared_midturn_steer_capability(
     assert _session_supports_midturn_steer(snap) is expected
 
 
-def test_session_create_body_forwards_placement_but_forces_parentage() -> None:
+@pytest.mark.asyncio
+async def test_sys_session_create_never_forwards_placement_arguments() -> None:
     """
-    ``host_id`` / ``workspace`` reach the wire; the parent stays forced.
+    ``host_id`` / ``workspace`` must never reach ``POST /v1/sessions``.
 
-    Placement and containment are independent: an orchestrator may put a
-    child on another host, but must never be able to retarget its parent
-    and escape its own subtree.
+    Two independent reasons, both verified against the server:
+
+    1. A parented create force-inherits the parent's runner
+       (``inherited_runner_id``), which wins over ``host_id`` in routing —
+       so forwarding it advertised a placement the server cannot honor and
+       handed the child a cwd validated on a different machine.
+    2. The server boundary-checks ``workspace`` against the agent's
+       ``os_env.cwd`` ONLY when ``host_id`` is set. Forwarding ``workspace``
+       alone therefore let a caller point a child's tool cwd anywhere on the
+       runner's filesystem, escaping the agent's sandbox.
+
+    Asserted through ``execute_tool`` rather than the body builder, so
+    re-adding the arguments at the call site cannot pass unnoticed.
     """
-    from omnigent.runner.tool_dispatch import _build_session_create_body
+    from omnigent.runner.tool_dispatch import execute_tool
 
-    body = _build_session_create_body(
-        "ag_abc",
-        "conv_caller",
-        "worker",
-        "go",
-        host_id="host_remote",
-        workspace="/srv/work/repo",
-    )
+    seen: dict[str, Any] = {}
 
-    assert body["host_id"] == "host_remote"
-    assert body["workspace"] == "/srv/work/repo"
-    assert body["parent_session_id"] == "conv_caller"
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            seen.update(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_new", "agent_name": "researcher"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": "ag_abc",
+                    "title": "worker",
+                    "host_id": "host_remote",
+                    "workspace": "/",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert "host_id" not in seen, seen
+    assert "workspace" not in seen, seen
+    # Containment is still forced.
+    assert seen["parent_session_id"] == "conv_caller"
 
 
-def test_session_create_body_omits_placement_when_not_requested() -> None:
+def test_sys_session_create_schema_advertises_no_placement() -> None:
     """
-    Without placement args the body carries neither key.
+    The LLM-facing schema must not offer placement it cannot deliver.
 
-    Sending ``host_id: null`` would trip the server's "workspace required
-    for host" validator and break the ordinary co-located create.
+    Leaving the properties on the schema while dropping them on the wire
+    would be worse than either: the model would believe it had placed a
+    worker on another host and silently get a co-located one.
     """
-    from omnigent.runner.tool_dispatch import _build_session_create_body
+    from omnigent.tools.builtins.spawn import SysSessionCreateTool
 
-    body = _build_session_create_body("ag_abc", "conv_caller", "worker", "go")
+    props = SysSessionCreateTool().get_schema()["function"]["parameters"]["properties"]
 
-    assert "host_id" not in body
-    assert "workspace" not in body
+    assert "host_id" not in props
+    assert "workspace" not in props
 
 
 def test_subagent_inbox_line_names_the_dispatch_that_produced_it() -> None:
@@ -6698,15 +6743,20 @@ def test_subagent_inbox_line_omits_dispatch_when_absent() -> None:
 
 def test_child_rows_surface_free_form_titled_children() -> None:
     """
-    ``sys_session_list``'s sub_agents view includes colon-less children.
+    ``sys_session_list``'s sub_agents view includes free-form-titled children,
+    and never invents an agent name for them.
 
-    ``sys_session_create`` accepts a free-form title, and skipping rows
-    without a ``":"`` hid every MCP-created child from the caller's own
-    sub-agent view — an orchestrator could not enumerate the sessions it
-    had just launched. Closed rows stay hidden either way.
+    ``sys_session_create`` accepts an arbitrary title, so skipping such rows
+    hid every MCP-created child from the parent that launched it. But the
+    agent name may only be reported when the caller can actually dispatch to
+    it: the head must be a sub-agent the spec declares, or the title must
+    carry the Web UI's explicit ``ui:`` marker. A bare colon is not enough —
+    ``"team:alpha"`` is a label, not a binding to an agent named ``team``.
+    Closed rows stay hidden either way.
     """
     from omnigent.runner.tool_dispatch import _child_rows_to_entries
 
+    spec = SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")])
     entries = _child_rows_to_entries(
         [
             {
@@ -6717,13 +6767,25 @@ def test_child_rows_surface_free_form_titled_children() -> None:
                 "labels": {},
             },
             {
+                "id": "conv_ui",
+                "title": "ui:claude-native-ui:1",
+                "tool": "claude-native-ui",
+                "session_name": "1",
+                "labels": {},
+            },
+            {
                 "id": "conv_freeform",
-                # The server sets ``tool`` to the raw title on a colon-less
-                # row and leaves ``agent_name`` unset, so neither yields a
-                # real agent name here.
                 "title": "my-worker",
                 "tool": "my-worker",
                 "session_name": None,
+                "labels": {},
+            },
+            {
+                # A colon here is punctuation, not an agent binding.
+                "id": "conv_colon",
+                "title": "team:alpha",
+                "tool": "team",
+                "session_name": "alpha",
                 "labels": {},
             },
             {
@@ -6731,22 +6793,31 @@ def test_child_rows_surface_free_form_titled_children() -> None:
                 "title": "gone:closed:conv_closed",
                 "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
             },
-        ]
+        ],
+        spec,
     )
 
     by_id = {e["conversation_id"]: e for e in entries}
-    assert set(by_id) == {"conv_named", "conv_freeform"}
+    assert set(by_id) == {"conv_named", "conv_ui", "conv_freeform", "conv_colon"}
     assert by_id["conv_named"] == {
         "agent": "researcher",
         "title": "auth",
         "conversation_id": "conv_named",
     }
-    # ``agent`` is null rather than the title: reusing ``tool`` here would
-    # assert an agent named "my-worker", which does not exist.
+    assert by_id["conv_ui"] == {
+        "agent": "claude-native-ui",
+        "title": "1",
+        "conversation_id": "conv_ui",
+    }
     assert by_id["conv_freeform"] == {
         "agent": None,
         "title": "my-worker",
         "conversation_id": "conv_freeform",
+    }
+    assert by_id["conv_colon"] == {
+        "agent": None,
+        "title": "team:alpha",
+        "conversation_id": "conv_colon",
     }
 
 

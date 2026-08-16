@@ -2198,34 +2198,34 @@ async def _send_to_existing_session(
             }
         )
     parsed = _parse_session_title(snap_data.get("title"))
-    # A child created via sys_session_create carries a free-form title with
-    # no "<agent>:" prefix, so the parsed halves are empty. Falling back to
-    # the bound agent name and the raw title keeps the handle and the inbox
-    # line naming the child the caller actually knows, instead of the
-    # anonymous "agent" / null it would otherwise report.
+    # ``sub_agent_name`` — not the title's shape — is what says a child was
+    # spawned as a NAMED sub-agent and therefore stores "<agent>:<title>".
+    # A sys_session_create child leaves it NULL and takes a free-form title,
+    # so splitting that on its first colon invents an agent that does not
+    # exist (title "bug: login 500" -> agent "bug"). Such a child is named
+    # by its bound agent and its own whole title instead.
     raw_title = title_without_closed_marker(_optional_string(snap_data.get("title"))) or ""
+    if _optional_string(snap_data.get("sub_agent_name")) is None:
+        parsed = _ParsedTitle(agent=None, title=None)
     agent_label = parsed.agent or _optional_string(snap_data.get("agent_name")) or "agent"
     child_label = parsed.title if parsed.agent is not None else (raw_title or None)
-    # A harness that steers redirects its active turn, so a mid-turn send is
-    # the whole point of sending. Refusing only where the message would sit
-    # until the turn ends keeps the busy interlock meaningful without
-    # blocking the correction an orchestrator is trying to make.
-    can_steer = _session_supports_midturn_steer(snap_data) is True
+    # One outstanding dispatch per child, always — even on a harness that
+    # can steer. ``register_subagent_work`` is keyed by child session id and
+    # REPLACES the prior entry, so the registry cannot represent two live
+    # dispatches: a second send silently orphans the first work_id, and if
+    # the outgoing turn ends inside the message-POST window its output is
+    # delivered under the NEW dispatch's id while the second turn's real
+    # output is dropped by the ``delivered`` dedupe. Steering must wait for
+    # a registry that can hold both before the guard can relax.
     existing_work = _runner_app.get_subagent_work(target_session_id)
-    busy_work = existing_work is not None and existing_work.status in (
+    if existing_work is not None and existing_work.status in (
         "launching",
         "running",
         "waiting",
-    )
-    if busy_work and not can_steer:
+    ):
         return (
-            f"Error: session {target_session_id!r} already has a launching or running turn "
-            "and its harness cannot steer mid-turn; wait for completion before sending again"
-        )
-    if snap_data.get("busy") is True and not can_steer:
-        return (
-            f"Error: session {target_session_id!r} is already running and its harness cannot "
-            "steer mid-turn; wait for completion before sending again"
+            f"Error: session {target_session_id!r} already has a launching or running turn; "
+            "wait for completion before sending again (use sys_cancel_task to interrupt it)"
         )
     _runner_app.register_child_session(
         target_session_id,
@@ -2391,8 +2391,6 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
-    host_id: object = None,
-    workspace: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -2411,11 +2409,17 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
-    :param host_id: Optional host to place the child on, e.g.
-        ``"host_a1b2c3d4"``. Omitted means co-located with the parent.
-    :param workspace: Absolute start directory on that host; the server
-        rejects a ``host_id`` without one.
     :returns: The JSON request body.
+
+    Deliberately sends NO ``host_id`` / ``workspace``. A parented create
+    always inherits the parent's runner server-side
+    (``inherited_runner_id``), which wins over ``host_id`` in routing, so
+    forwarding them advertised a placement the server cannot honor while
+    handing the child a cwd validated against a different machine. Worse,
+    ``workspace`` is only boundary-checked against the agent's
+    ``os_env.cwd`` when ``host_id`` is set, so forwarding it alone let a
+    caller point a child anywhere on the runner's filesystem. Cross-host
+    child placement needs a server-side change first.
     """
     body: _JsonObject = {
         "agent_id": agent_id,
@@ -2425,12 +2429,6 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
-    # Placement is independent of parentage: the child stays contained in
-    # the caller's subtree while running on a host of the caller's choice.
-    if isinstance(host_id, str) and host_id:
-        body["host_id"] = host_id
-    if isinstance(workspace, str) and workspace:
-        body["workspace"] = workspace
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2604,8 +2602,6 @@ async def _execute_session_create(
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
-        host_id=args.get("host_id"),
-        workspace=args.get("workspace"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -3919,7 +3915,12 @@ async def _execute_session_query_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
     if tool_name == "sys_session_list":
-        return await _session_list_via_rest(conversation_id, server_client, args.get("agent_name"))
+        return await _session_list_via_rest(
+            conversation_id,
+            server_client,
+            args.get("agent_name"),
+            agent_spec=agent_spec,
+        )
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
     if tool_name == "sys_session_get_info":
@@ -4062,6 +4063,11 @@ async def _session_get_info_via_rest(
 
 # How far up the parent chain a metadata read will look for placement.
 _PLACEMENT_ANCESTOR_HOPS = 5
+
+# Title prefix the Web UI "Add agent" flow writes ("ui:<agent>:<label>"). An
+# explicit marker, so unlike a bare colon it cannot be produced by a
+# free-form sys_session_create title and is safe to parse an agent out of.
+_UI_ADDED_TITLE_PREFIX = "ui:"
 
 
 @dataclass
@@ -4819,6 +4825,8 @@ async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     agent_name: object = None,
+    *,
+    agent_spec: AgentSpec | None = None,
 ) -> str:
     """
     Return the two-view session list: ``sub_agents`` + global ``sessions``.
@@ -4838,7 +4846,7 @@ async def _session_list_via_rest(
         ``sessions`` view; ignored for ``sub_agents``.
     :returns: JSON ``{"sub_agents": [...], "sessions": [...]}``.
     """
-    sub_agents = await _collect_sub_agents(conversation_id, server_client)
+    sub_agents = await _collect_sub_agents(conversation_id, server_client, agent_spec=agent_spec)
     sessions = await _collect_global_sessions(server_client, agent_name)
     return json.dumps({"sub_agents": sub_agents, "sessions": sessions})
 
@@ -4889,6 +4897,8 @@ async def _rename_current_session_via_rest(
 async def _collect_sub_agents(
     conversation_id: str,
     server_client: httpx.AsyncClient,
+    *,
+    agent_spec: AgentSpec | None = None,
 ) -> list[dict[str, str | None]]:
     """
     Collect the caller's named-sub-agent view via ``GET .../child_sessions``.
@@ -4915,7 +4925,7 @@ async def _collect_sub_agents(
         return []
     if resp.status_code != 200:
         return []
-    result = _child_rows_to_entries(resp.json().get("data", []))
+    result = _child_rows_to_entries(resp.json().get("data", []), agent_spec)
 
     # If the caller is itself a child, surface main + siblings too.
     parent_id = await _session_parent_id(conversation_id, server_client)
@@ -4928,7 +4938,7 @@ async def _collect_sub_agents(
                 timeout=30.0,
             )
             if sib_resp.status_code == 200:
-                for entry in _child_rows_to_entries(sib_resp.json().get("data", [])):
+                for entry in _child_rows_to_entries(sib_resp.json().get("data", []), agent_spec):
                     # Exclude the caller itself from its own sibling list.
                     if entry["conversation_id"] != conversation_id:
                         result.append(entry)
@@ -5027,6 +5037,7 @@ async def _collect_global_sessions(
 
 def _child_rows_to_entries(
     rows: list[_JsonObject],
+    agent_spec: AgentSpec | None = None,
 ) -> list[dict[str, str | None]]:
     """
     Map ``child_sessions`` rows to ``sys_session_list`` entries.
@@ -5035,14 +5046,25 @@ def _child_rows_to_entries(
     ``tool``/``session_name`` from the title (including the
     ``"ui:<agent>:<label>"`` form), so those are reused.
 
-    Colon-less rows are included rather than skipped: ``sys_session_create``
-    accepts a free-form title, so dropping them hid every MCP-created child
-    from the caller's own sub-agent view — the orchestrator could not
-    enumerate the sessions it had just launched. Those rows carry no agent
-    half to recover, so they report ``agent: null`` with the whole title as
-    the label, matching the in-process tool.
+    ``sys_session_create`` children are included rather than skipped: they
+    take a free-form title, so dropping them hid every MCP-created child from
+    the caller's own sub-agent view.
+
+    ``agent`` is only reported when it is a name the caller can actually
+    dispatch to — the head of the title must be a sub-agent the parent's spec
+    declares, or the title must carry the Web UI's explicit ``"ui:"`` prefix.
+    A bare ``":"`` is NOT sufficient: a free-form title like
+    ``"bug: login 500"`` would otherwise be reported as a child bound to an
+    agent named ``"bug"``, and an orchestrator feeding that back into
+    named-mode ``sys_session_send`` would spawn an unrelated child rather
+    than reach this one. Unrecognized rows report ``agent: null`` with the
+    whole title as the label, which still identifies the child; its real
+    binding comes from ``sys_session_get_info``.
 
     :param rows: ``data`` rows from ``GET .../child_sessions``.
+    :param agent_spec: The calling agent's spec, used to decide whether a
+        title's head names a declared sub-agent. ``None`` reports every
+        non-``ui:`` row as ``agent: null``.
     :returns: ``[{"agent", "title", "conversation_id"}, ...]``.
     """
     entries: list[dict[str, str | None]] = []
@@ -5051,16 +5073,16 @@ def _child_rows_to_entries(
         labels = _string_mapping(row.get("labels"))
         if not title or is_session_closed(labels, title):
             continue
-        if ":" in title:
-            agent = _optional_string(row.get("tool"))
+        display = title_without_closed_marker(title) or ""
+        parsed_agent = _optional_string(row.get("tool"))
+        if display.startswith(_UI_ADDED_TITLE_PREFIX) or (
+            parsed_agent is not None and _has_subagent(parsed_agent, agent_spec)
+        ):
+            agent = parsed_agent
             label = _optional_string(row.get("session_name"))
         else:
-            # ``tool`` degrades to the RAW TITLE on these rows, so reusing it
-            # would report the title as the agent's name — a name no agent
-            # actually has. Report the honest absence instead; the caller
-            # reads the real binding from sys_session_get_info.
-            agent = _optional_string(row.get("agent_name"))
-            label = title_without_closed_marker(title)
+            agent = None
+            label = display
         entries.append(
             {
                 "agent": agent,

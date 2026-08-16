@@ -26,7 +26,16 @@ NATIVE_CODING_AGENTS = _registry_native_agents()
 
 _BY_AGENT_NAME = {agent.agent_name: agent for agent in NATIVE_CODING_AGENTS}
 _BY_HARNESS = {agent.harness: agent for agent in NATIVE_CODING_AGENTS}
-_BY_WRAPPER_LABEL = {agent.wrapper_label: agent for agent in NATIVE_CODING_AGENTS}
+# Both the session wrapper label and the sub-agent variant map to the same
+# harness. A named-mode sub-agent is stamped ``<agent>-subagent``, so keying
+# only on ``wrapper_label`` left every fan-out worker unresolvable — the exact
+# sessions a capability lookup is asked about.
+_BY_WRAPPER_LABEL = {
+    label: agent
+    for agent in NATIVE_CODING_AGENTS
+    for label in (agent.wrapper_label, agent.subagent_wrapper_label)
+    if label
+}
 _BY_TERMINAL_NAME = {agent.terminal_name: agent for agent in NATIVE_CODING_AGENTS}
 
 # Canonical built-in ``*-native-ui`` agent names, one per tier-1 native harness.
