@@ -25,6 +25,7 @@ from collections.abc import Callable
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool
 from omnigent.tools.builtins.advise_models import SysAdviseModelsTool
+from omnigent.tools.builtins.agent_limits import SysAgentLimitsTool
 from omnigent.tools.builtins.agents import (
     SysAgentDownloadTool,
     SysAgentGetTool,
@@ -83,6 +84,7 @@ __all__ = [
     "SysAdviseModelsTool",
     "SysAgentDownloadTool",
     "SysAgentGetTool",
+    "SysAgentLimitsTool",
     "SysAgentListTool",
     "SysCallAsyncTool",
     "SysCancelAsyncTool",

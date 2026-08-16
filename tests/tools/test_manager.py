@@ -90,6 +90,11 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "browser_click",
         "browser_type",
         "browser_screenshot",
+        # The per-host agent caps are always readable: an agent refused with
+        # host_agent_limit_reached cannot act on it without seeing the cap,
+        # and this is the only surface that says whether a raise survives a
+        # restart.
+        "sys_agent_limits",
     }
 )
 

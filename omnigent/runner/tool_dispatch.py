@@ -296,6 +296,10 @@ _SESSION_QUERY_TOOLS = frozenset(
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
 
+# Runner-local and server-free: the caps live in this process plus
+# ``config.yaml``, so the tool needs no server round trip at all.
+_AGENT_LIMITS_TOOLS = frozenset({"sys_agent_limits"})
+
 # Grantee sentinel for an anonymous, public read-only share. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
 # ``agent_session_sharing: public`` may grant it (enforced in
@@ -2135,6 +2139,250 @@ async def _execute_subagent_tool(
     )
 
 
+def _session_cli(agent_name: str | None) -> str | None:
+    """
+    Reduce an agent name to the CLI/toolchain it runs.
+
+    The cap is per TOOLCHAIN, not per agent: ten differently-named agents
+    all driving ``codex`` are ten codex processes on the box, and counting
+    them separately would let the dimension be trivially side-stepped by
+    renaming.
+
+    :param agent_name: Raw session ``agent_name``, e.g. ``"codex-native-ui"``.
+    :returns: The harness key, e.g. ``"codex-native"``; the agent name itself
+        when it is not a native wrapper; ``None`` when unknown.
+    """
+    from omnigent.native_coding_agents import (
+        native_coding_agent_for_agent_name,
+        native_coding_agent_for_wrapper_label,
+    )
+
+    if not agent_name:
+        return None
+    native = native_coding_agent_for_agent_name(agent_name) or (
+        native_coding_agent_for_wrapper_label(agent_name)
+    )
+    return native.harness if native is not None else agent_name
+
+
+async def _agent_name_for_id(
+    agent_id: str,
+    server_client: httpx.AsyncClient,
+) -> str | None:
+    """
+    Resolve a registered agent's name from its durable id.
+
+    :param agent_id: The agent to launch, e.g. ``"ag_abc123"``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: The agent's name, or ``None`` when it cannot be resolved.
+    """
+    try:
+        resp = await server_client.get(
+            "/v1/agents",
+            params={"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"},
+            timeout=30.0,
+        )
+    except Exception:  # noqa: BLE001 — an unresolvable name only relaxes the CLI cap
+        return None
+    if resp.status_code != 200:
+        return None
+    body = _string_object_dict(resp.json())
+    if body is None:
+        return None
+    for row in _json_object_list(body.get("data")):
+        if _optional_string(row.get("id")) == agent_id:
+            return _optional_string(row.get("name"))
+    return None
+
+
+def execute_agent_limits(arguments: str) -> str:
+    """
+    Report or change the per-host agent caps.
+
+    Shared by both executors (the in-process tool delegates here) so the
+    LLM sees one contract. Server-free: the caps live in this process and
+    in ``config.yaml``.
+
+    Persistence status is ALWAYS reported, never assumed. A change that
+    applied at runtime but could not be written would otherwise come back
+    as a mysterious regression after the next restart, so a failed write is
+    surfaced as ``persisted: false`` plus an explicit warning rather than
+    being swallowed or raised.
+
+    :param arguments: JSON-encoded arguments; optional ``max_per_host`` and
+        ``max_per_cli_per_host``.
+    :returns: JSON describing the limits now in force.
+    """
+    from omnigent.agent_limits import apply_limits, config_file_path, current_limits
+
+    try:
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": "sys_agent_limits: malformed JSON arguments"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": "sys_agent_limits: arguments must be a JSON object"})
+    requested_host = args.get("max_per_host")
+    requested_cli = args.get("max_per_cli_per_host")
+    if requested_host is None and requested_cli is None:
+        limits = current_limits()
+        return json.dumps(
+            {
+                "max_per_host": limits.max_per_host,
+                "max_per_cli_per_host": limits.max_per_cli_per_host,
+                "config_file": str(config_file_path()),
+            }
+        )
+    try:
+        update = apply_limits(
+            max_per_host=requested_host if isinstance(requested_host, int) else None,
+            max_per_cli_per_host=requested_cli if isinstance(requested_cli, int) else None,
+        )
+    except ValueError as exc:
+        return json.dumps({"error": "invalid_limit", "message": str(exc)})
+    result: _JsonObject = {
+        "updated": True,
+        "max_per_host": update.limits.max_per_host,
+        "max_per_cli_per_host": update.limits.max_per_cli_per_host,
+        "applies_immediately": True,
+        "persisted": update.persisted_path is not None,
+        "config_file": str(update.persisted_path or config_file_path()),
+    }
+    if update.persist_error is not None:
+        result["persist_error"] = update.persist_error
+        result["warning"] = (
+            "The new limit is active NOW but could not be written to the "
+            "config file, so it WILL BE LOST when the host restarts. Edit "
+            f"{config_file_path()} by hand to make it durable."
+        )
+    return json.dumps(result)
+
+
+async def _caller_host_id(
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+) -> str | None:
+    """
+    Resolve which host the calling session runs on.
+
+    A child is co-located with its caller, so this is also the host that
+    would carry any session the caller creates.
+
+    :param conversation_id: The caller's own session id.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: The effective host id, or ``None`` when the caller has none
+        (a CLI-launched tree) or it cannot be read.
+    """
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{conversation_id}",
+            params={"include_items": "false", "include_liveness": "false"},
+            timeout=30.0,
+        )
+    except Exception:  # noqa: BLE001 — an unknown host skips the cap, never blocks
+        return None
+    if resp.status_code != 200:
+        return None
+    snap = _string_object_dict(resp.json())
+    if snap is None:
+        return None
+    return (await _effective_placement(snap, server_client)).host_id
+
+
+async def _agent_limit_refusal(
+    *,
+    host_id: str | None,
+    new_cli: str | None,
+    server_client: httpx.AsyncClient,
+) -> str | None:
+    """
+    Refuse a create that would exceed this host's agent caps.
+
+    A host is a finite machine and nothing bounded how many agent sessions
+    an orchestrator could put on it; the failure then surfaced as unrelated
+    timeouts instead of a refusal the caller could act on. Two dimensions:
+    the overall count protects the box, and the per-CLI count stops one
+    toolchain consuming the whole budget on its own.
+
+    Fails OPEN on an unreadable session list. A transient read error must
+    not block every create — a cap that turns a blip into a total outage is
+    worse than the overload it prevents.
+
+    :param host_id: Host the new session would land on; ``None`` (a
+        CLI-launched tree with no host record) skips the check, since there
+        is no host to attribute the count to.
+    :param new_cli: CLI the new session would run, from :func:`_session_cli`;
+        ``None`` checks only the overall cap.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: A JSON error string when the create must be refused, else
+        ``None``.
+    """
+    from omnigent.agent_limits import current_limits
+
+    if host_id is None:
+        return None
+    limits = current_limits()
+    try:
+        resp = await server_client.get(
+            "/v1/sessions",
+            params={"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"},
+            timeout=30.0,
+        )
+    except Exception:  # noqa: BLE001 — fail open, see above
+        return None
+    if resp.status_code != 200:
+        return None
+    body = _string_object_dict(resp.json())
+    if body is None:
+        return None
+    on_host = 0
+    on_host_same_cli = 0
+    for row in _json_object_list(body.get("data")):
+        if _optional_string(row.get("host_id")) != host_id:
+            continue
+        # A closed session holds nothing on the machine, so counting it
+        # would permanently shrink the budget as sessions accumulate.
+        if is_session_closed(
+            _string_mapping(row.get("labels")), _optional_string(row.get("title"))
+        ):
+            continue
+        on_host += 1
+        if (
+            new_cli is not None
+            and _session_cli(_optional_string(row.get("agent_name"))) == new_cli
+        ):
+            on_host_same_cli += 1
+    if on_host >= limits.max_per_host:
+        return json.dumps(
+            {
+                "error": "host_agent_limit_reached",
+                "host_id": host_id,
+                "limit": limits.max_per_host,
+                "current": on_host,
+                "message": (
+                    f"host already runs {on_host} agent sessions (limit "
+                    f"{limits.max_per_host}); close one with sys_session_close "
+                    "or raise the cap with sys_agent_limits."
+                ),
+            }
+        )
+    if new_cli is not None and on_host_same_cli >= limits.max_per_cli_per_host:
+        return json.dumps(
+            {
+                "error": "cli_agent_limit_reached",
+                "host_id": host_id,
+                "cli": new_cli,
+                "limit": limits.max_per_cli_per_host,
+                "current": on_host_same_cli,
+                "message": (
+                    f"host already runs {on_host_same_cli} {new_cli!r} sessions "
+                    f"(limit {limits.max_per_cli_per_host}); close one, use a "
+                    "different CLI, or raise the cap with sys_agent_limits."
+                ),
+            }
+        )
+    return None
+
+
 def _validated_child_workspace(
     workspace: object,
     *,
@@ -2969,6 +3217,15 @@ async def _execute_session_create(
     )
     if isinstance(checked_workspace, str):
         return checked_workspace
+    # The child is co-located with the caller, so the caller's host is the
+    # one that would carry it.
+    limit_error = await _agent_limit_refusal(
+        host_id=await _caller_host_id(conversation_id, server_client),
+        new_cli=_session_cli(await _agent_name_for_id(str(agent_id), server_client)),
+        server_client=server_client,
+    )
+    if limit_error is not None:
+        return limit_error
     body = _build_session_create_body(
         str(agent_id),
         conversation_id,
@@ -5967,6 +6224,8 @@ async def execute_tool(
                 conversation_id,
                 server_client,
             )
+        elif tool_name in _AGENT_LIMITS_TOOLS:
+            output = execute_agent_limits(arguments)
         elif tool_name in _SESSION_QUERY_TOOLS:
             output = await _execute_session_query_tool(
                 tool_name,
