@@ -52,7 +52,9 @@ jobs:
     # Gated to this fork; inert upstream and in other mirrors.
     if: github.repository == 'orvexai/omnigent'
     name: linux-x86_64
-    runs-on: runners
+    # This is the org's own self-hosted Linux pool; the repo's CI proves
+    # that the public-runners label resolves to an online runner.
+    runs-on: public-runners
     timeout-minutes: 60
 
     steps:
@@ -393,7 +395,7 @@ jobs:
     # creates or mutates a Release.
     if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'orvexai/omnigent'
     needs: build-linux
-    runs-on: runners
+    runs-on: public-runners
     timeout-minutes: 15
     permissions:
       contents: write # create the release + upload assets
