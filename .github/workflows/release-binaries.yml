@@ -8,11 +8,12 @@
 # with no Python toolchain at all.
 #
 # Release flow:
-#   1. Push a tag (v*) -> build the three binaries, smoke them, publish a
-#      draft GitHub Release with the archives + SHA256SUMS attached.
+#   1. Push a tag (v*) -> build and smoke the Linux binary, then publish a
+#      draft GitHub Release with its archive + SHA256SUMS attached.
 #   2. Review the draft, then publish it by hand.
-#   Manual `workflow_dispatch` builds and uploads run artifacts WITHOUT
-#   touching Releases, so the packaging can be exercised off a tag.
+#   Manual `workflow_dispatch` builds and uploads the Linux artifact WITHOUT
+#   touching Releases. Set `build_other_platforms` to also exercise the
+#   Windows and macOS packaging legs on their platform runners.
 #
 # The SPA is built by setup.py during `pip install .` (it is skipped only when
 # OMNIGENT_SKIP_WEB_UI=true), so every platform sets up Node + pnpm and the
@@ -29,6 +30,10 @@ on:
         description: "Build without the bundled web UI (faster; CLI/host only)."
         type: boolean
         default: false
+      build_other_platforms:
+        description: "Also build the Windows and macOS binaries on platform runners."
+        type: boolean
+        default: false
   # CI-test the workflow on change; the publish job is gated off PR events.
   pull_request:
     paths:
@@ -43,9 +48,170 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  build-linux:
     # Gated to this fork; inert upstream and in other mirrors.
     if: github.repository == 'orvexai/omnigent'
+    name: linux-x86_64
+    runs-on: runners
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version-file: .python-version
+
+      # setup.py shells out to pnpm to build the SPA into
+      # omnigent/server/static/web-ui unless OMNIGENT_SKIP_WEB_UI=true.
+      # setup-node BEFORE pnpm/action-setup: its self-installer needs a Node
+      # binary. Same order the repo's other pnpm workflows use.
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        if: ${{ !inputs.skip_web_ui }}
+        with:
+          node-version: 22
+      # Must equal package.json's "packageManager" pin — action-setup v4 hard
+      # errors when a `version:` here disagrees with it.
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        if: ${{ !inputs.skip_web_ui }}
+        with:
+          version: 11.15.1
+          standalone: true
+
+      - name: Install omnigent + PyInstaller
+        shell: bash
+        env:
+          OMNIGENT_SKIP_WEB_UI: ${{ inputs.skip_web_ui && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # Install the project itself (not editable): PyInstaller collects
+          # from site-packages, and an editable install leaves the package
+          # behind a path hook that --collect-all cannot walk.
+          python -m pip install .
+          python -m pip install pyinstaller==6.11.1
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python -c "import omnigent.version as v; print(v.VERSION)")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building omnigent $version for linux-x86_64"
+
+      - name: Build executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --collect-all pulls omnigent's package data (alembic migrations,
+          #   the SPA bundle, bundled agent configs) plus every submodule the
+          #   CLI imports lazily.
+          # --copy-metadata is REQUIRED, not cosmetic: harness_plugins.py
+          #   discovers community harnesses through
+          #   importlib.metadata.entry_points(), which reads dist metadata that
+          #   PyInstaller otherwise drops — without it the harness registry
+          #   silently loses every plugin.
+          pyinstaller \
+            --name omnigent \
+            --onefile \
+            --console \
+            --noconfirm \
+            --clean \
+            --collect-all omnigent \
+            --copy-metadata omnigent \
+            --hidden-import omnigent.cli \
+            --collect-all alembic \
+            --collect-submodules uvicorn \
+            --collect-submodules passlib \
+            scripts/pyinstaller_entry.py
+
+      # A binary that imports but cannot run its own CLI is worse than a build
+      # failure, because it ships. Exercise the real entry point.
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=dist/omnigent
+          # Not `[ ... ] && bin=...`: under `set -e` the false branch returns
+          # non-zero and would abort the step on every non-Windows runner.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            bin=dist/omnigent.exe
+          fi
+          "$bin" --version
+          "$bin" --help > /dev/null
+          # --version/--help short-circuit before the app is constructed, so
+          # they prove only that argparse works. A binary missing the SPA
+          # bundle, alembic's migration scripts, or a uvicorn/passlib
+          # submodule passes both and ships, then dies on the user's first
+          # `omnigent server`. Boot the real server and require a healthy
+          # response.
+          export OMNIGENT_DATA_DIR="$(python -c 'import tempfile; print(tempfile.mkdtemp())')"
+          export OMNIGENT_CONFIG_HOME="$(python -c 'import tempfile; print(tempfile.mkdtemp())')"
+          "$bin" server --port 8765 > serve.log 2>&1 &
+          serve_pid=$!
+          set +e
+          python - "$serve_pid" <<'PY'
+          import os
+          import sys
+          import time
+          import urllib.request
+
+          pid = int(sys.argv[1])
+          healthy = False
+          for _ in range(60):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:8765/health", timeout=1) as response:
+                      healthy = 200 <= response.status < 300
+                      if healthy:
+                          break
+              except Exception:
+                  pass
+              try:
+                  os.kill(pid, 0)
+              except OSError:
+                  break
+              time.sleep(1)
+          raise SystemExit(0 if healthy else 1)
+          PY
+          health_status=$?
+          set -e
+          kill "$serve_pid" 2>/dev/null || true
+          if [ "$health_status" -ne 0 ]; then
+            echo "server failed to become healthy; log follows:" >&2
+            cat serve.log >&2
+            exit 1
+          fi
+          echo "smoke OK (CLI + server boot)"
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="omnigent-${{ steps.ver.outputs.version }}-linux-x86_64"
+          mkdir -p out
+          python - "$name" <<'PY'
+          import sys
+          import tarfile
+          from pathlib import Path
+
+          name = sys.argv[1]
+          with tarfile.open(Path("out") / f"{name}.tar.gz", "w:gz") as archive:
+              archive.add("dist/omnigent", arcname="omnigent")
+          PY
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: out/*
+          if-no-files-found: error
+
+  build-other-platforms:
+    # Platform-specific runners are intentionally opt-in because the default
+    # org runner is Linux. These legs are independent from the Linux build.
+    if: github.repository == 'orvexai/omnigent' && inputs.build_other_platforms
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -54,9 +220,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04 # oldest supported glibc -> widest Linux compat
-            target: linux-x86_64
-            archive: tar.gz
           - os: windows-latest
             target: windows-x86_64
             archive: zip
@@ -78,7 +241,7 @@ jobs:
       # omnigent/server/static/web-ui unless OMNIGENT_SKIP_WEB_UI=true.
       # setup-node BEFORE pnpm/action-setup: its self-installer needs a Node
       # binary. Same order the repo's other pnpm workflows use.
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+      - uses: actions/setup-node@39370e3970a6d050c480ff0ed4d3fdee5af # v4.1.0
         if: ${{ !inputs.skip_web_ui }}
         with:
           node-version: 22
@@ -158,23 +321,38 @@ jobs:
           # submodule passes both and ships, then dies on the user's first
           # `omnigent server`. Boot the real server and require a healthy
           # response.
-          export OMNIGENT_DATA_DIR="$(mktemp -d)"
-          export OMNIGENT_CONFIG_HOME="$(mktemp -d)"
+          export OMNIGENT_DATA_DIR="$(python -c 'import tempfile; print(tempfile.mkdtemp())')"
+          export OMNIGENT_CONFIG_HOME="$(python -c 'import tempfile; print(tempfile.mkdtemp())')"
           "$bin" server --port 8765 > serve.log 2>&1 &
           serve_pid=$!
-          ok=""
-          for _ in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:8765/health > /dev/null 2>&1; then
-              ok=1
-              break
-            fi
-            if ! kill -0 "$serve_pid" 2>/dev/null; then
-              break
-            fi
-            sleep 1
-          done
+          set +e
+          python - "$serve_pid" <<'PY'
+          import os
+          import sys
+          import time
+          import urllib.request
+
+          pid = int(sys.argv[1])
+          healthy = False
+          for _ in range(60):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:8765/health", timeout=1) as response:
+                      healthy = 200 <= response.status < 300
+                      if healthy:
+                          break
+              except Exception:
+                  pass
+              try:
+                  os.kill(pid, 0)
+              except OSError:
+                  break
+              time.sleep(1)
+          raise SystemExit(0 if healthy else 1)
+          PY
+          health_status=$?
+          set -e
           kill "$serve_pid" 2>/dev/null || true
-          if [ -z "$ok" ]; then
+          if [ "$health_status" -ne 0 ]; then
             echo "server failed to become healthy; log follows:" >&2
             cat serve.log >&2
             exit 1
@@ -188,11 +366,20 @@ jobs:
           set -euo pipefail
           name="omnigent-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
           mkdir -p out
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a "out/$name.zip" ./dist/omnigent.exe
-          else
-            tar -czf "out/$name.tar.gz" -C dist omnigent
-          fi
+          python - "${{ matrix.archive }}" "$name" <<'PY'
+          import sys
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          archive_type, name = sys.argv[1:]
+          if archive_type == "zip":
+              with zipfile.ZipFile(Path("out") / f"{name}.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+                  archive.write("dist/omnigent.exe", arcname="omnigent.exe")
+          else:
+              with tarfile.open(Path("out") / f"{name}.tar.gz", "w:gz") as archive:
+                  archive.add("dist/omnigent", arcname="omnigent")
+          PY
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
@@ -205,12 +392,16 @@ jobs:
     # Tag pushes only: a manual run leaves the artifacts on the run and never
     # creates or mutates a Release.
     if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'orvexai/omnigent'
-    needs: build
-    runs-on: ubuntu-latest
+    needs: build-linux
+    runs-on: runners
     timeout-minutes: 15
     permissions:
       contents: write # create the release + upload assets
     steps:
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version-file: .python-version
+
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           path: dl
@@ -218,13 +409,30 @@ jobs:
       - name: Collect + checksum
         run: |
           set -euo pipefail
-          mkdir -p out
-          find dl -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} out/ \;
-          cd out
-          sha256sum * > SHA256SUMS
-          ls -la
+          python - <<'PY'
+          import hashlib
+          import shutil
+          from pathlib import Path
 
-      # Draft, not published: a human eyeballs the four archives before this
+          out = Path("out")
+          out.mkdir()
+          artifacts = sorted(
+              path for path in Path("dl").rglob("*")
+              if path.is_file() and (path.name.endswith(".tar.gz") or path.suffix == ".zip")
+          )
+          for artifact in artifacts:
+              shutil.move(str(artifact), out / artifact.name)
+          checksums = []
+          for artifact in sorted(out.iterdir()):
+              if artifact.name == "SHA256SUMS":
+                  continue
+              digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+              checksums.append(f"{digest}  {artifact.name}")
+          (out / "SHA256SUMS").write_text("\n".join(checksums) + "\n")
+          PY
+          ls -la out
+
+      # Draft, not published: a human eyeballs the Linux archive before this
       # becomes the thing users download.
       - uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
         with:
