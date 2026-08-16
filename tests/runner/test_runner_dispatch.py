@@ -6490,6 +6490,142 @@ async def test_get_info_stops_at_nearest_placed_ancestor() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_get_info_reports_unknown_inheritance_when_an_ancestor_read_fails() -> None:
+    """
+    A failed ancestor lookup reports ``placement_inherited: null``, not ``false``.
+
+    ``false`` is a claim — "this session has no inherited placement". Emitting
+    it after a failed read fabricates a negative during any server hiccup, and
+    an orchestrator deciding where to co-locate work acts on it. ``null``
+    means unknown, matching what ``runner_online`` already does.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "status": "running",
+                    "parent_session_id": "conv_root",
+                    "host_id": None,
+                    "workspace": None,
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_root":
+            return httpx.Response(503, json={"error": "unavailable"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_info",
+                json.dumps({"session_id": "conv_child"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["placement_inherited"] is None
+    assert out["host_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_info_keeps_a_sessions_own_git_branch() -> None:
+    """
+    A session with only ``git_branch`` set keeps it instead of inheriting.
+
+    The short-circuit originally gated on host/workspace alone, so a row
+    carrying its own branch (reachable via the existing-worktree create path
+    without a host) walked up and reported an ANCESTOR's branch — the wrong
+    branch name to an orchestrator deciding where to merge.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "status": "running",
+                    "parent_session_id": "conv_root",
+                    "host_id": None,
+                    "workspace": None,
+                    "git_branch": "feature/mine",
+                },
+            )
+        raise AssertionError(f"must not read {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_info",
+                json.dumps({"session_id": "conv_child"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["git_branch"] == "feature/mine"
+    assert out["placement_inherited"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_info_walks_past_intermediate_unplaced_ancestors() -> None:
+    """
+    Placement is found several hops up, not just on the immediate parent.
+
+    Every existing walk test resolved on the first hop, so the documented
+    multi-hop budget was never exercised — shrinking it to 1 would have gone
+    unnoticed while grandchildren silently reported no placement at all.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    chain = {
+        "conv_c": "conv_b",
+        "conv_b": "conv_a",
+        "conv_a": "conv_root",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sid = request.url.path.rsplit("/", 1)[-1]
+        if sid in chain:
+            return httpx.Response(
+                200,
+                json={
+                    "id": sid,
+                    "status": "running",
+                    "parent_session_id": chain[sid],
+                    "host_id": None,
+                    "workspace": None,
+                },
+            )
+        if sid == "conv_root":
+            return httpx.Response(
+                200,
+                json={"id": "conv_root", "host_id": "host_deep", "workspace": "/srv/deep"},
+            )
+        raise AssertionError(f"unexpected {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_info",
+                json.dumps({"session_id": "conv_c"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["host_id"] == "host_deep"
+    assert out["workspace"] == "/srv/deep"
+    assert out["placement_inherited"] is True
+
+
+@pytest.mark.asyncio
 async def test_get_info_keeps_own_placement_without_extra_lookup() -> None:
     """
     A session with its own placement reports it and reads no root.
@@ -6883,10 +7019,14 @@ async def test_sys_session_create_500_stays_opaque_when_title_is_free() -> None:
             return httpx.Response(
                 200,
                 json={
+                    # Production shape: the server STRIPS the ":closed:"
+                    # marker from ``title`` and carries closedness in
+                    # ``labels``. A mock that leaves the marker in the title
+                    # exercises a branch that never fires in production.
                     "data": [
                         {
                             "id": "conv_closed",
-                            "title": "worker:closed:conv_closed",
+                            "title": "worker",
                             "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
                         }
                     ]
@@ -6907,6 +7047,51 @@ async def test_sys_session_create_500_stays_opaque_when_title_is_free() -> None:
 
     info = json.loads(output)
     assert info["error"] == "sys_session_create returned 500"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_does_not_blame_the_title_on_a_non_500_failure() -> None:
+    """
+    A failure that is not a bare 500 is never reported as a title clash.
+
+    On a server carrying the typed mapping a real clash is a 409 and never
+    reaches the classifier, so probing on every failure could only ever
+    misdiagnose. Concretely: a 400 for a missing required field, while a
+    healthy sibling happens to hold the requested title, previously told the
+    agent to close that sibling — destroying a live worker and making no
+    progress, since the retry fails the same way.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    scanned = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal scanned
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(400, json={"error": {"message": "workspace required"}})
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            scanned = True
+            return httpx.Response(
+                200, json={"data": [{"id": "conv_holder", "title": "worker", "labels": {}}]}
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_abc", "title": "worker"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "sys_session_create returned 400"
+    # The real cause must survive, not be replaced by a guess.
+    assert "workspace required" in info["detail"]
+    assert scanned is False
 
 
 @pytest.mark.asyncio

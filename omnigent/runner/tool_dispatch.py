@@ -2365,7 +2365,14 @@ async def _session_create_error(
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: A JSON error object.
     """
-    if isinstance(title, str) and title:
+    # Only a 500 is classified. A server carrying the typed mapping reports a
+    # real clash as 409 and never reaches here, so on that server this probe
+    # can only ever fire on some OTHER failure — and naming a live sibling
+    # then tells the agent to close a healthy worker for a create that failed
+    # for an unrelated reason (a 400 "workspace required", a 503). An old
+    # server surfaces the clash as a bare 500, which is the one case worth
+    # investigating.
+    if resp.status_code == 500 and isinstance(title, str) and title:
         holder = await _live_sibling_with_title(conversation_id, title, server_client)
         if holder is not None:
             return json.dumps(
@@ -2373,8 +2380,13 @@ async def _session_create_error(
                     "error": "session_title_exists",
                     "title": title,
                     "conversation_id": holder,
+                    # The underlying failure is still reported: the clash is
+                    # the likely cause, not a certainty, and a caller that
+                    # closes the holder and still fails needs the real error.
+                    "detail": resp.text[:200],
                     "message": (
-                        f"a sibling session already uses the title {title!r}; close it with "
+                        f"the create failed and a sibling session already uses the title "
+                        f"{title!r}, which is the likely cause; close it with "
                         "sys_session_close (then this title is reusable) or create with a "
                         "different title"
                     ),
@@ -4080,14 +4092,37 @@ class _Placement:
         host-bound (a CLI-launched tree).
     :param workspace: Start directory on that host.
     :param git_branch: Branch checked out in that workspace.
-    :param inherited: ``True`` when the values came from the tree root
-        rather than the session's own row.
+    :param inherited: ``True`` when the values came from an ancestor
+        rather than the session's own row, ``False`` when they are its
+        own, and ``None`` when an ancestor read FAILED so inheritance
+        could not be determined. ``None`` matters: reporting ``False``
+        after a failed lookup asserts "this session has no inherited
+        placement", which is a fabricated negative during any server
+        hiccup — the same distinction ``runner_online`` already makes.
     """
 
     host_id: str | None
     workspace: str | None
     git_branch: str | None
-    inherited: bool
+    inherited: bool | None
+
+
+def _unknown_inheritance(own: _Placement) -> _Placement:
+    """
+    Degrade a placement to "inheritance unknown" after a failed ancestor read.
+
+    The session's own (empty) values are still the best answer available,
+    but the caller must not be told they are definitive.
+
+    :param own: The session's own placement, with ``inherited=False``.
+    :returns: The same values with ``inherited=None``.
+    """
+    return _Placement(
+        host_id=own.host_id,
+        workspace=own.workspace,
+        git_branch=own.git_branch,
+        inherited=None,
+    )
 
 
 async def _effective_placement(
@@ -4118,7 +4153,7 @@ async def _effective_placement(
         git_branch=_optional_string(snap.get("git_branch")),
         inherited=False,
     )
-    if own.host_id is not None or own.workspace is not None:
+    if own.host_id is not None or own.workspace is not None or own.git_branch is not None:
         return own
     ancestor_id = _optional_string(snap.get("parent_session_id"))
     seen = {_optional_string(snap.get("id"))}
@@ -4135,12 +4170,12 @@ async def _effective_placement(
                 timeout=30.0,
             )
         except Exception:  # noqa: BLE001 — placement is descriptive, not load-bearing
-            return own
+            return _unknown_inheritance(own)
         if resp.status_code != 200:
-            return own
+            return _unknown_inheritance(own)
         ancestor = _string_object_dict(resp.json())
         if ancestor is None:
-            return own
+            return _unknown_inheritance(own)
         host = _optional_string(ancestor.get("host_id"))
         workspace = _optional_string(ancestor.get("workspace"))
         if host is not None or workspace is not None:
@@ -4151,7 +4186,9 @@ async def _effective_placement(
                 inherited=True,
             )
         ancestor_id = _optional_string(ancestor.get("parent_session_id"))
-    return own
+    # Hop budget exhausted with placement still unfound: the chain was not
+    # walked to its end, so inheritance is undetermined rather than absent.
+    return _unknown_inheritance(own)
 
 
 def _session_supports_midturn_steer(snap: _JsonObject) -> bool | None:
