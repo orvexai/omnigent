@@ -5081,10 +5081,10 @@ async def _session_get_info_via_rest(
     binding, runner binding, host, reasoning effort, effective model,
     parent linkage, workspace / git branch, persisted last-activity time,
     and the outstanding approval prompts (the prompts themselves plus a
-    count). ``turn_active`` reports whether this runner holds an active turn
-    for a local session; it is ``None`` for a peer session. It does not detect
-    a hung or unresponsive harness — a wedged process can still hold an
-    active turn. Runner connectivity
+    count). ``turn_active`` is ``True`` when this runner observes an active
+    turn, ``False`` when this runner positively knows the session is idle, and
+    ``None`` when the state is unknown. Unknown covers both a peer session and
+    a local session with no observed liveness edge. Runner connectivity
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
     the lookup fails or no runner is bound). The full transcript is

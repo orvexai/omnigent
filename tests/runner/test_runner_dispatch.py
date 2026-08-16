@@ -7802,7 +7802,9 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     # never queried (a stray /v1/runners call would mean the None-runner
     # short-circuit regressed).
     assert info["runner_online"] is None
-    assert info["turn_active"] is False
+    # The caller's harness is not bound in this fixture and no liveness edge
+    # was observed, so the runner must report unknown rather than idle.
+    assert info["turn_active"] is None
     assert info["last_activity_at"] == 42
     assert info["pending_elicitations"] == []
     assert info["pending_elicitation_count"] == 0
@@ -7894,19 +7896,31 @@ async def test_sys_session_get_info_reports_remote_turn_as_unknown(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_reports_native_process_manager_turn(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        pytest.param("running", True, id="running-edge"),
+        pytest.param("idle", False, id="idle-edge"),
+        pytest.param(None, None, id="no-edge"),
+    ],
+)
+async def test_sys_session_get_info_reports_native_status_memo(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str | None,
+    expected: bool | None,
 ) -> None:
-    """A native harness turn is visible even without an ``_active_turns`` entry."""
+    """Native sessions use external status edges and stay unknown without one."""
+    from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
-    process_manager = HarnessProcessManager(tmp_parent=tmp_path)
-    app = create_runner_app(
-        process_manager=process_manager,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        runner_app,
+        "_session_harness_name_ref",
+        lambda _session_id: "claude-native",
     )
-    process_manager.mark_in_flight("conv_native", "resp_native")
-    assert "conv_native" not in app.state.active_turns
+    if status is not None:
+        app.state.session_resource_registry.note_external_session_status("conv_native", status)
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_native":
@@ -7937,8 +7951,7 @@ async def test_sys_session_get_info_reports_native_process_manager_turn(
             conversation_id="conv_caller",
         )
 
-    assert json.loads(output)["turn_active"] is True
-    process_manager.clear_in_flight("conv_native")
+    assert json.loads(output)["turn_active"] is expected
 
 
 @pytest.mark.asyncio

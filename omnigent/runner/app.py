@@ -1868,6 +1868,8 @@ _session_agent_ids_ref: dict[str, str] = {}
 # Module-level refs used by runner-local observability tools.
 _active_turns_ref: dict[str, asyncio.Task[None] | None] = {}
 _process_manager_ref: HarnessProcessManager | None = None
+_resource_registry_ref: SessionResourceRegistry | None = None
+_session_harness_name_ref: Callable[[str], str | None] | None = None
 
 # Module-level ref to _session_histories. Populated inside
 # create_runner_app; used by tests to inspect in-memory history.
@@ -2038,18 +2040,37 @@ def get_session_agent_id(session_id: str) -> str | None:
     return _session_agent_ids_ref.get(session_id)
 
 
-def session_has_active_turn(session_id: str) -> bool:
+def session_has_active_turn(session_id: str) -> bool | None:
     """
-    Return whether this runner currently holds an active turn for a session.
+    Return this runner's observed turn state for a session.
 
     :param session_id: Session/conversation ID, e.g.
         ``"conv_abc123"``.
-    :returns: ``True`` when either runner-local turn registry reports an
-        active turn, else ``False``.
+    :returns: ``True`` when a runner-local registry or external status memo
+        reports an active turn; ``False`` when the session is known idle; or
+        ``None`` when liveness is unknown.
     """
-    return session_id in _active_turns_ref or (
+    if session_id in _active_turns_ref or (
         _process_manager_ref is not None and _process_manager_ref.has_active_turn(session_id)
+    ):
+        return True
+
+    status_memo = (
+        _resource_registry_ref.session_status_memo(session_id)
+        if _resource_registry_ref is not None
+        else None
     )
+    if status_memo == "running":
+        return True
+    if status_memo == "idle":
+        return False
+
+    harness_name = (
+        _session_harness_name_ref(session_id) if _session_harness_name_ref is not None else None
+    )
+    if harness_name is None or is_native_harness(harness_name):
+        return None
+    return False
 
 
 # How long a session's discovered skills stay cached before the runner
@@ -2222,7 +2243,8 @@ def create_runner_app(
         if task is not None:
             task.cancel()
 
-    global _active_turns_ref, _process_manager_ref
+    global _active_turns_ref, _process_manager_ref, _resource_registry_ref
+    global _session_harness_name_ref
 
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     _session_sub_agent_names: dict[str, str] = {}
@@ -2454,6 +2476,7 @@ def create_runner_app(
             per_session_workspace=per_session_workspace,
         )
     app.state.session_resource_registry = resource_registry
+    _resource_registry_ref = resource_registry
 
     def _publish_terminal_activity(session_id: str, terminal_id: str) -> None:
         _publish_event(
@@ -4186,6 +4209,8 @@ def create_runner_app(
             return None
         h = spec.executor.config.get("harness") or spec.executor.type
         return canonicalize_harness(h) or h
+
+    _session_harness_name_ref = _session_harness_name
 
     def _publish_turn_status(
         conv_id: str,

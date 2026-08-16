@@ -470,6 +470,15 @@ class SessionResourceRegistry:
             self._status_pollers.pop(session_id, None)
             return self._last_session_status.pop(session_id, None)
 
+    def session_status_memo(self, session_id: str) -> str | None:
+        """Return the session's latest recorded status memo, if any.
+
+        :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+        :returns: ``"running"``, ``"idle"``, or ``None`` when no status edge was observed.
+        """
+        with self._lock:
+            return self._last_session_status.get(session_id)
+
     def _claim_status_edge(self, session_id: str, status: str, blocked_on: str | None) -> bool:
         """Record an edge as published, reporting whether it was a change.
 
