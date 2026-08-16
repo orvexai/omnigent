@@ -8055,6 +8055,8 @@ async def test_sys_session_get_info_reports_remote_turn_as_unknown(tmp_path: Pat
     [
         pytest.param("running", True, id="running-edge"),
         pytest.param("idle", False, id="idle-edge"),
+        # A failed turn is over; the memo must not stay stuck on ``running``.
+        pytest.param("failed", False, id="failed-edge"),
         pytest.param(None, None, id="no-edge"),
     ],
 )

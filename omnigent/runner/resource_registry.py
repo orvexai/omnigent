@@ -555,9 +555,9 @@ class SessionResourceRegistry:
 
         Structured native forwarders can know turn completion more reliably than
         a PTY diff heuristic. Keep the required-terminal exit memo aligned so a
-        terminal that closes after a forwarded ``idle`` edge is treated as a
-        clean shutdown, while ``running`` / ``waiting`` still classify a later
-        exit as mid-turn.
+        terminal that closes after a forwarded ``idle`` or ``failed`` edge is
+        treated as a clean shutdown, while ``running`` / ``waiting`` still
+        classify a later exit as mid-turn.
 
         Also adopts *status* as the watcher's dedup baseline. The forwarder
         publishes these edges directly to the server, so without this the
@@ -568,7 +568,9 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
         """
-        if status == "idle":
+        if status in {"idle", "failed"}:
+            # A failed turn is over. Leaving the memo on ``running`` would keep
+            # reporting the session mid-turn for as long as it lives.
             self._set_session_status_memo(session_id, "idle")
         elif status in {"running", "waiting"}:
             self._set_session_status_memo(session_id, "running")
