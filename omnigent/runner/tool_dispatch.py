@@ -67,6 +67,7 @@ from omnigent.model_override import (
     validate_model_override,
 )
 from omnigent.native_coding_agents import public_agent_name
+from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
 from omnigent.runner.event_delivery import event_denial_reason
 from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
@@ -3009,6 +3010,7 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
+    reasoning_effort: object = None,
     workspace: str | None = None,
 ) -> _JsonObject:
     """
@@ -3016,9 +3018,9 @@ def _build_session_create_body(
 
     ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
     what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``, and
-    ``model`` are included when provided; the message becomes the child's
-    first queued user turn via ``initial_items``.
+    top-level or sibling session). A non-empty ``title``, ``message``,
+    ``model``, and ``reasoning_effort`` are included when provided; the
+    message becomes the child's first queued user turn via ``initial_items``.
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.
@@ -3028,6 +3030,8 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
+    :param reasoning_effort: Optional reasoning-effort override; written as
+        ``reasoning_effort`` on the session.
     :param workspace: Optional project directory for the child, ALREADY
         boundary-checked by :func:`_validated_child_workspace`. Never pass a
         raw caller value: the server only validates this field when
@@ -3050,6 +3054,8 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
     if workspace:
         body["workspace"] = workspace
     if isinstance(message, str) and message:
@@ -3198,6 +3204,21 @@ async def _execute_session_create(
         return json.dumps({"error": "sys_session_create requires server access"})
     if conversation_id is None:
         return json.dumps({"error": "sys_session_create requires a session id"})
+    raw_reasoning_effort = args.get("reasoning_effort")
+    try:
+        reasoning_effort = validate_effort(
+            raw_reasoning_effort,
+            "session metadata",
+            EFFORT_VALUES,
+        )
+    except ValueError as exc:
+        return json.dumps(
+            {
+                "error": "invalid_reasoning_effort",
+                "reasoning_effort": raw_reasoning_effort,
+                "message": str(exc),
+            }
+        )
     agent_id = args.get("agent_id")
     config_path = args.get("config_path")
     has_agent_id = isinstance(agent_id, str) and bool(agent_id)
@@ -3265,6 +3286,7 @@ async def _execute_session_create(
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        reasoning_effort=reasoning_effort,
         workspace=checked_workspace[0],
     )
     try:

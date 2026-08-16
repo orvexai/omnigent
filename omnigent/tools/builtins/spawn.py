@@ -898,7 +898,7 @@ class SysSessionCreateTool(Tool):
             "Returns {conversation_id, agent_id, title, status}; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
-            "with sys_session_send."
+            "with sys_session_send. Optionally set its reasoning effort."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -967,6 +967,18 @@ class SysSessionCreateTool(Tool):
                                 "or 'provider-local-model-id'. Sets the harness "
                                 "model at session creation; omit to use the "
                                 "agent's default."
+                            ),
+                        },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "description": (
+                                "Optional reasoning effort for the child session. "
+                                "Accepted values: 'none', 'minimal', 'low', 'medium', "
+                                "'high', 'xhigh', or 'max'. Harnesses accept subsets: "
+                                "Codex accepts 'none'/'minimal' but not 'max'; Claude "
+                                "accepts 'max' but not 'none'/'minimal'. The harness "
+                                "clamps values outside its own ladder. Omit to leave "
+                                "the harness default in force (no override)."
                             ),
                         },
                         "workspace": {

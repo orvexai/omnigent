@@ -7273,6 +7273,7 @@ def test_sys_session_create_schema_offers_project_but_not_host() -> None:
     # workspace IS offered — cross-PROJECT placement on this machine is
     # supported, and its containment is enforced runner-side.
     assert "workspace" in props
+    assert "reasoning_effort" in props
 
 
 def test_subagent_inbox_line_names_the_dispatch_that_produced_it() -> None:
@@ -7679,10 +7680,63 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
     assert captured["agent_id"] == "ag_x"
     assert captured["title"] == "auth"
     assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
+    assert "reasoning_effort" not in captured
     handle = json.loads(output)
     assert handle["conversation_id"] == "conv_child"
     assert handle["agent_id"] == "ag_x"
     assert handle["agent_name"] == "researcher"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_forwards_reasoning_effort() -> None:
+    """A valid reasoning effort reaches the JSON session-create body."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child_effort"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "reasoning_effort": "high"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert captured["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_rejects_invalid_reasoning_effort_without_post() -> None:
+    """An invalid reasoning effort is typed and rejected before the create POST."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server must not be reached: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "reasoning_effort": "turbo"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "invalid_reasoning_effort"
+    assert info["reasoning_effort"] == "turbo"
+    assert "none, minimal, low, medium, high, xhigh, max" in info["message"]
 
 
 @pytest.mark.asyncio
