@@ -120,9 +120,12 @@ class SysSessionSendTool(Tool):
             "subagent/Task tool your harness provides. Two modes: pass "
             "(agent, title) to spawn-or-continue a named sub-agent (the "
             "first call with a pair creates it, later calls continue "
-            "it); or pass session_id to post to an existing child "
-            "session you created (e.g. via sys_session_create) — this "
-            "is confined to your direct children. Provide exactly one "
+            "it); or pass session_id to post to ANY session you can "
+            "access — your own children, and also peer sessions on other "
+            "machines (find them with sys_session_list). That is how you "
+            "talk to an agent on another host: message its session. A "
+            "peer must be idle; its reply arrives in your inbox like a "
+            "child's. Provide exactly one "
             "of (agent + title) or session_id, always with args. "
             "Returns a handle immediately, not the child's output: the "
             "turn runs asynchronously and its result is delivered to "
@@ -249,7 +252,10 @@ def _build_sys_session_send_schema(
             "conversation, visible in the session tree) — not your "
             "harness's built-in subagent/Task tool, which remains the "
             "right choice for quick in-context delegation. "
-            "Confined to your direct children. Returns a handle "
+            "Targets ANY session you can access — your own children, and "
+            "peer sessions on other machines (find them with "
+            "sys_session_list). That is how you talk to an agent on "
+            "another host. A peer must be idle. Returns a handle "
             "immediately, not the child's output: the turn runs "
             "asynchronously and its result is delivered to your inbox "
             "— poll sys_read_inbox to collect it, or sys_cancel_task "
@@ -503,11 +509,14 @@ class SysSessionListTool(Tool):
             "parent/siblings) — use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
             "every session "
-            "you can access, each with status + runner connectivity, "
-            "for orchestration (inspect via sys_agent_get / "
-            "sys_session_get_info, or drive via sys_session_send by "
-            "session_id). Pass agent_name to filter the global list to "
-            "sessions running that agent."
+            "you can access, each with status, runner connectivity, and "
+            "placement (host_id + workspace) so you can tell WHICH "
+            "MACHINE and project it runs in. This is how you find agents "
+            "to talk to: any idle session here can be messaged with "
+            "sys_session_send by session_id, including one on another "
+            "host, and its reply comes back to your inbox. Inspect first "
+            "via sys_agent_get / sys_session_get_info. Pass agent_name "
+            "to filter the global list to sessions running that agent."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -882,7 +891,10 @@ class SysSessionCreateTool(Tool):
             "re-upload its bundle. Optionally queue an initial user "
             "message. The new session is always a child of the calling "
             "session (you cannot create top-level or sibling sessions) "
-            "and always runs on your machine, co-located with you. "
+            "and always runs on your machine, co-located with you — but "
+            "it may run in a different PROJECT on that machine via "
+            "workspace. To reach an agent on another machine, message an "
+            "existing session there with sys_session_send instead. "
             "Returns {conversation_id, agent_id, title, status}; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
@@ -955,6 +967,18 @@ class SysSessionCreateTool(Tool):
                                 "or 'provider-local-model-id'. Sets the harness "
                                 "model at session creation; omit to use the "
                                 "agent's default."
+                            ),
+                        },
+                        "workspace": {
+                            "type": "string",
+                            "description": (
+                                "Optional project directory for the child, "
+                                "e.g. 'sibling-repo' or an absolute path "
+                                "inside your own working directory. Lets you "
+                                "start a child in a DIFFERENT project on this "
+                                "machine; omit to inherit yours. Must be an "
+                                "existing directory within your working "
+                                "directory — paths outside it are refused."
                             ),
                         },
                     },

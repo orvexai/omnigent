@@ -2135,6 +2135,310 @@ async def _execute_subagent_tool(
     )
 
 
+def _validated_child_workspace(
+    workspace: object,
+    *,
+    agent_spec: AgentSpec | None,
+    conversation_id: str,
+    runner_workspace: Path | None,
+) -> str | tuple[str | None]:
+    """
+    Resolve a caller-supplied child workspace, or reject it.
+
+    Lets an orchestrator start a child in a DIFFERENT project (repo) on this
+    machine, e.g. a reviewer in a sibling checkout, instead of inheriting the
+    parent's directory.
+
+    The containment check is load-bearing and cannot be delegated: the server
+    validates ``workspace`` against the agent's ``os_env.cwd`` **only** when
+    ``host_id`` is set, and ``sys_session_create`` deliberately never sends a
+    ``host_id`` (a parented child always inherits its parent's runner, so
+    placement could not be honored anyway). Forwarding an unchecked
+    ``workspace`` would therefore let a caller point a child's tool cwd at any
+    absolute path on the runner's filesystem — an escape from the agent's own
+    sandbox. Same rule as ``config_path``: resolve, then require containment.
+
+    :param workspace: The caller-supplied value; non-str means "not requested".
+    :param agent_spec: The calling agent's spec, source of the os_env cwd.
+    :param conversation_id: The caller's session id, for os_env resolution.
+    :param runner_workspace: The runner workspace, authoritative when present.
+    :returns: A 1-tuple carrying the canonical path (or ``None`` when the
+        caller requested none) on success; a JSON error string on rejection.
+    """
+    if not isinstance(workspace, str) or not workspace:
+        return (None,)
+    os_spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+    if os_spec.cwd is None:
+        return json.dumps(
+            {
+                "error": "workspace_not_allowed",
+                "workspace": workspace,
+                "message": "this agent has no resolved working directory to scope a workspace to.",
+            }
+        )
+    resolved_cwd = Path(os_spec.cwd).expanduser().resolve()
+    target = (resolved_cwd / Path(workspace).expanduser()).resolve()
+    if not target.is_relative_to(resolved_cwd):
+        return json.dumps(
+            {
+                "error": "workspace_out_of_bounds",
+                "workspace": workspace,
+                "message": (
+                    "workspace must be inside your own working directory; "
+                    "a child cannot be started outside it."
+                ),
+            }
+        )
+    if not target.is_dir():
+        return json.dumps(
+            {
+                "error": "workspace_not_found",
+                "workspace": workspace,
+                "message": "workspace must be an existing directory on this machine.",
+            }
+        )
+    return (str(target),)
+
+
+def _message_event_denied(resp: httpx.Response) -> str | None:
+    """
+    Return the denial reason when an accepted-looking event POST was refused.
+
+    ``POST /v1/sessions/{id}/events`` answers a policy denial with HTTP **202**
+    and ``{"queued": false, "denied": true, "reason": ...}``. A status-only
+    check therefore reads a refused message as delivered, registers work, and
+    waits forever for a turn that never starts.
+
+    :param resp: The event POST response.
+    :returns: The denial reason when the message was refused, else ``None``.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict) or not body.get("denied"):
+        return None
+    reason = body.get("reason")
+    return reason if isinstance(reason, str) and reason else "denied by policy"
+
+
+async def _newest_item_id(
+    session_id: str,
+    server_client: httpx.AsyncClient,
+) -> str | None:
+    """
+    Return the id of a session's newest conversation item.
+
+    Read BEFORE posting so the reply poller can scope itself to items that
+    did not exist yet — the only way to tell this dispatch's answer from
+    output the session was already producing.
+
+    :param session_id: Target session id.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: The newest item id, or ``None`` for an empty/unreadable
+        transcript (the poller then considers every item new).
+    """
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{session_id}/items",
+            params={"order": "desc", "limit": 1},
+            timeout=30.0,
+        )
+    except Exception:  # noqa: BLE001 — anchoring is best-effort
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        rows = resp.json().get("data", [])
+    except ValueError:
+        return None
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return None
+    return _optional_string(rows[0].get("id"))
+
+
+async def _send_to_peer_session(
+    target_session_id: str,
+    message: str,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    snap_data: _JsonObject,
+    created_by: str | None,
+) -> str:
+    """
+    Message a session that is not the caller's child, and await its reply.
+
+    This is what makes agent-to-agent messaging work across runners (and
+    therefore across hosts): a child always shares its parent's runner, so a
+    target that is NOT a child may live in a different runner process whose
+    completion events are invisible here. The message itself already travels
+    fine — it is POSTed to the server, which routes it to whichever runner
+    owns the target — but the RESULT would never come back, because the work
+    registry, the parent inbox and the wake notice are all process-local.
+    A poller supplies that missing return edge.
+
+    Access is bounded by the server: the snapshot read above already 404s or
+    403s anything the caller may not see. Within that boundary the caller may
+    address any session — which is the point, since a peer on another machine
+    can never be in the caller's spawn tree.
+
+    :param target_session_id: The peer session id, e.g. ``"conv_abc123"``.
+    :param message: Text to deliver.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The caller's own session id — the inbox that
+        receives the reply.
+    :param snap_data: The peer's already-fetched session snapshot.
+    :param created_by: Human actor to attribute the message to.
+    :returns: A JSON handle carrying ``work_id``, or a JSON/text error.
+    """
+    from omnigent.runner import app as _runner_app
+
+    if target_session_id == conversation_id:
+        return json.dumps(
+            {
+                "error": "session_is_self",
+                "conversation_id": target_session_id,
+                "message": "a session cannot send a message to itself.",
+            }
+        )
+    if is_session_closed(
+        _string_mapping(snap_data.get("labels")),
+        _optional_string(snap_data.get("title")),
+    ):
+        return json.dumps(
+            {
+                "error": "session_closed",
+                "conversation_id": target_session_id,
+                "message": "target session is closed and cannot accept input.",
+            }
+        )
+    # Refuse a busy peer rather than steering someone else's turn: the reply
+    # would merge into work this caller did not request, and the owning
+    # runner tracks one dispatch per session, so the real requester's result
+    # would be corrupted too.
+    status = _optional_string(snap_data.get("status"))
+    if status in ("running", "waiting"):
+        return json.dumps(
+            {
+                "error": "session_busy",
+                "conversation_id": target_session_id,
+                "status": status,
+                "message": (
+                    "target session is mid-turn; wait for it to go idle before "
+                    "sending (poll sys_session_get_info)."
+                ),
+            }
+        )
+    target_runner = _optional_string(snap_data.get("runner_id"))
+    if target_runner is None:
+        return json.dumps(
+            {
+                "error": "session_not_running",
+                "conversation_id": target_session_id,
+                "message": (
+                    "target session is not bound to a runner, so it cannot "
+                    "receive input; it must be resumed first."
+                ),
+            }
+        )
+    if await _runner_online_or_none(target_runner, server_client) is False:
+        return json.dumps(
+            {
+                "error": "session_runner_offline",
+                "conversation_id": target_session_id,
+                "message": (
+                    "the machine hosting this session is offline; it cannot "
+                    "receive input until that host reconnects."
+                ),
+            }
+        )
+    start_remote = _runner_app._remote_dispatch_start_ref
+    if start_remote is None:
+        return json.dumps(
+            {
+                "error": "peer_messaging_unavailable",
+                "conversation_id": target_session_id,
+                "message": "this runner cannot await a peer reply; send to a child instead.",
+            }
+        )
+    existing = _runner_app.get_subagent_work(target_session_id)
+    if existing is not None and existing.status in ("launching", "running", "waiting"):
+        return json.dumps(
+            {
+                "error": "session_busy",
+                "conversation_id": target_session_id,
+                "message": (
+                    "a dispatch to this session is already outstanding; wait "
+                    "for its result before sending again."
+                ),
+            }
+        )
+
+    # Anchor BEFORE posting so the poller can distinguish our reply.
+    anchor_item_id = await _newest_item_id(target_session_id, server_client)
+    agent_label = _optional_string(snap_data.get("agent_name")) or "agent"
+    peer_title = title_without_closed_marker(_optional_string(snap_data.get("title"))) or None
+    work_entry = _runner_app.register_subagent_work(
+        parent_session_id=conversation_id,
+        child_session_id=target_session_id,
+        agent=agent_label,
+        title=peer_title or "",
+        wrapper_label=_session_wrapper_label(snap_data),
+        created_by=created_by,
+    )
+    try:
+        msg_resp = await _post_child_message_event(
+            server_client,
+            target_session_id,
+            content=[{"type": "input_text", "text": message}],
+            created_by=created_by,
+        )
+    except httpx.HTTPError as exc:
+        _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
+        return f"Error: failed to send message to session: {type(exc).__name__}: {exc}"
+    if msg_resp.status_code >= 400:
+        _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
+        return (
+            f"Error: failed to send message to session: "
+            f"{msg_resp.status_code} {msg_resp.text[:200]}"
+        )
+    denial = _message_event_denied(msg_resp)
+    if denial is not None:
+        _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
+        return json.dumps(
+            {
+                "error": "message_denied",
+                "conversation_id": target_session_id,
+                "message": f"the target session refused the message: {denial}",
+            }
+        )
+    start_remote(
+        child_session_id=target_session_id,
+        work_id=work_entry.work_id,
+        anchor_item_id=anchor_item_id,
+        sent_text=message,
+    )
+    return json.dumps(
+        {
+            "task_id": target_session_id,
+            "handle_id": target_session_id,
+            "conversation_id": target_session_id,
+            "work_id": work_entry.work_id,
+            "kind": "peer_session",
+            "agent": agent_label,
+            "title": peer_title,
+            "host_id": snap_data.get("host_id"),
+            "status": "launching",
+            "message": (
+                f"[System: message delivered to session {target_session_id} "
+                f"({agent_label}). Its reply will appear in your inbox; call "
+                "sys_read_inbox to collect it.]"
+            ),
+        }
+    )
+
+
 async def _send_to_existing_session(
     target_session_id: str,
     message: str,
@@ -2175,20 +2479,25 @@ async def _send_to_existing_session(
     if snap.status_code == 404:
         return json.dumps({"error": "session_not_found", "conversation_id": target_session_id})
     if snap.status_code in (401, 403):
-        return json.dumps({"error": "session_out_of_tree", "conversation_id": target_session_id})
+        # An ACL denial, not a tree violation — the caller cannot fix this by
+        # picking a different session in its own subtree.
+        return json.dumps({"error": "access_denied", "conversation_id": target_session_id})
     if snap.status_code != 200:
         return f"Error: sys_session_send lookup returned {snap.status_code}"
     snap_data = snap.json()
     if snap_data.get("parent_session_id") != conversation_id:
-        return json.dumps(
-            {
-                "error": "session_out_of_tree",
-                "conversation_id": target_session_id,
-                "message": (
-                    "target is not a direct child of the calling session; "
-                    "sys_session_send by session_id is child-only."
-                ),
-            }
+        # Not our child. A child always runs on its parent's runner, so any
+        # target that is NOT one may be served by a different runner process,
+        # whose completion events this process never sees. Route it through
+        # the peer path, which polls for the reply instead of waiting on an
+        # event that cannot arrive.
+        return await _send_to_peer_session(
+            target_session_id,
+            message,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            snap_data=snap_data,
+            created_by=created_by,
         )
     if is_session_closed(snap_data.get("labels"), snap_data.get("title")):
         return json.dumps(
@@ -2268,6 +2577,21 @@ async def _send_to_existing_session(
         _runner_app.unregister_subagent_work(target_session_id)
         return (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
+        )
+    denial = _message_event_denied(msg_resp)
+    if denial is not None:
+        # A policy denial answers 202, so the status check above misses it.
+        # Without this the child never starts a turn while its work entry
+        # stays "launching" forever — the child becomes permanently
+        # un-sendable and the parent's turns end as "waiting".
+        _runner_app.unregister_child_session(target_session_id)
+        _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
+        return json.dumps(
+            {
+                "error": "message_denied",
+                "conversation_id": target_session_id,
+                "message": f"the child refused the message: {denial}",
+            }
         )
 
     return json.dumps(
@@ -2404,6 +2728,7 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
+    workspace: str | None = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -2422,17 +2747,19 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
+    :param workspace: Optional project directory for the child, ALREADY
+        boundary-checked by :func:`_validated_child_workspace`. Never pass a
+        raw caller value: the server only validates this field when
+        ``host_id`` is set, which this body never sends.
     :returns: The JSON request body.
 
-    Deliberately sends NO ``host_id`` / ``workspace``. A parented create
-    always inherits the parent's runner server-side
-    (``inherited_runner_id``), which wins over ``host_id`` in routing, so
-    forwarding them advertised a placement the server cannot honor while
-    handing the child a cwd validated against a different machine. Worse,
-    ``workspace`` is only boundary-checked against the agent's
-    ``os_env.cwd`` when ``host_id`` is set, so forwarding it alone let a
-    caller point a child anywhere on the runner's filesystem. Cross-host
-    child placement needs a server-side change first.
+    Deliberately sends NO ``host_id``. A parented create always inherits the
+    parent's runner server-side (``inherited_runner_id``), which wins over
+    ``host_id`` in routing, so forwarding it advertised a placement the
+    server cannot honor while handing the child a cwd validated against a
+    different machine. Cross-host child placement needs a server-side change
+    first; cross-PROJECT placement on this machine is supported through
+    ``workspace``, whose containment this runner enforces itself.
     """
     body: _JsonObject = {
         "agent_id": agent_id,
@@ -2442,6 +2769,8 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    if workspace:
+        body["workspace"] = workspace
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2632,12 +2961,21 @@ async def _execute_session_create(
             agent_spec=agent_spec,
             runner_workspace=runner_workspace,
         )
+    checked_workspace = _validated_child_workspace(
+        args.get("workspace"),
+        agent_spec=agent_spec,
+        conversation_id=conversation_id,
+        runner_workspace=runner_workspace,
+    )
+    if isinstance(checked_workspace, str):
+        return checked_workspace
     body = _build_session_create_body(
         str(agent_id),
         conversation_id,
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        workspace=checked_workspace[0],
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -3927,9 +4265,21 @@ async def _execute_session_query_tool(
     The in-process reads are confined to the caller's spawn tree, while
     the read tools here are global by design — bounded only by what the
     server's per-user ACL allows ``server_client`` to fetch, the same
-    posture as :func:`_execute_subagent_tool`. The write tools
-    (``sys_session_close``, ``sys_session_send``) do enforce the tree on
-    both executors; only reads differ.
+    posture as :func:`_execute_subagent_tool`.
+
+    Scoping by tool, since it is deliberately NOT uniform:
+
+    - ``sys_session_close`` is tree-scoped on both executors. Tombstoning
+      is destructive bookkeeping and stays confined to what the caller
+      spawned.
+    - ``sys_session_send`` is tree-scoped in-process (that executor has no
+      caller identity to bound anything else by) but here reaches any
+      session the server lets the caller read. This is what makes
+      agent-to-agent messaging possible at all across machines: a child
+      always shares its parent's runner, so a peer on another host can
+      never be in the caller's tree. The server ACL is the boundary, and a
+      peer must be idle — see :func:`_send_to_peer_session`.
+    - The reads are global on this executor and tree-scoped in-process.
 
     :param tool_name: ``"sys_session_get_history"``, ``"sys_session_list"``,
         ``"sys_session_close"``, ``"sys_session_get_info"``, or
@@ -5097,6 +5447,13 @@ async def _collect_global_sessions(
             "runner_id": r.get("runner_id"),
             "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
             "parent_session_id": r.get("parent_session_id"),
+            # Placement, so an orchestrator can tell WHICH MACHINE and which
+            # project a session runs in before messaging it. Without these the
+            # global list is a flat set of ids and cross-host coordination is
+            # blind — the caller cannot tell a local peer from a remote one.
+            "host_id": r.get("host_id"),
+            "workspace": r.get("workspace"),
+            "git_branch": r.get("git_branch"),
         }
         for r in rows
     ]

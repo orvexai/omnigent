@@ -5969,6 +5969,11 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
                             "status": "running",
                             "runner_id": "r1",
                             "parent_session_id": None,
+                            # Production rows carry placement; it is what
+                            # tells a caller WHICH MACHINE a peer runs on.
+                            "host_id": "host_b",
+                            "workspace": "/srv/work/repo",
+                            "git_branch": "main",
                         },
                         {
                             "id": "s2",
@@ -6009,6 +6014,9 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
+            "host_id": "host_b",
+            "workspace": "/srv/work/repo",
+            "git_branch": "main",
         },
         {
             "session_id": "s2",
@@ -6018,6 +6026,9 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
+            "host_id": None,
+            "workspace": None,
+            "git_branch": None,
         },
     ]
     # Connectivity resolved once per UNIQUE runner — two sessions share
@@ -6974,26 +6985,94 @@ def test_get_info_reports_declared_midturn_steer_capability(
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_never_forwards_placement_arguments() -> None:
+async def test_sys_session_create_drops_host_id_and_refuses_an_escaping_workspace() -> None:
     """
-    ``host_id`` / ``workspace`` must never reach ``POST /v1/sessions``.
+    ``host_id`` is silently dropped; an out-of-bounds ``workspace`` is refused.
 
-    Two independent reasons, both verified against the server:
+    Two different reasons, both verified against the server:
 
-    1. A parented create force-inherits the parent's runner
-       (``inherited_runner_id``), which wins over ``host_id`` in routing —
-       so forwarding it advertised a placement the server cannot honor and
-       handed the child a cwd validated on a different machine.
-    2. The server boundary-checks ``workspace`` against the agent's
-       ``os_env.cwd`` ONLY when ``host_id`` is set. Forwarding ``workspace``
-       alone therefore let a caller point a child's tool cwd anywhere on the
-       runner's filesystem, escaping the agent's sandbox.
+    - ``host_id`` cannot be honored at all — a parented create force-inherits
+      the parent's runner (``inherited_runner_id``), which wins over
+      ``host_id`` in routing. Forwarding it would advertise a placement the
+      server ignores.
+    - ``workspace`` CAN be honored, but the server boundary-checks it only
+      when ``host_id`` is set — which never happens here. So the runner must
+      enforce containment itself, or a caller could point a child's tool cwd
+      at any absolute path on this filesystem. ``"/"`` is the escape.
 
     Asserted through ``execute_tool`` rather than the body builder, so
-    re-adding the arguments at the call site cannot pass unnoticed.
+    re-adding either argument at the call site cannot pass unnoticed.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
+    seen: dict[str, Any] = {}
+    posted = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal posted
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            posted = True
+            seen.update(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_new", "agent_name": "researcher"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        escaping = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": "ag_abc",
+                        "title": "worker",
+                        "host_id": "host_remote",
+                        "workspace": "/",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[]),
+                runner_workspace=Path("/home/nobody/project"),
+            )
+        )
+        # The escape is refused OUTRIGHT — nothing may reach the server.
+        assert escaping["error"] == "workspace_out_of_bounds"
+        assert posted is False
+
+        # A create with no placement still goes through, and carries no host.
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {"agent_id": "ag_abc", "title": "worker", "host_id": "host_remote"}
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=SimpleNamespace(sub_agents=[]),
+            runner_workspace=Path("/home/nobody/project"),
+        )
+
+    assert posted is True
+    assert "host_id" not in seen, seen
+    # Containment is still forced.
+    assert seen["parent_session_id"] == "conv_caller"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_forwards_an_in_bounds_workspace(tmp_path: Path) -> None:
+    """
+    A workspace inside the agent's own directory reaches the wire, canonicalized.
+
+    This is the cross-PROJECT half: a child started in a sibling checkout on
+    this machine. It must be sent as a resolved absolute path, because the
+    server stores it verbatim and the runner later uses it as the child's
+    tool cwd.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    sibling = tmp_path / "sibling-repo"
+    sibling.mkdir()
     seen: dict[str, Any] = {}
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -7009,37 +7088,37 @@ async def test_sys_session_create_never_forwards_placement_arguments() -> None:
         await execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps(
-                {
-                    "agent_id": "ag_abc",
-                    "title": "worker",
-                    "host_id": "host_remote",
-                    "workspace": "/",
-                }
+                {"agent_id": "ag_abc", "title": "worker", "workspace": "sibling-repo"}
             ),
             server_client=server_client,
             conversation_id="conv_caller",
+            agent_spec=SimpleNamespace(sub_agents=[]),
+            runner_workspace=tmp_path,
         )
 
-    assert "host_id" not in seen, seen
-    assert "workspace" not in seen, seen
-    # Containment is still forced.
-    assert seen["parent_session_id"] == "conv_caller"
+    assert seen["workspace"] == str(sibling.resolve())
+    assert "host_id" not in seen
 
 
-def test_sys_session_create_schema_advertises_no_placement() -> None:
+def test_sys_session_create_schema_offers_project_but_not_host() -> None:
     """
-    The LLM-facing schema must not offer placement it cannot deliver.
+    The schema offers the placement it can deliver, and only that.
 
-    Leaving the properties on the schema while dropping them on the wire
-    would be worse than either: the model would believe it had placed a
-    worker on another host and silently get a co-located one.
+    ``workspace`` works: the child runs on this machine, and the runner
+    enforces the directory boundary itself. ``host_id`` does not: a parented
+    create force-inherits the parent's runner, so advertising it would let a
+    model believe it had placed a worker on another machine and silently get
+    a co-located one. Cross-host reach is via sys_session_send to an existing
+    session there instead.
     """
     from omnigent.tools.builtins.spawn import SysSessionCreateTool
 
     props = SysSessionCreateTool().get_schema()["function"]["parameters"]["properties"]
 
     assert "host_id" not in props
-    assert "workspace" not in props
+    # workspace IS offered — cross-PROJECT placement on this machine is
+    # supported, and its containment is enforced runner-side.
+    assert "workspace" in props
 
 
 def test_subagent_inbox_line_names_the_dispatch_that_produced_it() -> None:
@@ -8271,43 +8350,58 @@ async def test_sys_session_send_session_id_posts_to_direct_child(
 
 
 @pytest.mark.asyncio
-async def test_sys_session_send_session_id_rejects_non_child() -> None:
+async def test_sys_session_send_reaches_a_peer_session_and_awaits_its_reply() -> None:
     """
-    By-session-id send refuses a target that is NOT a direct child of the
-    caller (``parent_session_id`` mismatch) — returning
-    ``session_out_of_tree`` and posting NO message. This is the
-    child-only safety guarantee: an orchestrator can't drive a sibling or
-    an unrelated session it merely has read access to. If the parentage
-    check regressed, the message would be posted and the assertion on
-    ``event_posts`` would fail.
+    A send to a session that is NOT the caller's child is delivered, not refused.
+
+    This is the whole of cross-machine agent-to-agent messaging. A child
+    always shares its parent's runner, so a peer on another host can never be
+    in the caller's spawn tree — refusing non-children made talking to an
+    agent on another machine impossible by construction. The server ACL is
+    the boundary (the snapshot read 403s anything the caller may not see).
+
+    The reply cannot arrive as a runtime event here (the owning runner holds
+    that), so the handle must carry a ``work_id`` AND a poller must be armed
+    to supply the missing return edge — a send whose promised inbox result
+    never lands is the failure mode this whole branch exists to kill.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     event_posts: list[dict[str, Any]] = []
+    started: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_other":
-            # Target's parent is someone ELSE, not the caller.
             return httpx.Response(
                 200,
                 json={
                     "id": "conv_other",
-                    "parent_session_id": "conv_someone_else",
-                    "title": "x:y",
+                    # Owned by a DIFFERENT runner, and not our child.
+                    "parent_session_id": None,
+                    "runner_id": "runner_remote",
+                    "host_id": "host_b",
+                    "status": "idle",
+                    "title": "houston",
+                    "agent_name": "claude-native-ui",
                 },
             )
-        if request.url.path == "/v1/sessions/conv_other/events":
+        if request.url.path == "/v1/runners/runner_remote/status":
+            return httpx.Response(200, json={"online": True})
+        if request.url.path == "/v1/sessions/conv_other/items":
+            return httpx.Response(200, json={"data": [{"id": "item_9"}]})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_other/events":
             event_posts.append(json.loads(request.content))
-            return httpx.Response(200, json={"ok": True})
+            return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_server_handler),
-        base_url="http://server",
-    ) as server_client:
-        try:
+    runner_app._remote_dispatch_start_ref = lambda **kw: started.append(kw)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
             output = await execute_tool(
                 tool_name="sys_session_send",
                 arguments=json.dumps({"session_id": "conv_other", "args": "hi"}),
@@ -8316,13 +8410,207 @@ async def test_sys_session_send_session_id_rejects_non_child() -> None:
                 agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
                 session_inbox=session_inbox,
             )
-        finally:
-            runner_app._session_inboxes_ref.pop("conv_caller", None)
+    finally:
+        runner_app._remote_dispatch_start_ref = None
+        runner_app.unregister_subagent_work("conv_other")
+        runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    handle = json.loads(output)
+    assert handle["status"] == "launching"
+    assert handle["kind"] == "peer_session"
+    assert handle["host_id"] == "host_b"
+    assert event_posts[0]["data"]["content"][0]["text"] == "hi"
+    # A poller MUST be armed, anchored on the pre-send newest item, or the
+    # reply can never reach this runner's inbox.
+    assert started[0]["work_id"] == handle["work_id"]
+    assert started[0]["anchor_item_id"] == "item_9"
+    assert started[0]["sent_text"] == "hi"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "extra_args", "expect_error"),
+    [
+        ("conv_child", {}, "message_denied"),
+        ("conv_peer", {}, "message_denied"),
+    ],
+    ids=["child", "peer"],
+)
+async def test_send_releases_the_work_entry_when_the_message_is_denied(
+    target: str,
+    extra_args: dict[str, Any],
+    expect_error: str,
+) -> None:
+    """
+    A policy-denied message must not leave a dispatch outstanding.
+
+    ``POST /v1/sessions/{id}/events`` answers a denial with HTTP **202** and
+    ``{"queued": false, "denied": true}``, so a status-only check reads it as
+    delivered. The send then registers work for a turn that never starts: the
+    target is permanently un-sendable ("already has a launching or running
+    turn") and the parent's turns end as "waiting" forever. Both the child
+    and the peer path must notice the denial in the BODY.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{target}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": target,
+                    # conv_child IS our child; conv_peer is not.
+                    "parent_session_id": ("conv_caller" if target == "conv_child" else None),
+                    "runner_id": "runner_remote",
+                    "status": "idle",
+                    "title": "researcher:auth",
+                    "sub_agent_name": "researcher",
+                },
+            )
+        if request.url.path == "/v1/runners/runner_remote/status":
+            return httpx.Response(200, json={"online": True})
+        if request.url.path == f"/v1/sessions/{target}/items":
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{target}/events":
+            return httpx.Response(
+                202, json={"queued": False, "denied": True, "reason": "blocked by cost budget"}
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    runner_app._remote_dispatch_start_ref = lambda **kw: None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": target, "args": "go", **extra_args}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=session_inbox,
+            )
+    finally:
+        runner_app._remote_dispatch_start_ref = None
+        runner_app.unregister_subagent_work(target)
+        runner_app._session_inboxes_ref.pop("conv_caller", None)
 
     info = json.loads(output)
-    assert info["error"] == "session_out_of_tree"
-    # No message was posted to the non-child session.
-    assert event_posts == []
+    assert info["error"] == expect_error
+    assert "cost budget" in info["message"]
+    # The slot must be free again, or the target is wedged forever.
+    assert runner_app.get_subagent_work(target) is None
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_refuses_a_busy_peer_without_posting() -> None:
+    """
+    A peer mid-turn is refused, and nothing is delivered to it.
+
+    Messaging someone else's in-flight turn merges this caller's text into
+    work it did not request, and the owning runner tracks one dispatch per
+    session — so the real requester's result would be corrupted too. Refusing
+    sidesteps the whole class.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    posted = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal posted
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_other":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_other",
+                    "parent_session_id": None,
+                    "runner_id": "runner_remote",
+                    "status": "running",
+                    "title": "houston",
+                },
+            )
+        if request.method == "POST":
+            posted = True
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_other", "args": "hi"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[]),
+                session_inbox=session_inbox,
+            )
+    finally:
+        runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    info = json.loads(output)
+    assert info["error"] == "session_busy"
+    assert posted is False
+    # And no work entry may linger for a send that never happened.
+    assert runner_app.get_subagent_work("conv_other") is None
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_reports_an_offline_peer_host() -> None:
+    """
+    A peer whose machine is offline fails fast instead of polling for 30 min.
+
+    Without this the caller registers work, arms a poller, and learns nothing
+    until the dispatch times out — for a target that was never reachable.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_other":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_other",
+                    "parent_session_id": None,
+                    "runner_id": "runner_remote",
+                    "status": "idle",
+                    "title": "houston",
+                },
+            )
+        if request.url.path == "/v1/runners/runner_remote/status":
+            return httpx.Response(200, json={"online": False})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_other", "args": "hi"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[]),
+                session_inbox=session_inbox,
+            )
+    finally:
+        runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    info = json.loads(output)
+    assert info["error"] == "session_runner_offline"
+    assert runner_app.get_subagent_work("conv_other") is None
 
 
 @pytest.mark.parametrize("empty_output", ["", "   ", "\n\t "])
@@ -10771,3 +11059,60 @@ async def test_factor3_new_message_lands_in_real_buffer(
     assert buffered
     assert buffered[-1]["content"] == "second message"
     assert buffered[-1]["conversation_id"] == conv
+
+
+def test_resolve_remote_reply_ignores_output_that_predates_our_message() -> None:
+    """
+    Text already in a peer's transcript is never mistaken for our reply.
+
+    A peer is a session in its own right: it goes running -> idle for turns
+    that have nothing to do with this caller. Taking whatever assistant text
+    is newest would deliver a stranger's answer under this dispatch's
+    work_id, which is precisely the misreporting the work_id exists to stop.
+    """
+    from omnigent.runner.app import resolve_remote_reply
+
+    items = [
+        {"id": "i1", "role": "user", "content": [{"text": "someone else's question"}]},
+        {"id": "i2", "role": "assistant", "content": [{"text": "SOMEONE ELSE'S ANSWER"}]},
+        {"id": "i3", "role": "user", "content": [{"text": "our question"}]},
+    ]
+
+    our_id, reply = resolve_remote_reply(items, sent_text="our question", our_message_id=None)
+
+    assert our_id == "i3"
+    # Our message is in, but nothing has answered IT yet.
+    assert reply == ""
+
+
+def test_resolve_remote_reply_returns_text_after_our_message() -> None:
+    """Assistant text following our message is the reply, and the last wins."""
+    from omnigent.runner.app import resolve_remote_reply
+
+    items = [
+        {"id": "i1", "role": "user", "content": [{"text": "our question"}]},
+        {"id": "i2", "role": "assistant", "content": [{"text": "thinking"}]},
+        {"id": "i3", "role": "assistant", "content": [{"text": "FINAL ANSWER"}]},
+    ]
+
+    our_id, reply = resolve_remote_reply(items, sent_text="our question", our_message_id=None)
+
+    assert our_id == "i1"
+    assert reply == "FINAL ANSWER"
+
+
+def test_resolve_remote_reply_waits_until_our_message_is_ingested() -> None:
+    """
+    Before our message appears, there is no reply — however idle the peer looks.
+
+    The window between POST and ingestion is exactly when a status-only rule
+    would fire and deliver stale text as this dispatch's result.
+    """
+    from omnigent.runner.app import resolve_remote_reply
+
+    items = [{"id": "i1", "role": "assistant", "content": [{"text": "STALE"}]}]
+
+    our_id, reply = resolve_remote_reply(items, sent_text="our question", our_message_id=None)
+
+    assert our_id is None
+    assert reply == ""
