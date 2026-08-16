@@ -1865,6 +1865,10 @@ def cancel_timer(session_id: str, timer_id: str) -> bool:
 # create_runner_app; read by tool_dispatch._execute_subagent_tool.
 _session_agent_ids_ref: dict[str, str] = {}
 
+# Module-level refs used by runner-local observability tools.
+_active_turns_ref: dict[str, asyncio.Task[None] | None] = {}
+_process_manager_ref: HarnessProcessManager | None = None
+
 # Module-level ref to _session_histories. Populated inside
 # create_runner_app; used by tests to inspect in-memory history.
 _session_histories_ref: dict[str, list[_JsonObject]] = {}
@@ -2032,6 +2036,20 @@ def get_session_agent_id(session_id: str) -> str | None:
     :returns: The agent_id, or ``None`` if not found.
     """
     return _session_agent_ids_ref.get(session_id)
+
+
+def session_has_active_turn(session_id: str) -> bool:
+    """
+    Return whether this runner currently holds an active turn for a session.
+
+    :param session_id: Session/conversation ID, e.g.
+        ``"conv_abc123"``.
+    :returns: ``True`` when either runner-local turn registry reports an
+        active turn, else ``False``.
+    """
+    return session_id in _active_turns_ref or (
+        _process_manager_ref is not None and _process_manager_ref.has_active_turn(session_id)
+    )
 
 
 # How long a session's discovered skills stay cached before the runner
@@ -2204,6 +2222,8 @@ def create_runner_app(
         if task is not None:
             task.cancel()
 
+    global _active_turns_ref, _process_manager_ref
+
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     _session_sub_agent_names: dict[str, str] = {}
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
@@ -2224,6 +2244,8 @@ def create_runner_app(
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
+    _active_turns_ref = _active_turns
+    _process_manager_ref = process_manager
     _native_pane_status: dict[str, str] = {}
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     app.state.session_message_buffers = _session_message_buffers

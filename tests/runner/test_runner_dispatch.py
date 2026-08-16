@@ -7762,6 +7762,8 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
+    create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+
     requested_paths: list[str] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -7800,10 +7802,143 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     # never queried (a stray /v1/runners call would mean the None-runner
     # short-circuit regressed).
     assert info["runner_online"] is None
+    assert info["turn_active"] is False
     assert info["last_activity_at"] == 42
     assert info["pending_elicitations"] == []
     assert info["pending_elicitation_count"] == 0
     assert not any(p.startswith("/v1/runners") for p in requested_paths)
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_reports_local_active_turn(tmp_path: Path) -> None:
+    """A direct child held by this runner reports an active turn."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    process_manager = HarnessProcessManager(tmp_parent=tmp_path)
+    app = create_runner_app(
+        process_manager=process_manager,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.active_turns["conv_child"] = None
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "agent_id": "ag_child",
+                    "agent_name": "worker",
+                    "parent_session_id": "conv_caller",
+                    "runner_id": None,
+                    "pending_elicitations": [],
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_child"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert json.loads(output)["turn_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_reports_remote_turn_as_unknown(tmp_path: Path) -> None:
+    """A peer's process-local turn state is unknowable from this runner."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    process_manager = HarnessProcessManager(tmp_parent=tmp_path)
+    create_runner_app(
+        process_manager=process_manager,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    process_manager.mark_in_flight("conv_peer", "resp_peer")
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_peer":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_peer",
+                    "agent_id": "ag_peer",
+                    "agent_name": "worker",
+                    "parent_session_id": "someone_else",
+                    "runner_id": "remote-runner",
+                    "pending_elicitations": [],
+                },
+            )
+        if request.url.path == "/v1/runners/remote-runner/status":
+            return httpx.Response(200, json={"online": True})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_peer"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert json.loads(output)["turn_active"] is None
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_reports_native_process_manager_turn(
+    tmp_path: Path,
+) -> None:
+    """A native harness turn is visible even without an ``_active_turns`` entry."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    process_manager = HarnessProcessManager(tmp_parent=tmp_path)
+    app = create_runner_app(
+        process_manager=process_manager,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    process_manager.mark_in_flight("conv_native", "resp_native")
+    assert "conv_native" not in app.state.active_turns
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_native":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_native",
+                    "agent_id": "ag_native",
+                    "agent_name": "claude-native",
+                    "harness": "claude-native",
+                    "parent_session_id": "conv_caller",
+                    "runner_id": "runner_native",
+                    "pending_elicitations": [],
+                },
+            )
+        if request.url.path == "/v1/runners/runner_native/status":
+            return httpx.Response(200, json={"online": True})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_native"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert json.loads(output)["turn_active"] is True
+    process_manager.clear_in_flight("conv_native")
 
 
 @pytest.mark.asyncio
