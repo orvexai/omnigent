@@ -63,7 +63,7 @@ jobs:
           - os: macos-14 # Apple silicon
             target: macos-arm64
             archive: tar.gz
-          - os: macos-13 # Intel
+          - os: macos-15-intel # Intel; macos-13 was retired Dec 2025
             target: macos-x86_64
             archive: tar.gz
 
@@ -76,14 +76,19 @@ jobs:
 
       # setup.py shells out to pnpm to build the SPA into
       # omnigent/server/static/web-ui unless OMNIGENT_SKIP_WEB_UI=true.
-      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
-        if: ${{ !inputs.skip_web_ui }}
-        with:
-          version: 9
+      # setup-node BEFORE pnpm/action-setup: its self-installer needs a Node
+      # binary. Same order the repo's other pnpm workflows use.
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         if: ${{ !inputs.skip_web_ui }}
         with:
           node-version: 22
+      # Must equal package.json's "packageManager" pin — action-setup v4 hard
+      # errors when a `version:` here disagrees with it.
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        if: ${{ !inputs.skip_web_ui }}
+        with:
+          version: 11.15.1
+          standalone: true
 
       - name: Install omnigent + PyInstaller
         shell: bash
@@ -147,7 +152,34 @@ jobs:
           fi
           "$bin" --version
           "$bin" --help > /dev/null
-          echo "smoke OK"
+          # --version/--help short-circuit before the app is constructed, so
+          # they prove only that argparse works. A binary missing the SPA
+          # bundle, alembic's migration scripts, or a uvicorn/passlib
+          # submodule passes both and ships, then dies on the user's first
+          # `omnigent server`. Boot the real server and require a healthy
+          # response.
+          export OMNIGENT_DATA_DIR="$(mktemp -d)"
+          export OMNIGENT_CONFIG_HOME="$(mktemp -d)"
+          "$bin" server --port 8765 > serve.log 2>&1 &
+          serve_pid=$!
+          ok=""
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8765/health > /dev/null 2>&1; then
+              ok=1
+              break
+            fi
+            if ! kill -0 "$serve_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          kill "$serve_pid" 2>/dev/null || true
+          if [ -z "$ok" ]; then
+            echo "server failed to become healthy; log follows:" >&2
+            cat serve.log >&2
+            exit 1
+          fi
+          echo "smoke OK (CLI + server boot)"
 
       - name: Package
         id: pkg

@@ -7934,3 +7934,44 @@ async def test_curl_evaluate_policy_command_round_trips(
     output = json.loads(result.stdout)
     assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_blocking_startup_prompt_detects_a_first_run_offer() -> None:
+    """
+    A startup selection list is recognized so the launch fails fast.
+
+    Claude Code occasionally ships a first-run interactive offer that renders
+    before the input box and blocks it forever. Every omnigent sub-agent
+    launch on that machine then fails with a generic 30s timeout, and the
+    only "fix" is a per-machine flag in the user's global config that a fresh
+    machine will not have. Detecting the SHAPE keeps the remedy in code and
+    survives a new offer with different wording.
+
+    Pane text is the real capture from an observed failure.
+    """
+    from omnigent.claude_native_bridge import _blocking_startup_prompt
+
+    pane = (
+        " ⚠ 3 MCP servers need authentication · run /mcp\n"
+        "──────────────────────────────────────────────\n"
+        " Make auto mode your default permission mode?\n"
+        "   Auto mode lets Claude handle permission prompts automatically.\n"
+        "   ❯ 1. Yes, set auto mode as my default permission mode\n"
+        "     2. No, keep bypass permissions\n"
+    )
+
+    assert _blocking_startup_prompt(pane) == "Make auto mode your default permission mode?"
+
+
+def test_blocking_startup_prompt_ignores_a_healthy_pane() -> None:
+    """
+    A normal ready pane is not mistaken for a blocking prompt.
+
+    A false positive here would abort healthy launches, which is strictly
+    worse than the timeout it replaces.
+    """
+    from omnigent.claude_native_bridge import _blocking_startup_prompt
+
+    pane = ' ⏵⏵ bypass permissions on (shift+tab to cycle)\n ❯ Try "fix lint errors"\n'
+
+    assert _blocking_startup_prompt(pane) is None
