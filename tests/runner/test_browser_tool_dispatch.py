@@ -328,6 +328,24 @@ def test_unknown_viz_error_becomes_actionable_guidance() -> None:
     assert "UnknownVizError" in out["detail"]
 
 
+def test_renderer_script_failure_becomes_fresh_snapshot_guidance() -> None:
+    """A generic renderer failure points agents at the likely stale-ref recovery."""
+    from omnigent.runner.tool_dispatch import _browser_action_guidance
+
+    raw = (
+        '{"ok": false, "error": "Script failed to execute; check the renderer console."}'
+        + " x" * 120
+    )
+
+    out = json.loads(_browser_action_guidance(raw))
+
+    assert out["error"] == "browser_action_failed_in_renderer"
+    assert "most likely cause" in out["message"]
+    assert "fresh browser_snapshot" in out["message"]
+    assert "ref from that new snapshot" in out["message"]
+    assert out["detail"] == raw[:200]
+
+
 def test_unrecognised_browser_errors_pass_through_unchanged() -> None:
     """A failure we have no guidance for is never dressed up as one we do."""
     from omnigent.runner.tool_dispatch import _browser_action_guidance

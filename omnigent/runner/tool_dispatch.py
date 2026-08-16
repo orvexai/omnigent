@@ -4145,7 +4145,7 @@ def _browser_action_guidance(raw: str) -> str:
     """
     Turn an opaque renderer/browser failure into something an agent can act on.
 
-    Two failures dominate in practice and neither is self-explanatory:
+    Three failures dominate in practice and none is self-explanatory:
 
     - ``UnknownVizError`` is Chromium's compositor refusing to capture. The
       pane is hidden (``setVisible(false)``), which the desktop app does
@@ -4157,6 +4157,9 @@ def _browser_action_guidance(raw: str) -> str:
       often wrong: it fires for any action the renderer failed to answer, so
       an agent whose other calls are succeeding is sent to debug a connection
       that demonstrably works.
+    - The renderer's generic script-execution failure gives an agent no useful
+      recovery path. A ref from a superseded snapshot or invalidated
+      navigation is the most common cause, but the renderer error is generic.
 
     :param raw: The verbatim response body from the browser action.
     :returns: The body, with actionable guidance appended when recognised.
@@ -4172,6 +4175,25 @@ def _browser_action_guidance(raw: str) -> str:
                     "so the browser pane is showing, then retry. Other browser "
                     "tools keep working while it is hidden — only screenshot "
                     "needs it visible."
+                ),
+                "detail": raw[:200],
+            }
+        )
+    renderer_error = raw.casefold()
+    if (
+        "script failed to execute" in renderer_error
+        or "check the renderer console" in renderer_error
+    ):
+        return json.dumps(
+            {
+                "error": "browser_action_failed_in_renderer",
+                "message": (
+                    "The browser action failed in the renderer. The most likely "
+                    "cause is that its ref came from a superseded browser snapshot "
+                    "or was invalidated by navigation. Take a fresh "
+                    "browser_snapshot, then retry with a ref from that new snapshot. "
+                    "If that does not resolve it, the renderer failure may have "
+                    "another cause."
                 ),
                 "detail": raw[:200],
             }
