@@ -155,6 +155,10 @@ def test_builtin_names_size_matches_registry() -> None:
                 "browser_click",
                 "browser_type",
                 "browser_screenshot",
+                # Synthesised runner-side from repeated ``snapshot`` actions
+                # (no renderer verb), but reserved like the other browser
+                # names so a user spec cannot shadow it.
+                "browser_wait_for",
             }
         )
         == BUILTIN_NAMES

@@ -195,12 +195,15 @@ _EXPECTED_BROWSER_NAMES = {
     "browser_click",
     "browser_type",
     "browser_screenshot",
+    # Synthesised runner-side from repeated ``snapshot`` actions rather than
+    # a renderer verb, but framework-owned and reserved like the rest.
+    "browser_wait_for",
 }
 
 
 def test_browser_names_reserved_framework_owned() -> None:
     """
-    The five ``browser_*`` names are reserved in the builtin registry so
+    The ``browser_*`` names are reserved in the builtin registry so
     user specs can't shadow them, but they are FRAMEWORK-OWNED — like
     ``list_comments`` / ``update_comment``, they are NOT instantiable via
     ``get_builtin_tool`` (registration is ToolManager's job). This pins
@@ -256,3 +259,79 @@ def test_native_relay_includes_browser_for_bare_spec() -> None:
         if schema["name"].startswith("browser_"):
             assert schema["description"]
             assert schema["parameters"]["type"] == "object"
+
+
+def test_snapshot_truncation_bounds_a_large_tree_and_says_so() -> None:
+    """
+    A big page is capped, and the result declares the truncation.
+
+    The renderer returns the whole accessibility tree with no way to scope
+    it — one wiki front page ran to ~490 elements, a large slice of an
+    agent's context for a single look. Truncating silently would be worse
+    than not truncating: the agent would conclude an element does not exist
+    when it was merely cut off, so the cut is reported explicitly.
+    """
+    from omnigent.runner.tool_dispatch import _truncate_browser_snapshot
+
+    tree = "\n".join(f'- link "item {i}" [ref={i}]' for i in range(50))
+    raw = json.dumps({"ok": True, "data": {"snapshot_id": "s1", "url": "u", "tree": tree}})
+
+    out = json.loads(_truncate_browser_snapshot(raw, 10))
+
+    assert len(out["data"]["tree"].splitlines()) == 10
+    assert out["data"]["truncated"] is True
+    assert out["data"]["dropped_elements"] == 40
+    # The agent must be told an absent element may simply be below the cut.
+    assert "below the cut" in out["data"]["truncation_note"]
+
+
+def test_snapshot_truncation_leaves_a_small_tree_untouched() -> None:
+    """A tree within the cap is returned byte-identical — no note, no flag."""
+    from omnigent.runner.tool_dispatch import _truncate_browser_snapshot
+
+    raw = json.dumps({"ok": True, "data": {"tree": '- heading "Hi" [ref=1]'}})
+
+    assert _truncate_browser_snapshot(raw, 10) == raw
+
+
+def test_snapshot_truncation_passes_through_a_failed_action() -> None:
+    """
+    An error payload is never rewritten.
+
+    Truncation must not mangle a failure into something that looks like a
+    successful-but-empty snapshot.
+    """
+    from omnigent.runner.tool_dispatch import _truncate_browser_snapshot
+
+    raw = json.dumps({"ok": False, "error": "No browser view"})
+
+    assert _truncate_browser_snapshot(raw, 1) == raw
+
+
+def test_unknown_viz_error_becomes_actionable_guidance() -> None:
+    """
+    Chromium's raw compositor error is replaced with what to actually do.
+
+    `UnknownVizError` means the pane is hidden (setVisible(false)), which the
+    desktop app does whenever a dialog or the Workspace panel is up. Only
+    screenshot needs a compositor surface, so every other verb keeps working
+    and the raw error reads like a broken tool. An agent given the raw string
+    has no way to know a UI state is the cause.
+    """
+    from omnigent.runner.tool_dispatch import _browser_action_guidance
+
+    out = json.loads(_browser_action_guidance('{"ok": false, "error": "UnknownVizError"}'))
+
+    assert out["error"] == "browser_pane_not_visible"
+    assert "Workspace panel" in out["message"]
+    # The original is preserved so the cause is still diagnosable.
+    assert "UnknownVizError" in out["detail"]
+
+
+def test_unrecognised_browser_errors_pass_through_unchanged() -> None:
+    """A failure we have no guidance for is never dressed up as one we do."""
+    from omnigent.runner.tool_dispatch import _browser_action_guidance
+
+    raw = '{"ok": false, "error": "No browser view"}'
+
+    assert _browser_action_guidance(raw) == raw

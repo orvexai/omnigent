@@ -34,6 +34,7 @@ BROWSER_TOOL_NAMES: frozenset[str] = frozenset(
         "browser_click",
         "browser_type",
         "browser_screenshot",
+        "browser_wait_for",
     }
 )
 
@@ -105,7 +106,13 @@ class BrowserSnapshotTool(Tool):
             "renderer can detect when the snapshot has been superseded "
             "by a newer one or invalidated by navigation. Refs are "
             "dramatically more stable than CSS selectors against "
-            "generated class names and Shadow DOM."
+            "generated class names and Shadow DOM. Large pages are "
+            "TRUNCATED to bound context (a news or wiki front page can "
+            "otherwise run to several hundred elements); when that "
+            "happens the result says so and reports how many were "
+            "dropped, so treat a missing element as possibly cut off "
+            "rather than absent. Raise max_refs, or navigate somewhere "
+            "narrower, to see more."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -122,7 +129,17 @@ class BrowserSnapshotTool(Tool):
                 "description": BrowserSnapshotTool.description(),
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "max_refs": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "Most elements to return. Omit for a "
+                                "sensible default that keeps a big page "
+                                "from consuming your context."
+                            ),
+                        },
+                    },
                     "additionalProperties": False,
                 },
             },
@@ -286,7 +303,12 @@ class BrowserScreenshotTool(Tool):
             "browser_snapshot for picking elements to act on, since "
             "screenshots can't carry ref ids and you can't click a "
             "pixel location. Use this when you need to verify what "
-            "something looks like, not to plan an interaction."
+            "something looks like, not to plan an interaction. "
+            "REQUIRES THE BROWSER PANE TO BE VISIBLE in the desktop "
+            "app: a hidden pane has no rendered surface to capture, so "
+            "this fails while every other browser tool keeps working. "
+            "If it reports browser_pane_not_visible, close any open "
+            "dialog and switch off the Workspace panel, then retry."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -320,3 +342,63 @@ BROWSER_TOOL_CLASSES: tuple[type[Tool], ...] = (
     BrowserTypeTool,
     BrowserScreenshotTool,
 )
+
+
+class BrowserWaitForTool(Tool):
+    """Wait for expected text to appear on the page (schema only)."""
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"browser_wait_for"``."""
+        return "browser_wait_for"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Wait until the given text appears on the page, then "
+            "return. Use this after any action that loads content "
+            "asynchronously — a redirect chain, a login flow, a "
+            "spinner, a lazily-rendered panel — instead of taking "
+            "snapshots on a hunch and hoping the content has arrived. "
+            "Returns found:true as soon as the text is present, or "
+            "found:false with the current URL if it never appears "
+            "within the timeout, so a failed wait still tells you "
+            "where the page actually ended up."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        :returns: Dict with ``"type": "function"`` and a
+            ``"function"`` sub-dict.
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": BrowserWaitForTool.name(),
+                "description": BrowserWaitForTool.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": (
+                                "Substring to wait for anywhere in the "
+                                "page's accessibility tree, e.g. "
+                                "'Sign in' or 'Dashboard'."
+                            ),
+                        },
+                        "timeout_s": {
+                            "type": "number",
+                            "description": (
+                                "Seconds to keep waiting before giving up. Omit for the default."
+                            ),
+                        },
+                    },
+                    "required": ["text"],
+                    "additionalProperties": False,
+                },
+            },
+        }
