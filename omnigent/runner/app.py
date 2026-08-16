@@ -84,6 +84,7 @@ from omnigent.runner.background_titles import (
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
+from omnigent.runner.event_delivery import EventPostResult, event_denial_reason
 from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
 from omnigent.runner.native import (
     _AUTO_OPENCODE_SERVERS,
@@ -388,6 +389,10 @@ _RUNNER_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 # returns a transient 503 RUNNER_UNAVAILABLE while the parent's runner tunnel
 # is reconnecting, so a single attempt can strand the parent silently.
 _WAKE_POST_MAX_ATTEMPTS = 3
+# Delay before the single out-of-band wake retry. Long enough to outlast a
+# runner tunnel reconnect, which the seconds-scale in-band retries above do
+# not cover — that gap is what leaves a parent asleep on a completed result.
+_WAKE_RETRY_AFTER_S = 60.0
 _WAKE_POST_RETRY_BASE_DELAY_S = 0.5
 _WAKE_POST_RETRY_MAX_DELAY_S = 4.0
 # 4xx statuses that are transient and worth retrying (mirrors the forwarder's
@@ -1483,7 +1488,7 @@ async def _deliver_subagent_wake_post(
     notice: str,
     *,
     created_by: str | None = None,
-) -> bool:
+) -> EventPostResult:
     """
     POST a sub-agent wake notice with a bounded retry on transient failure.
 
@@ -1494,6 +1499,13 @@ async def _deliver_subagent_wake_post(
     retries transient failures up to :data:`_WAKE_POST_MAX_ATTEMPTS` with
     exponential backoff, because the wake is the sole delivery signal for
     the last child of a fan-out. Permanent 4xx rejections stop immediately.
+
+    A **policy denial is not a transport failure** and must not be retried:
+    the policy will refuse again, and for a gate that parks on a human ASK
+    each retry parks ANOTHER one, producing duplicate approval cards. It
+    also is not a success — the route reports it as HTTP 202, so a
+    status-only check called it delivered and left the parent asleep with
+    a completed result in its inbox and nothing left to rouse it.
 
     :param server_client: Omnigent HTTP client for the runner subprocess.
     :param parent_id: Parent session to wake, e.g. ``"conv_parent123"``.
@@ -1535,7 +1547,9 @@ async def _deliver_subagent_wake_post(
             # Treat a non-2xx RESPONSE (e.g. a genuine 503 JSONResponse) as a
             # failure — httpx does not raise on status by itself.
             resp.raise_for_status()
-            return True
+            if (denial := event_denial_reason(resp)) is not None:
+                return EventPostResult(delivered=False, denial_reason=denial)
+            return EventPostResult(delivered=True)
         except (httpx.HTTPError, asyncio.TimeoutError) as exc:
             if (
                 attribution_created_by is not None
@@ -1560,13 +1574,13 @@ async def _deliver_subagent_wake_post(
                 exc,
             )
             if last_attempt or not retryable:
-                return False
+                return EventPostResult(delivered=False)
             delay_s = min(
                 _WAKE_POST_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)),
                 _WAKE_POST_RETRY_MAX_DELAY_S,
             )
             await _wake_retry_sleep(delay_s)
-    return False
+    return EventPostResult(delivered=False)
 
 
 def _subagent_delivery_not_confirmed_response(
@@ -1917,6 +1931,47 @@ def _api_item_text(item: _JsonObject) -> str:
     return "".join(parts)
 
 
+def parent_needs_rewake(
+    parent_session_id: str,
+    *,
+    wake_pending: set[str],
+    wake_owed: set[str],
+    inbox_size: int,
+) -> bool:
+    """
+    Decide whether a parent with undrained results should be woken again.
+
+    **Scheduling only.** This does NOT decide whether the caller should clear
+    the wake flags — those must be cleared on idle regardless of what this
+    returns, because ``_schedule_subagent_wake`` debounces on them and a flag
+    left set suppresses the *next* child's wake entirely. Using this as the
+    clear-gate reintroduces exactly that stranding bug.
+
+    Two states qualify, and conflating them is what broke this:
+
+    - **pending** — a wake was sent, and the parent still has results it has
+      not drained. Re-waking nudges it to finish.
+    - **owed** — a wake never landed at all (refused by policy, or failed
+      past its bounded retries). This is the dangerous one: the parent is
+      idle, holds a completed result, and has **nothing scheduled to rouse
+      it**. The wake is the only delivery signal a sub-agent result gets.
+
+    The original guard checked *only* ``pending``, and the failure path
+    cleared that flag before recovery could run — so the single case this
+    function exists for was the one case it skipped.
+
+    :param parent_session_id: Parent session being considered.
+    :param wake_pending: Parents with a wake already sent.
+    :param wake_owed: Parents whose wake did not land.
+    :param inbox_size: Undrained items in the parent's inbox. Zero means
+        there is nothing to wake it *for*.
+    :returns: ``True`` when a wake should be scheduled.
+    """
+    if inbox_size <= 0:
+        return False
+    return parent_session_id in wake_pending or parent_session_id in wake_owed
+
+
 def resolve_remote_reply(
     items: list[_JsonObject],
     *,
@@ -2192,6 +2247,12 @@ def create_runner_app(
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
     _subagent_wake_pending: set[str] = set()
+    # Parents whose wake notice never landed (refused, or failed past its
+    # retries). Distinct from "pending": these have a completed result in an
+    # inbox and NOTHING scheduled to deliver it, so they are what
+    # ``_rewake_parent_if_inbox_stranded`` must rescue.
+    _wake_owed_parents: set[str] = set()
+    _wake_retry_tasks: dict[str, asyncio.Task[None]] = {}
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
@@ -3611,6 +3672,10 @@ def create_runner_app(
             _poller = _remote_dispatch_tasks.pop(_child_id, None)
             if _poller is not None and not _poller.done():
                 _poller.cancel()
+        _wake_owed_parents.discard(session_id)
+        _wake_retry = _wake_retry_tasks.pop(session_id, None)
+        if _wake_retry is not None and not _wake_retry.done():
+            _wake_retry.cancel()
         unregister_subagent_work_for_session(session_id)
         if filesystem_registry is not None:
             filesystem_registry.unregister_conversation(session_id)
@@ -5493,21 +5558,101 @@ def create_runner_app(
                 _ingest_now_serving[session_id] = _seq + 1
                 _cond.notify_all()
 
+    async def _retry_owed_wake(parent_id: str, child_id: str) -> None:
+        """
+        Re-attempt one wake that failed to reach a sleeping parent.
+
+        The wake is the ONLY delivery signal for a completed child, and the
+        parent is by definition idle — so a failed wake means the result
+        sits in an inbox with nothing left to rouse it. The in-band retries
+        are bounded to seconds, which does not outlast a runner tunnel
+        reconnect; this one fires long enough after to catch that.
+
+        Deliberately a single shot armed on failure, NOT a periodic sweep:
+        the cost of an always-on watchdog over every session is not
+        justified by a case that only arises when a wake actually failed.
+        Always terminalizes — success, second failure, or teardown — so it
+        cannot become the kind of never-resolving waiter it exists to fix.
+
+        :param parent_id: Parent session owed a wake.
+        :param child_id: Child whose result is stranded, for logging.
+        :returns: None.
+        """
+        try:
+            await asyncio.sleep(_WAKE_RETRY_AFTER_S)
+            if parent_id not in _wake_owed_parents:
+                return
+            inbox = _session_inboxes.get(parent_id)
+            if inbox is None or inbox.empty():
+                _wake_owed_parents.discard(parent_id)
+                return
+            entries = list_subagent_work(parent_id)
+            notice = _format_subagent_wake_notice(
+                agent=entries[0].agent if entries else "sub-agent",
+                title=entries[0].title if entries else "",
+                status="completed",
+                pending=inbox.qsize(),
+            )
+            result = await _deliver_subagent_wake_post(server_client, parent_id, notice)
+            if result.delivered:
+                _wake_owed_parents.discard(parent_id)
+                _logger.info("Retried sub-agent wake reached parent=%s", parent_id)
+                return
+            _logger.warning(
+                "Sub-agent wake for parent=%s child=%s still undelivered after retry (%s); "
+                "the result stays in its inbox and will surface on the parent's next turn",
+                parent_id,
+                child_id,
+                result.denial_reason or "delivery failed",
+            )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            _wake_retry_tasks.pop(parent_id, None)
+
     async def _post_subagent_wake_notice(
         parent_id: str, notice: str, child_id: str, created_by: str | None
     ) -> None:
-        delivered = await _deliver_subagent_wake_post(
+        result = await _deliver_subagent_wake_post(
             server_client, parent_id, notice, created_by=created_by
         )
-        if not delivered:
-            _subagent_wake_pending.discard(parent_id)
+        if result.delivered:
+            return
+        # The wake did NOT land. Clearing the pending flag alone (what this
+        # used to do) removed the parent from the only recovery path there
+        # is — ``_rewake_parent_if_inbox_stranded`` gates on that very flag,
+        # so the single case it exists for was the one case it skipped.
+        # Record the debt explicitly instead.
+        _subagent_wake_pending.discard(parent_id)
+        _wake_owed_parents.add(parent_id)
+        if result.denied:
+            # A policy refusal will refuse again, and re-posting into a
+            # parked ASK gate spawns duplicate approval cards. Do not retry;
+            # rely on the parent's next turn to drain the inbox.
             _logger.warning(
-                "Sub-agent wake POST failed for parent=%s child=%s after %d attempt(s); "
-                "result remains in the parent inbox until the next wake",
+                "Sub-agent wake for parent=%s child=%s was REFUSED by policy (%s); "
+                "the result stays in the parent inbox until its next turn",
                 parent_id,
                 child_id,
-                _WAKE_POST_MAX_ATTEMPTS,
+                result.denial_reason,
             )
+            return
+        _logger.warning(
+            "Sub-agent wake POST failed for parent=%s child=%s after %d attempt(s); "
+            "retrying once in %.0fs",
+            parent_id,
+            child_id,
+            _WAKE_POST_MAX_ATTEMPTS,
+            _WAKE_RETRY_AFTER_S,
+        )
+        if parent_id in _wake_retry_tasks:
+            return
+        retry_task = asyncio.create_task(
+            _retry_owed_wake(parent_id, child_id), name=f"wake-retry-{parent_id}"
+        )
+        _wake_retry_tasks[parent_id] = retry_task
+        retry_task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(retry_task)
 
     def _schedule_subagent_wake(entry: _SubagentWorkEntry) -> None:
         if entry.parent_session_id == entry.child_session_id:
@@ -5540,11 +5685,35 @@ def create_runner_app(
         _background_tasks.add(_wake_task)
 
     def _rewake_parent_if_inbox_stranded(parent_session_id: str) -> None:
-        if parent_session_id not in _subagent_wake_pending:
-            return
-        _subagent_wake_pending.discard(parent_session_id)
+        # Two states qualify, and the second is the one that was missing.
+        # ``pending`` = a wake was sent and the parent still has undrained
+        # results. ``owed`` = a wake never landed at all (refused, or failed
+        # past its retries) — precisely the case where the parent is asleep
+        # with a completed result and nothing scheduled to rouse it. The old
+        # guard checked only ``pending``, which the failure path had just
+        # cleared, so the recovery excluded the failure it was written for.
         inbox = _session_inboxes.get(parent_session_id)
-        if inbox is None or inbox.empty():
+        tracked = (
+            parent_session_id in _subagent_wake_pending
+            or parent_session_id in _wake_owed_parents
+        )
+        if not tracked:
+            return
+        should_wake = parent_needs_rewake(
+            parent_session_id,
+            wake_pending=_subagent_wake_pending,
+            wake_owed=_wake_owed_parents,
+            inbox_size=0 if inbox is None else inbox.qsize(),
+        )
+        # Clear on idle REGARDLESS of inbox state, and BEFORE deciding whether
+        # to re-wake. ``_schedule_subagent_wake`` debounces on the pending
+        # flag, so leaving it set merely because the inbox happens to be empty
+        # right now silently suppresses the NEXT child's wake — stranding a
+        # result that has not been produced yet. Guarded by
+        # ``test_parent_idle_with_stuck_wake_flag_and_drained_inbox_clears_flag``.
+        _subagent_wake_pending.discard(parent_session_id)
+        _wake_owed_parents.discard(parent_session_id)
+        if not should_wake:
             return
         entries = list_subagent_work(parent_session_id)
         if not entries:
