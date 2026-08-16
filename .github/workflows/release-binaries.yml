@@ -87,10 +87,9 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          # Install the project itself (not editable): PyInstaller collects
-          # from site-packages, and an editable install leaves the package
-          # behind a path hook that --collect-all cannot walk.
-          python -m pip install .
+          # Install local SDK siblings explicitly because pip ignores [tool.uv.sources]. Keep installs
+          # non-editable: PyInstaller collects from site-packages, not path hooks --collect-all cannot walk.
+          python -m pip install ./sdks/python-client ./sdks/ui .
           python -m pip install pyinstaller==6.11.1
 
       - name: Resolve version
@@ -262,10 +261,9 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          # Install the project itself (not editable): PyInstaller collects
-          # from site-packages, and an editable install leaves the package
-          # behind a path hook that --collect-all cannot walk.
-          python -m pip install .
+          # Install local SDK siblings explicitly because pip ignores [tool.uv.sources]. Keep installs
+          # non-editable: PyInstaller collects from site-packages, not path hooks --collect-all cannot walk.
+          python -m pip install ./sdks/python-client ./sdks/ui .
           python -m pip install pyinstaller==6.11.1
 
       - name: Resolve version
