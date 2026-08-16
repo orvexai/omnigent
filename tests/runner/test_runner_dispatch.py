@@ -5216,11 +5216,12 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
     # c3 (explicitly closed despite its mixed-type label map) and c5
     # (legacy title tombstone) dropped; the ui:-added child surfaces under
     # its bound agent + label; c4 (no colon) surfaces under its own title
-    # so a free-form child stays reachable by name.
+    # with a null agent, so a free-form child stays reachable without
+    # claiming an agent name that does not exist.
     assert out["sub_agents"] == [
         {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
         {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2"},
-        {"agent": "legacy-untyped", "title": "legacy-untyped", "conversation_id": "c4"},
+        {"agent": None, "title": "legacy-untyped", "conversation_id": "c4"},
     ]
 
 
@@ -6717,10 +6718,12 @@ def test_child_rows_surface_free_form_titled_children() -> None:
             },
             {
                 "id": "conv_freeform",
+                # The server sets ``tool`` to the raw title on a colon-less
+                # row and leaves ``agent_name`` unset, so neither yields a
+                # real agent name here.
                 "title": "my-worker",
                 "tool": "my-worker",
                 "session_name": None,
-                "agent_name": "codex-native-ui",
                 "labels": {},
             },
             {
@@ -6738,8 +6741,10 @@ def test_child_rows_surface_free_form_titled_children() -> None:
         "title": "auth",
         "conversation_id": "conv_named",
     }
+    # ``agent`` is null rather than the title: reusing ``tool`` here would
+    # assert an agent named "my-worker", which does not exist.
     assert by_id["conv_freeform"] == {
-        "agent": "codex-native-ui",
+        "agent": None,
         "title": "my-worker",
         "conversation_id": "conv_freeform",
     }
