@@ -154,6 +154,9 @@ _BOX_RULE_CHARS = frozenset("─━╭╮╰╯│┃╌╍")
 # people's statuslines run ~3 lines — so the ``❯`` row isn't the last
 # non-empty line.
 _PROMPT_SCAN_TAIL_LINES = 5
+# A numbered choice in a startup selection list, e.g. "1. Yes, ..." — with or
+# without the TUI's "❯" selection caret.
+_STARTUP_CHOICE_RE = re.compile(r"^[^\w]{0,3}\d+[.)]\s+\S")
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # How long to wait for the pasted draft to visibly land in Claude's
@@ -3634,6 +3637,36 @@ def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
+def _blocking_startup_prompt(pane: str) -> str | None:
+    """
+    Return the question text when the pane is parked on a startup prompt.
+
+    Claude Code occasionally ships a first-run interactive offer (an opt-in
+    nudge, a migration choice) that renders a numbered selection list and
+    blocks BEFORE the input box exists. Every omnigent sub-agent launch on
+    that machine then fails identically: the readiness gate waits its full
+    budget for a prompt that cannot appear, and reports a generic timeout.
+
+    Detecting the shape rather than any single offer's wording keeps this
+    working across CLI releases — a new nudge is caught the same way — and
+    keeps the remedy in code instead of relying on a per-machine flag in the
+    user's global config, which a fresh machine simply will not have.
+
+    :param pane: Captured terminal contents.
+    :returns: The question line, e.g. ``"Make auto mode your default
+        permission mode?"``, or ``None`` when no such prompt is showing.
+    """
+    lines = [line.strip() for line in pane.splitlines() if line.strip()]
+    # A selection list: consecutively numbered choices the user must answer.
+    numbered = [line for line in lines if _STARTUP_CHOICE_RE.match(line)]
+    if len(numbered) < 2:
+        return None
+    for index, line in enumerate(lines):
+        if line.endswith("?") and any(_STARTUP_CHOICE_RE.match(c) for c in lines[index + 1 :]):
+            return line
+    return None
+
+
 def _claude_prompt_rendered(pane: str) -> bool:
     """
     Return whether Claude Code's input prompt is rendered in a pane.
@@ -3856,6 +3889,18 @@ def _wait_for_claude_prompt_ready(
             empty_polls += 1
         if _claude_prompt_rendered(pane):
             return
+        # Parked on an interactive startup prompt: the input box will never
+        # appear, so waiting out the budget only delays an identical failure
+        # on every launch. Fail immediately and name what must be answered.
+        blocking = _blocking_startup_prompt(pane)
+        if blocking is not None:
+            raise RuntimeError(
+                "Claude Code is waiting on an interactive startup prompt and "
+                "cannot accept input: "
+                f"{blocking!r}. Run `claude` once in a terminal on this "
+                "machine and answer it, then retry. The message was not "
+                "delivered." + _format_terminal_failure_tail(pane)
+            )
         if time.monotonic() >= deadline:
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
