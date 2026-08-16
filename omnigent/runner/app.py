@@ -5233,7 +5233,11 @@ def create_runner_app(
                 status="failed",
                 output=f"Error: sub-agent turn failed: {error.get('message', 'unknown')}",
             )
-        elif not _is_native_harness(conv_id) and not has_buffered:
+        elif (
+            not _is_native_harness(conv_id)
+            and _session_harness_name(conv_id) is not None
+            and not has_buffered
+        ):
             _mark_subagent_terminal_and_wake(
                 conv_id,
                 status="completed",
@@ -5694,8 +5698,7 @@ def create_runner_app(
         # cleared, so the recovery excluded the failure it was written for.
         inbox = _session_inboxes.get(parent_session_id)
         tracked = (
-            parent_session_id in _subagent_wake_pending
-            or parent_session_id in _wake_owed_parents
+            parent_session_id in _subagent_wake_pending or parent_session_id in _wake_owed_parents
         )
         if not tracked:
             return

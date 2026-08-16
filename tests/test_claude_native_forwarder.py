@@ -9,6 +9,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -4751,6 +4752,296 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
             await task
         server.shutdown()
         server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("notification_output", "expected_output"),
+    [
+        ("<result>REAL_TASK_RESULT</result>", "REAL_TASK_RESULT"),
+        ("<summary>SUMMARY_ONLY_RESULT</summary>", "SUMMARY_ONLY_RESULT"),
+    ],
+    ids=["result", "summary-only"],
+)
+async def test_subagent_watcher_task_notification_delivers_result(
+    tmp_path: Path,
+    notification_output: str,
+    expected_output: str,
+) -> None:
+    """The parent Task notification, not child narration, closes the child."""
+    bridge_dir = tmp_path / "bridge"
+    parent_path = tmp_path / "session.jsonl"
+    task_id = "task42"
+    parent_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "parent-notification",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<task-notification>\n"
+                        f"<task-id>{task_id}</task-id>\n"
+                        "<status>completed</status>\n"
+                        f"{notification_output}\n"
+                        "</task-notification>"
+                    ),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _seed_subagent_on_disk(
+        transcript_path=parent_path,
+        subagent_id=task_id,
+        agent_type="general-purpose",
+        description="long task",
+        tool_use_id="toolu_task42",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "opening",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "OPENING_NARRATION"},
+                    ],
+                },
+            }
+        ],
+    )
+    notifications: dict[str, forwarder._SubagentTaskNotification] = {}
+    parent_state = forwarder.TranscriptForwardState(
+        transcript_path=parent_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(parent_path, 0),
+    )
+    child_state = forwarder.SubagentForwardState(
+        subagents={
+            task_id: forwarder.SubagentEntry(
+                subagent_id=task_id,
+                child_conversation_id="conv_child_task42",
+                started_at_ts=time.time(),
+            )
+        }
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=parent_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            task_notifications=notifications,
+        )
+        await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=parent_path,
+            state=child_state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(),
+            item_retry_tracker=forwarder._PostRetryTracker(),
+            status_retry_tracker=forwarder._PostRetryTracker(),
+            task_notifications=notifications,
+        )
+
+    child_statuses = [
+        request["data"]
+        for request in requests
+        if request["type"] == "external_session_status"
+        and request.get("data", {}).get("status") in {"idle", "failed"}
+    ]
+    assert child_statuses == [{"status": "idle", "output": expected_output}]
+    assert all(
+        request.get("data", {}).get("output") != "OPENING_NARRATION" for request in requests
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagent_quiescence_posts_waiting_not_terminal_idle(tmp_path: Path) -> None:
+    """Five seconds of quiet marks a child waiting, never completed."""
+    bridge_dir = tmp_path / "bridge"
+    parent_path = tmp_path / "session.jsonl"
+    parent_path.write_text("", encoding="utf-8")
+    child_path = _seed_subagent_on_disk(
+        transcript_path=parent_path,
+        subagent_id="quiet42",
+        agent_type="Explore",
+        description="thinking",
+        tool_use_id="toolu_quiet42",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "quiet-opening",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "OPENING_NARRATION"}],
+                },
+            }
+        ],
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "quiet42": forwarder.SubagentEntry(
+                subagent_id="quiet42",
+                child_conversation_id="conv_quiet42",
+                byte_offset=child_path.stat().st_size,
+                last_activity_ts=time.time() - forwarder._SUBAGENT_IDLE_QUIESCENCE_S - 1,
+                started_at_ts=time.time() - forwarder._SUBAGENT_IDLE_QUIESCENCE_S - 1,
+            )
+        }
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        updated = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=parent_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(),
+            item_retry_tracker=forwarder._PostRetryTracker(),
+            status_retry_tracker=forwarder._PostRetryTracker(),
+        )
+
+    status_requests = [
+        request["data"] for request in requests if request["type"] == "external_session_status"
+    ]
+    assert status_requests == [{"status": "waiting"}]
+    assert updated.subagents["quiet42"].terminal_status is None
+
+
+@pytest.mark.asyncio
+async def test_active_subagent_past_old_fallback_window_is_not_failed(tmp_path: Path) -> None:
+    """Recent activity keeps a long-running child alive past the old cap."""
+    bridge_dir = tmp_path / "bridge"
+    parent_path = tmp_path / "session.jsonl"
+    parent_path.write_text("", encoding="utf-8")
+    child_path = _seed_subagent_on_disk(
+        transcript_path=parent_path,
+        subagent_id="active42",
+        agent_type="Explore",
+        description="still working",
+        tool_use_id="toolu_active42",
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "active42": forwarder.SubagentEntry(
+                subagent_id="active42",
+                child_conversation_id="conv_active42",
+                byte_offset=child_path.stat().st_size,
+                started_at_ts=time.time() - 1801.0,
+                last_activity_ts=time.time() - 301.0,
+            )
+        }
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        updated = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=parent_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(),
+            item_retry_tracker=forwarder._PostRetryTracker(),
+            status_retry_tracker=forwarder._PostRetryTracker(),
+        )
+
+    status_requests = [
+        request["data"] for request in requests if request["type"] == "external_session_status"
+    ]
+    assert all(request.get("status") != "failed" for request in status_requests)
+    assert updated.subagents["active42"].terminal_status is None
+
+
+@pytest.mark.asyncio
+async def test_subagent_terminal_fallback_reports_failed(tmp_path: Path) -> None:
+    """A child past the long fallback is failed, never completed."""
+    bridge_dir = tmp_path / "bridge"
+    parent_path = tmp_path / "session.jsonl"
+    parent_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=parent_path,
+        subagent_id="stuck42",
+        agent_type="Explore",
+        description="stuck",
+        tool_use_id="toolu_stuck42",
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "stuck42": forwarder.SubagentEntry(
+                subagent_id="stuck42",
+                child_conversation_id="conv_stuck42",
+                started_at_ts=time.time() - 1801.0,
+            )
+        }
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        updated = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=parent_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(),
+            item_retry_tracker=forwarder._PostRetryTracker(),
+            status_retry_tracker=forwarder._PostRetryTracker(),
+        )
+
+    status_requests = [
+        request["data"] for request in requests if request["type"] == "external_session_status"
+    ]
+    assert status_requests == [
+        {
+            "status": "failed",
+            "output": (
+                "Error: sub-agent did not produce a terminal task-notification "
+                "before the fallback deadline."
+            ),
+        }
+    ]
+    assert updated.subagents["stuck42"].terminal_status == "failed"
 
 
 async def test_subagent_watcher_retry_skips_previously_posted_items(
