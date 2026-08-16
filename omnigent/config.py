@@ -32,6 +32,30 @@ def load_global_config(path: Path | None = None) -> _Config:
         return raw
 
 
+def save_global_config(config: _Config, path: Path | None = None) -> Path:
+    """
+    Write the user-level config, replacing the file atomically.
+
+    Callers are expected to have loaded the existing config and mutated it,
+    so unrelated keys survive. The write goes to a sibling temp file and is
+    renamed into place: a crash mid-write would otherwise leave a truncated
+    ``config.yaml`` that fails to parse, which every later load treats as an
+    empty config — silently discarding the user's whole configuration.
+
+    :param config: The complete config mapping to persist.
+    :param path: Destination, defaulting to :func:`global_config_path`.
+    :returns: The path written.
+    :raises OSError: If the directory cannot be created or the file written.
+    """
+    resolved_path = path or global_config_path()
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = resolved_path.with_name(f"{resolved_path.name}.tmp")
+    with tmp_path.open("w") as config_file:
+        yaml.safe_dump(config, config_file, sort_keys=False)
+    tmp_path.replace(resolved_path)
+    return resolved_path
+
+
 def load_local_config(path: Path | None = None) -> _Config:
     """Load the project-level config, returning an empty mapping when absent."""
     resolved_path = path or Path.cwd() / _LOCAL_CONFIG_RELPATH
@@ -98,4 +122,5 @@ __all__ = [
     "load_effective_config",
     "load_global_config",
     "load_local_config",
+    "save_global_config",
 ]

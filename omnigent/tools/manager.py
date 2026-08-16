@@ -25,6 +25,7 @@ from omnigent.tools.builtins import (
     SysAdviseModelsTool,
     SysAgentDownloadTool,
     SysAgentGetTool,
+    SysAgentLimitsTool,
     SysAgentListTool,
     SysCallAsyncTool,
     SysCancelAsyncTool,
@@ -459,6 +460,11 @@ class ToolManager:
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
+        # Agent caps: always available, because the refusal an agent hits
+        # (host_agent_limit_reached) is unactionable without a way to read
+        # what the cap is — and the tool is the only place that says
+        # whether a raise survived a restart.
+        self._tools[SysAgentLimitsTool.name()] = SysAgentLimitsTool()
 
         # Session sharing: opt-in via the dedicated
         # ``agent_session_sharing`` flag, independent of spawn / declared

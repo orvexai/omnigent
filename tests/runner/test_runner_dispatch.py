@@ -11116,3 +11116,266 @@ def test_resolve_remote_reply_waits_until_our_message_is_ingested() -> None:
 
     assert our_id is None
     assert reply == ""
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "expected"),
+    [
+        ("codex-native-ui", "codex-native"),
+        ("codex-native-ui-subagent", "codex-native"),
+        ("claude-native-ui", "claude-native"),
+        ("polly", "polly"),
+        (None, None),
+    ],
+    ids=["codex", "codex_subagent", "claude", "non_native", "unknown"],
+)
+def test_session_cli_reduces_an_agent_name_to_its_toolchain(
+    agent_name: str | None,
+    expected: str | None,
+) -> None:
+    """
+    The per-CLI cap counts toolchains, not agent names.
+
+    Ten differently-named agents all driving `codex` are ten codex processes
+    on the box. Counting by name would let the cap be side-stepped by
+    renaming, which is the easiest thing in the world for an orchestrator to
+    do by accident.
+    """
+    from omnigent.runner.tool_dispatch import _session_cli
+
+    assert _session_cli(agent_name) == expected
+
+
+def _limits_session_rows(count: int, *, agent_name: str, host_id: str) -> list[dict[str, Any]]:
+    """Build *count* open session rows on *host_id* running *agent_name*."""
+    return [
+        {"id": f"s{i}", "host_id": host_id, "agent_name": agent_name, "labels": {}}
+        for i in range(count)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_limit_refuses_when_the_host_is_full() -> None:
+    """
+    A create is refused once the host is at its overall cap.
+
+    A host is a finite machine: every session holds a terminal and a harness
+    process. Unbounded, the overload surfaced as unrelated timeouts rather
+    than a refusal the caller could act on.
+    """
+    from omnigent import agent_limits
+    from omnigent.runner.tool_dispatch import _agent_limit_refusal
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"data": _limits_session_rows(3, agent_name="mixed", host_id="host_a")}
+        )
+
+    agent_limits.apply_limits(max_per_host=3, max_per_cli_per_host=99, persist=False)
+    try:
+        async with _session_query_client(handler) as client:
+            out = await _agent_limit_refusal(
+                host_id="host_a", new_cli="codex-native", server_client=client
+            )
+    finally:
+        agent_limits.reset_for_tests()
+
+    assert out is not None
+    info = json.loads(out)
+    assert info["error"] == "host_agent_limit_reached"
+    assert info["current"] == 3
+    assert info["limit"] == 3
+
+
+@pytest.mark.asyncio
+async def test_agent_limit_refuses_a_cli_that_is_full_while_the_host_is_not() -> None:
+    """
+    One toolchain cannot consume the whole host budget.
+
+    This is the dimension that actually binds in practice: an orchestrator
+    with a favourite worker drifts into twenty Codex processes and nothing
+    else, which is a very different load shape from a balanced mix.
+    """
+    from omnigent import agent_limits
+    from omnigent.runner.tool_dispatch import _agent_limit_refusal
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": (
+                    _limits_session_rows(2, agent_name="codex-native-ui", host_id="host_a")
+                    + _limits_session_rows(1, agent_name="claude-native-ui", host_id="host_a")
+                )
+            },
+        )
+
+    agent_limits.apply_limits(max_per_host=50, max_per_cli_per_host=2, persist=False)
+    try:
+        async with _session_query_client(handler) as client:
+            refused = await _agent_limit_refusal(
+                host_id="host_a", new_cli="codex-native", server_client=client
+            )
+            # A DIFFERENT CLI still has room on the same host.
+            allowed = await _agent_limit_refusal(
+                host_id="host_a", new_cli="claude-native", server_client=client
+            )
+    finally:
+        agent_limits.reset_for_tests()
+
+    assert refused is not None
+    assert json.loads(refused)["error"] == "cli_agent_limit_reached"
+    assert allowed is None
+
+
+@pytest.mark.asyncio
+async def test_agent_limit_ignores_closed_sessions_and_other_hosts() -> None:
+    """
+    Closed sessions and other hosts do not consume this host's budget.
+
+    A closed session holds nothing on the machine, so counting it would
+    permanently shrink the budget as tombstones accumulate — the cap would
+    tighten over time until nothing could be created at all.
+    """
+    from omnigent import agent_limits
+    from omnigent.runner.tool_dispatch import _agent_limit_refusal
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "closed",
+                        "host_id": "host_a",
+                        "agent_name": "codex-native-ui",
+                        "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                    },
+                    {
+                        "id": "elsewhere",
+                        "host_id": "host_b",
+                        "agent_name": "codex-native-ui",
+                        "labels": {},
+                    },
+                ]
+            },
+        )
+
+    agent_limits.apply_limits(max_per_host=1, max_per_cli_per_host=1, persist=False)
+    try:
+        async with _session_query_client(handler) as client:
+            out = await _agent_limit_refusal(
+                host_id="host_a", new_cli="codex-native", server_client=client
+            )
+    finally:
+        agent_limits.reset_for_tests()
+
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_agent_limit_fails_open_when_the_session_list_is_unreadable() -> None:
+    """
+    A transient read failure must not block every create.
+
+    A cap that converts a server blip into a total inability to spawn is
+    worse than the overload it exists to prevent.
+    """
+    from omnigent import agent_limits
+    from omnigent.runner.tool_dispatch import _agent_limit_refusal
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    agent_limits.apply_limits(max_per_host=1, max_per_cli_per_host=1, persist=False)
+    try:
+        async with _session_query_client(handler) as client:
+            out = await _agent_limit_refusal(
+                host_id="host_a", new_cli="codex-native", server_client=client
+            )
+    finally:
+        agent_limits.reset_for_tests()
+
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_is_refused_when_the_host_is_full() -> None:
+    """
+    The cap is enforced end to end, and nothing is created.
+
+    Asserted through ``execute_tool`` rather than the helper, so removing
+    the check at the call site cannot pass unnoticed.
+    """
+    from omnigent import agent_limits
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    created = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal created
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            created = True
+            return httpx.Response(201, json={"id": "conv_new"})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "host_id": "host_a"})
+        if request.url.path == "/v1/agents":
+            return httpx.Response(
+                200, json={"data": [{"id": "ag_abc", "name": "codex-native-ui"}]}
+            )
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(
+                200,
+                json={"data": _limits_session_rows(4, agent_name="mixed", host_id="host_a")},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    agent_limits.apply_limits(max_per_host=4, max_per_cli_per_host=99, persist=False)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_abc", "title": "worker"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[]),
+            )
+    finally:
+        agent_limits.reset_for_tests()
+
+    assert json.loads(output)["error"] == "host_agent_limit_reached"
+    assert created is False
+
+
+def test_sys_agent_limits_reports_and_updates(tmp_path: Path, monkeypatch: Any) -> None:
+    """
+    The tool reads the caps, and a change reports its persistence honestly.
+
+    "Applied now" and "survives a restart" are different promises, and the
+    response has to distinguish them — a runtime-only change reported as a
+    plain success comes back as an unexplained regression later.
+    """
+    from omnigent import agent_limits
+    from omnigent.runner.tool_dispatch import execute_agent_limits
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    agent_limits.reset_for_tests()
+    try:
+        read = json.loads(execute_agent_limits("{}"))
+        assert read["max_per_host"] == agent_limits.DEFAULT_MAX_PER_HOST
+
+        wrote = json.loads(execute_agent_limits(json.dumps({"max_per_host": 12})))
+        assert wrote["max_per_host"] == 12
+        assert wrote["applies_immediately"] is True
+        assert wrote["persisted"] is True
+        # And the change is visible to the very next read, no reload.
+        assert json.loads(execute_agent_limits("{}"))["max_per_host"] == 12
+
+        rejected = json.loads(execute_agent_limits(json.dumps({"max_per_host": 0})))
+        assert rejected["error"] == "invalid_limit"
+    finally:
+        agent_limits.reset_for_tests()
