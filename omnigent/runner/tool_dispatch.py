@@ -35,7 +35,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from omnigent.json_types import JsonObject as _JsonObject
 
@@ -451,6 +451,10 @@ _BROWSER_SCREENSHOT_JPEG_QUALITIES = (80, 70, 60, 50)
 # Poll cadence and ceiling for the synthesised ``browser_wait_for``.
 _BROWSER_WAIT_POLL_S = 1.0
 _BROWSER_WAIT_MAX_S = 30.0
+
+# Keep only the latest snapshot id for a bounded number of sessions.
+_BROWSER_SNAPSHOT_MAX_TRACKED = 4096
+_browser_snapshot_ids: dict[str, str] = {}
 
 # Runner-side outer HTTP read timeout for a browser action POST. The read
 # budget (60s) MUST exceed the server-side browser-action await (30s) so the
@@ -4155,7 +4159,11 @@ async def _execute_comment_tool(
         return json.dumps({"error": f"update_comment failed: {exc}"})
 
 
-def _browser_action_guidance(raw: str) -> str:
+def _browser_action_guidance(
+    raw: str,
+    *,
+    addressing: Literal["ref", "selector", "unknown"] = "unknown",
+) -> str:
     """
     Turn an opaque renderer/browser failure into something an agent can act on.
 
@@ -4175,6 +4183,7 @@ def _browser_action_guidance(raw: str) -> str:
       navigation is the most common cause, but the renderer error is generic.
 
     :param raw: The verbatim response body from the browser action.
+    :param addressing: How the action identified its target element.
     :returns: The body, with actionable guidance appended when recognised.
     """
     if "UnknownVizError" in raw:
@@ -4197,17 +4206,34 @@ def _browser_action_guidance(raw: str) -> str:
         "script failed to execute" in renderer_error
         or "check the renderer console" in renderer_error
     ):
+        if addressing == "ref":
+            message = (
+                "The browser action failed in the renderer. The most likely "
+                "cause is that its ref came from a superseded browser snapshot "
+                "or was invalidated by navigation. Take a fresh "
+                "browser_snapshot, then retry with a ref from that new snapshot. "
+                "If that does not resolve it, the renderer failure may have "
+                "another cause."
+            )
+        elif addressing == "selector":
+            message = (
+                "The browser action failed in the renderer because the selector "
+                "matched no element on the current page. Verify the selector "
+                "against a fresh browser_snapshot, then retry. If that does not "
+                "resolve it, the renderer failure may have another cause."
+            )
+        else:
+            message = (
+                "The browser action failed in the renderer. The target may have "
+                "used a ref from a superseded browser snapshot or a selector that "
+                "matched no element on the current page. Verify the target against "
+                "a fresh browser_snapshot, then retry. If that does not resolve it, "
+                "the renderer failure may have another cause."
+            )
         return json.dumps(
             {
                 "error": "browser_action_failed_in_renderer",
-                "message": (
-                    "The browser action failed in the renderer. The most likely "
-                    "cause is that its ref came from a superseded browser snapshot "
-                    "or was invalidated by navigation. Take a fresh "
-                    "browser_snapshot, then retry with a ref from that new snapshot. "
-                    "If that does not resolve it, the renderer failure may have "
-                    "another cause."
-                ),
+                "message": message,
                 "detail": raw[:200],
             }
         )
@@ -4231,7 +4257,12 @@ def _browser_action_guidance(raw: str) -> str:
     return raw
 
 
-def _truncate_browser_snapshot(raw: str, max_refs: int) -> str:
+def _truncate_browser_snapshot(
+    raw: str,
+    max_refs: int,
+    *,
+    conversation_id: str | None = None,
+) -> str:
     """
     Bound a snapshot's accessibility tree to *max_refs* elements.
 
@@ -4243,6 +4274,7 @@ def _truncate_browser_snapshot(raw: str, max_refs: int) -> str:
 
     :param raw: The verbatim snapshot response body.
     :param max_refs: Most tree lines to keep.
+    :param conversation_id: Session whose latest snapshot should be remembered.
     :returns: The body, with the tree truncated and annotated when it was too
         long; unchanged when it already fits or cannot be parsed.
     """
@@ -4255,6 +4287,14 @@ def _truncate_browser_snapshot(raw: str, max_refs: int) -> str:
     data = payload.get("data")
     if not isinstance(data, dict):
         return raw
+    snapshot_id = data.get("snapshot_id")
+    if conversation_id is not None and isinstance(snapshot_id, str) and snapshot_id:
+        if (
+            conversation_id not in _browser_snapshot_ids
+            and len(_browser_snapshot_ids) >= _BROWSER_SNAPSHOT_MAX_TRACKED
+        ):
+            del _browser_snapshot_ids[next(iter(_browser_snapshot_ids))]
+        _browser_snapshot_ids[conversation_id] = snapshot_id
     tree = data.get("tree")
     if not isinstance(tree, str):
         return raw
@@ -4534,6 +4574,35 @@ async def _post_browser_action(
     return resp.text
 
 
+def _annotate_superseded_browser_action(
+    raw: str,
+    *,
+    conversation_id: str,
+    snapshot_id: object,
+) -> str:
+    """Warn on successful actions submitted with a superseded snapshot id."""
+    latest_snapshot_id = _browser_snapshot_ids.get(conversation_id)
+    if (
+        not isinstance(snapshot_id, str)
+        or not latest_snapshot_id
+        or snapshot_id == latest_snapshot_id
+    ):
+        return raw
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return raw
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return raw
+    payload["warning"] = (
+        "The supplied snapshot_id is superseded by a newer browser snapshot. "
+        "The renderer may have resolved the ref to a detached element and done "
+        "nothing despite ok: true. If the expected effect did not occur, take a "
+        "fresh browser_snapshot and retry."
+    )
+    return json.dumps(payload)
+
+
 async def _execute_browser_tool(
     tool_name: str,
     args: _JsonObject,
@@ -4598,7 +4667,7 @@ async def _execute_browser_tool(
             if isinstance(raw_max, int) and not isinstance(raw_max, bool) and raw_max > 0
             else _BROWSER_SNAPSHOT_DEFAULT_MAX_REFS
         )
-        return _truncate_browser_snapshot(raw, max_refs)
+        return _truncate_browser_snapshot(raw, max_refs, conversation_id=conversation_id)
     if action == "screenshot":
         raw_max_edge = args.get("max_edge")
         max_edge = (
@@ -4622,7 +4691,19 @@ async def _execute_browser_tool(
         )
         return _browser_action_guidance(_bound_browser_screenshot(raw, max_edge, max_chars))
     # Rewrite the failures whose raw text sends an agent after the wrong cause.
-    return _browser_action_guidance(raw)
+    addressing: Literal["ref", "selector", "unknown"] = "unknown"
+    if action in {"click", "type"}:
+        if "ref" in args:
+            addressing = "ref"
+        elif "selector" in args:
+            addressing = "selector"
+        if "snapshot_id" in args:
+            raw = _annotate_superseded_browser_action(
+                raw,
+                conversation_id=conversation_id,
+                snapshot_id=args["snapshot_id"],
+            )
+    return _browser_action_guidance(raw, addressing=addressing)
 
 
 async def _execute_policy_tool(

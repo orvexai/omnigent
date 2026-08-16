@@ -434,6 +434,109 @@ def test_snapshot_truncation_passes_through_a_failed_action() -> None:
     assert _truncate_browser_snapshot(raw, 1) == raw
 
 
+@pytest.mark.asyncio
+async def test_superseded_snapshot_action_gets_a_warning() -> None:
+    """A successful action with an older known snapshot id is annotated."""
+    import omnigent.runner.tool_dispatch as tool_dispatch
+
+    tool_dispatch._browser_snapshot_ids.clear()
+    snapshot_body = {
+        "ok": True,
+        "data": {"snapshot_id": "snapshot-1", "tree": '- link "one" [ref=1]'},
+    }
+    await _execute_browser_tool(
+        "browser_snapshot",
+        {},
+        server_client=_RecordingClient(_RecordingResponse(body=snapshot_body)),
+        conversation_id="conv_snapshots",
+    )
+    await _execute_browser_tool(
+        "browser_snapshot",
+        {},
+        server_client=_RecordingClient(
+            _RecordingResponse(
+                body={
+                    "ok": True,
+                    "data": {"snapshot_id": "snapshot-2", "tree": '- link "two" [ref=1]'},
+                }
+            )
+        ),
+        conversation_id="conv_snapshots",
+    )
+
+    out = json.loads(
+        await _execute_browser_tool(
+            "browser_click",
+            {"ref": 1, "snapshot_id": "snapshot-1"},
+            server_client=_RecordingClient(_RecordingResponse(body={"ok": True})),
+            conversation_id="conv_snapshots",
+        )
+    )
+
+    assert "superseded" in out["warning"]
+    assert "detached element" in out["warning"]
+    assert "fresh browser_snapshot" in out["warning"]
+
+
+@pytest.mark.asyncio
+async def test_current_or_unrecorded_snapshot_action_is_unmodified() -> None:
+    """Current and unknown snapshot ids do not add a warning."""
+    import omnigent.runner.tool_dispatch as tool_dispatch
+
+    tool_dispatch._browser_snapshot_ids.clear()
+    snapshot_response = _RecordingResponse(
+        body={
+            "ok": True,
+            "data": {"snapshot_id": "snapshot-current", "tree": '- link "one" [ref=1]'},
+        }
+    )
+    await _execute_browser_tool(
+        "browser_snapshot",
+        {},
+        server_client=_RecordingClient(snapshot_response),
+        conversation_id="conv_current",
+    )
+    current_body = {"ok": True, "clicked": True}
+    current_client = _RecordingClient(_RecordingResponse(body=current_body))
+    current_out = await _execute_browser_tool(
+        "browser_click",
+        {"ref": 1, "snapshot_id": "snapshot-current"},
+        server_client=current_client,
+        conversation_id="conv_current",
+    )
+    assert current_out == json.dumps(current_body)
+
+    unknown_body = {"ok": True, "clicked": True}
+    unknown_out = await _execute_browser_tool(
+        "browser_click",
+        {"ref": 1, "snapshot_id": "snapshot-unknown"},
+        server_client=_RecordingClient(_RecordingResponse(body=unknown_body)),
+        conversation_id="conv_without_snapshot_record",
+    )
+    assert unknown_out == json.dumps(unknown_body)
+
+
+def test_snapshot_records_are_bounded() -> None:
+    """Snapshot ids are evicted when the session record reaches its cap."""
+    import omnigent.runner.tool_dispatch as tool_dispatch
+    from omnigent.runner.tool_dispatch import (
+        _BROWSER_SNAPSHOT_MAX_TRACKED,
+        _truncate_browser_snapshot,
+    )
+
+    tool_dispatch._browser_snapshot_ids.clear()
+    for index in range(_BROWSER_SNAPSHOT_MAX_TRACKED + 1):
+        raw = json.dumps(
+            {
+                "ok": True,
+                "data": {"snapshot_id": f"snapshot-{index}", "tree": ""},
+            }
+        )
+        _truncate_browser_snapshot(raw, 1, conversation_id=f"conv-{index}")
+
+    assert len(tool_dispatch._browser_snapshot_ids) == _BROWSER_SNAPSHOT_MAX_TRACKED
+
+
 def test_unknown_viz_error_becomes_actionable_guidance() -> None:
     """
     Chromium's raw compositor error is replaced with what to actually do.
@@ -454,7 +557,7 @@ def test_unknown_viz_error_becomes_actionable_guidance() -> None:
     assert "UnknownVizError" in out["detail"]
 
 
-def test_renderer_script_failure_becomes_fresh_snapshot_guidance() -> None:
+def test_ref_renderer_script_failure_becomes_fresh_snapshot_guidance() -> None:
     """A generic renderer failure points agents at the likely stale-ref recovery."""
     from omnigent.runner.tool_dispatch import _browser_action_guidance
 
@@ -463,13 +566,72 @@ def test_renderer_script_failure_becomes_fresh_snapshot_guidance() -> None:
         + " x" * 120
     )
 
-    out = json.loads(_browser_action_guidance(raw))
+    out = json.loads(_browser_action_guidance(raw, addressing="ref"))
 
     assert out["error"] == "browser_action_failed_in_renderer"
     assert "most likely cause" in out["message"]
     assert "fresh browser_snapshot" in out["message"]
     assert "ref from that new snapshot" in out["message"]
     assert out["detail"] == raw[:200]
+
+
+def test_selector_renderer_script_failure_names_missing_element() -> None:
+    """Selector failures advise checking the selector, not stale refs."""
+    from omnigent.runner.tool_dispatch import _browser_action_guidance
+
+    raw = '{"ok": false, "error": "Script failed to execute; check the renderer console."}'
+    out = json.loads(_browser_action_guidance(raw, addressing="selector"))
+
+    assert "selector matched no element on the current page" in out["message"]
+    assert "stale" not in out["message"].casefold()
+    assert "ref" not in out["message"].casefold()
+    assert "fresh browser_snapshot" in out["message"]
+    assert out["detail"] == raw[:200]
+
+
+def test_unknown_renderer_script_failure_names_both_possibilities() -> None:
+    """Unknown addressing keeps both possible causes explicitly conditional."""
+    from omnigent.runner.tool_dispatch import _browser_action_guidance
+
+    raw = '{"ok": false, "error": "Script failed to execute; check the renderer console."}'
+    out = json.loads(_browser_action_guidance(raw))
+
+    assert "may have used a ref" in out["message"]
+    assert "selector that matched no element" in out["message"]
+    assert "most likely" not in out["message"]
+    assert out["detail"] == raw[:200]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args", "expected", "forbidden"),
+    [
+        (
+            {"selector": "#missing"},
+            "selector matched no element on the current page",
+            "stale",
+        ),
+        ({"ref": 1}, "most likely cause", "selector matched no element"),
+        ({}, "may have used a ref", "most likely cause"),
+    ],
+)
+async def test_browser_action_guidance_uses_element_addressing(
+    args: dict[str, object], expected: str, forbidden: str
+) -> None:
+    """Dispatch passes ref, selector, and unknown addressing to guidance."""
+    raw = {"ok": False, "error": "Script failed to execute; check the renderer console."}
+    out = json.loads(
+        await _execute_browser_tool(
+            "browser_click",
+            args,
+            server_client=_RecordingClient(_RecordingResponse(body=raw)),
+            conversation_id="conv_guidance",
+        )
+    )
+
+    assert expected in out["message"]
+    assert forbidden not in out["message"]
+    assert out["detail"] == json.dumps(raw)[:200]
 
 
 def test_browser_action_timeout_becomes_action_specific_guidance() -> None:
