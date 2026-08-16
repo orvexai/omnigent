@@ -930,6 +930,55 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unbound_subagent_stream_end_does_not_deliver_opening_narration() -> None:
+    """An unbound mirrored child must not use its partial history as a result.
+
+    Claude Task children are mirrored into the runner without a harness binding.
+    Calling the real proxy-stream finalizer in that state used to enter its
+    non-native fallback and deliver the latest mirrored assistant text as a
+    false completion.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = "f1d6c73c87b04bc49e27ab322d17f0ef"
+    child_id = "c2d5c6b5f7f548f1a3c70a8bb438c8e1"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    runner_app._session_histories_ref[child_id] = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "I will start by reading the diff."}],
+        }
+    ]
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="general-purpose",
+        title="general-purpose",
+    )
+
+    try:
+        app.state.on_proxy_stream_end(child_id)
+        await asyncio.sleep(0)
+        entry = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+        runner_app._session_histories_ref.pop(child_id, None)
+
+    assert entry is not None
+    assert entry.status == "launching"
+    assert session_inbox.empty()
+
+
+@pytest.mark.asyncio
 async def test_external_status_for_untracked_session_does_not_wake() -> None:
     """
     Completing a session that is not a tracked sub-agent wakes nobody.

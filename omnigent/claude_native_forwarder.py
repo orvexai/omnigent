@@ -8,10 +8,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
@@ -69,13 +70,18 @@ _MAX_PERSISTED_COMPACTION_SEQS = 16
 # prose answer can be hundreds of chunks.
 _MAX_SEEN_DELTA_KEYS = 5000
 
-# Seconds of transcript inactivity after which we publish ``idle`` for
-# a sub-agent. The transcript is the only signal we have for sub-agent
-# completion in Phase A (no SubagentStop hook is subscribed); 5s is the
-# shortest window that comfortably absorbs a stalled tool call without
-# flickering the badge. Phase B will replace this with an authoritative
-# hook signal and drop the heuristic.
+# Seconds of transcript inactivity after which we publish ``waiting`` for
+# a sub-agent. This is a display-only badge: it must never be treated as
+# the Task's terminal signal.
 _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
+# Inactivity window for a Task child without Claude's authoritative
+# ``<task-notification>`` record. The 30-minute window accommodates blocking
+# tools in this repo that can legitimately run for 25+ minutes.
+_SUBAGENT_TERMINAL_FALLBACK_S = 1800.0
+_TASK_NOTIFICATION_FIELD_RE = re.compile(
+    r"<(task-id|status|result|summary)>(.*?)</\1>",
+    re.DOTALL,
+)
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
@@ -374,15 +380,21 @@ class SubagentEntry:
         re-posting earlier accepted items on the next poll.
     :param last_activity_ts: Unix timestamp of the most recent item
         observed in this sub-agent's transcript. Used by the idle
-        heuristic — when ``now - last_activity_ts >
-        _SUBAGENT_IDLE_QUIESCENCE_S`` we publish an
-        ``external_session_status: idle`` event. ``None`` when no
-        items have been seen yet (so the heuristic doesn't fire
-        before there's anything to be quiescent about).
+        heuristic and the inactivity fallback — when ``now -
+        last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S`` we publish
+        an ``external_session_status: waiting`` event. ``None`` when
+        no items have been seen yet (so the inactivity fallback uses
+        registration time only when no activity has been observed).
     :param last_status: Last status string POSTed for this
         sub-agent — used to dedupe so we don't spam ``running`` or
-        ``idle`` events on every tick when nothing changed. ``None``
+        ``waiting`` events on every tick when nothing changed. ``None``
         means no status has been posted yet.
+    :param started_at_ts: Unix timestamp when the child was registered;
+        used by the long failure fallback when no transcript item exists.
+    :param terminal_status: Authoritative terminal status learned from the
+        parent ``<task-notification>`` record or the failure fallback.
+    :param terminal_output: Result or failure detail paired with
+        ``terminal_status``.
     """
 
     subagent_id: str
@@ -391,6 +403,18 @@ class SubagentEntry:
     seen_source_ids: tuple[str, ...] = ()
     last_activity_ts: float | None = None
     last_status: str | None = None
+    started_at_ts: float | None = None
+    terminal_status: str | None = None
+    terminal_output: str | None = None
+
+
+@dataclass(frozen=True)
+class _SubagentTaskNotification:
+    """Authoritative completion record from the parent Claude transcript."""
+
+    subagent_id: str
+    status: str
+    result: str
 
 
 @dataclass(frozen=True)
@@ -797,6 +821,7 @@ async def forward_claude_transcript_to_session(
     task_subjects: dict[str, str] = {}
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
+    task_notifications: dict[str, _SubagentTaskNotification] = {}
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
@@ -853,6 +878,7 @@ async def forward_claude_transcript_to_session(
                         task_subjects = {}
                         task_statuses = {}
                         task_order = []
+                        task_notifications = {}
                         # A rotated session is a fresh dedupe context — reseed
                         # so the new session's first model observation doesn't
                         # post against the prior session's baseline.
@@ -889,6 +915,7 @@ async def forward_claude_transcript_to_session(
                         task_subjects = {}
                         task_statuses = {}
                         task_order = []
+                        task_notifications = {}
                         # A rotated session is a fresh dedupe context — reseed
                         # so the new session's first model observation doesn't
                         # post against the prior session's baseline.
@@ -943,6 +970,7 @@ async def forward_claude_transcript_to_session(
                             retry_tracker=item_retries,
                             skip_user_messages=skip_user_messages,
                             dedupe=dedupe,
+                            task_notifications=task_notifications,
                         )
                         hook_state = await _forward_available_status_events(
                             client=client,
@@ -973,6 +1001,7 @@ async def forward_claude_transcript_to_session(
                             start_retry_tracker=subagent_start_retries,
                             item_retry_tracker=subagent_item_retries,
                             status_retry_tracker=subagent_status_retries,
+                            task_notifications=task_notifications,
                         )
                         # Reconcile + POST cumulative cost AFTER sub-agents are
                         # forwarded so the estimate sees this poll's sub-agent
@@ -1075,6 +1104,9 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         seen_source_ids = row.get("seen_source_ids", [])
         last_activity_ts = row.get("last_activity_ts")
         last_status = row.get("last_status")
+        started_at_ts = row.get("started_at_ts")
+        terminal_status = row.get("terminal_status")
+        terminal_output = row.get("terminal_output")
         # Empty string is a valid parked sentinel written by
         # ``_forward_available_subagents`` after the start POST exhausts
         # its permanent-failure budget. Preserving it across restarts is
@@ -1091,6 +1123,16 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             last_activity_ts = None
         if last_status is not None and not isinstance(last_status, str):
             last_status = None
+        if started_at_ts is not None and not isinstance(started_at_ts, (int, float)):
+            started_at_ts = None
+        if started_at_ts is None:
+            started_at_ts = (
+                last_activity_ts if isinstance(last_activity_ts, (int, float)) else time.time()
+            )
+        if terminal_status not in (None, "completed", "failed"):
+            terminal_status = None
+        if terminal_output is not None and not isinstance(terminal_output, str):
+            terminal_output = None
         entries[subagent_id] = SubagentEntry(
             subagent_id=subagent_id,
             child_conversation_id=child_id,
@@ -1098,6 +1140,9 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             seen_source_ids=tuple(seen_source_ids),
             last_activity_ts=last_activity_ts,
             last_status=last_status,
+            started_at_ts=started_at_ts,
+            terminal_status=terminal_status,
+            terminal_output=terminal_output,
         )
     return SubagentForwardState(subagents=entries)
 
@@ -1119,6 +1164,9 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "seen_source_ids": list(entry.seen_source_ids),
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
+                "started_at_ts": entry.started_at_ts,
+                "terminal_status": entry.terminal_status,
+                "terminal_output": entry.terminal_output,
             }
             for entry in state.subagents.values()
         },
@@ -1230,6 +1278,37 @@ async def _post_external_subagent_start(
     return child_session_id
 
 
+def _task_notification_from_item(item: ClaudeTranscriptItem) -> _SubagentTaskNotification | None:
+    """Extract Claude's authoritative Task completion record from an item."""
+    if item.item_type != "message" or item.data.get("is_meta") is not True:
+        return None
+    content = item.data.get("content")
+    if not isinstance(content, list):
+        return None
+    text = next(
+        (
+            block.get("text")
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "input_text"
+            and isinstance(block.get("text"), str)
+        ),
+        None,
+    )
+    if text is None or not text.lstrip().startswith("<task-notification>"):
+        return None
+    fields = {name: value.strip() for name, value in _TASK_NOTIFICATION_FIELD_RE.findall(text)}
+    task_id = fields.get("task-id")
+    status = fields.get("status")
+    if not task_id or status not in {"completed", "failed"}:
+        return None
+    return _SubagentTaskNotification(
+        subagent_id=task_id.removeprefix("agent-"),
+        status=status,
+        result=fields.get("result") or fields.get("summary") or "",
+    )
+
+
 def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     """
     Read a Claude sub-agent's ``.meta.json`` file, validating the
@@ -1266,6 +1345,43 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     }
 
 
+async def _post_subagent_terminal_status(
+    client: httpx.AsyncClient,
+    *,
+    entry: SubagentEntry,
+    retry_tracker: _PostRetryTracker,
+) -> SubagentEntry:
+    """Post a pending authoritative terminal status and retain retry state."""
+    if entry.terminal_status is None or entry.last_status == entry.terminal_status:
+        return entry
+    retry_key = f"subagent_status:{entry.child_conversation_id}"
+    if retry_tracker.retry_delay_s(retry_key) is not None:
+        return entry
+    wire_status = "idle" if entry.terminal_status == "completed" else "failed"
+    try:
+        await post_external_session_status(
+            client,
+            session_id=entry.child_conversation_id,
+            status=wire_status,
+            output=entry.terminal_output,
+        )
+    except httpx.HTTPError as exc:
+        decision = retry_tracker.record_failure(retry_key, exc)
+        _logger.warning(
+            "Failed to forward claude-native sub-agent terminal status; "
+            "child=%s status=%s attempt=%s next_retry_s=%.3f http_status=%s",
+            entry.child_conversation_id,
+            wire_status,
+            decision.attempts,
+            decision.delay_s,
+            _http_status_for_log(exc),
+            exc_info=True,
+        )
+        return entry
+    retry_tracker.clear(retry_key)
+    return replace(entry, last_status=entry.terminal_status)
+
+
 async def _forward_available_subagents(
     *,
     client: httpx.AsyncClient,
@@ -1277,11 +1393,12 @@ async def _forward_available_subagents(
     start_retry_tracker: _PostRetryTracker,
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
+    task_notifications: Mapping[str, _SubagentTaskNotification] | None = None,
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
-    conversations for them, tail their transcripts, and publish
-    quiescence-based status.
+    conversations for them, tail their transcripts, and publish a
+    non-terminal quiescence badge.
 
     Idempotent across forwarder restarts: ``state`` (persisted to
     ``subagent_forwarder.json``) holds the Omnigent child id and byte
@@ -1315,6 +1432,7 @@ async def _forward_available_subagents(
     # ── Register newly-appeared sub-agents ──────────────
     # ``glob`` is sync; offload to a thread so we don't stat the
     # filesystem on the event loop.
+    now = time.time()
     meta_paths = await asyncio.to_thread(lambda: sorted(subagents_dir.glob(_SUBAGENT_META_GLOB)))
     updated = state
     for meta_path in meta_paths:
@@ -1401,19 +1519,59 @@ async def _forward_available_subagents(
                 subagent_id: SubagentEntry(
                     subagent_id=subagent_id,
                     child_conversation_id=child_id,
+                    started_at_ts=now,
                 ),
             }
         )
         await _write_subagent_forward_state_async(bridge_dir, updated)
 
     # ── Tail each tracked sub-agent's transcript ────────
-    now = time.time()
     for subagent_id, entry in list(updated.subagents.items()):
         if not entry.child_conversation_id:
             # Parked after exhausted start retries — nothing to tail.
             continue
+        new_entry = entry
+        notification = task_notifications.get(subagent_id) if task_notifications else None
+        if notification is not None and entry.terminal_status is None:
+            new_entry = replace(
+                entry,
+                terminal_status=notification.status,
+                terminal_output=notification.result,
+            )
+        fallback_ts = (
+            new_entry.last_activity_ts
+            if new_entry.last_activity_ts is not None
+            else new_entry.started_at_ts
+        )
+        if (
+            new_entry.terminal_status is None
+            and fallback_ts is not None
+            and now - fallback_ts > _SUBAGENT_TERMINAL_FALLBACK_S
+        ):
+            new_entry = replace(
+                new_entry,
+                terminal_status="failed",
+                terminal_output=(
+                    "Error: sub-agent did not produce a terminal task-notification "
+                    "before the fallback deadline."
+                ),
+            )
+        if new_entry is not entry:
+            updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
+            await _write_subagent_forward_state_async(bridge_dir, updated)
+        entry = new_entry
         jsonl_path = subagents_dir / f"agent-{subagent_id}.jsonl"
         if not jsonl_path.exists():
+            terminal_entry = await _post_subagent_terminal_status(
+                client,
+                entry=entry,
+                retry_tracker=status_retry_tracker,
+            )
+            if terminal_entry is not entry:
+                updated = SubagentForwardState(
+                    subagents={**updated.subagents, subagent_id: terminal_entry}
+                )
+                await _write_subagent_forward_state_async(bridge_dir, updated)
             continue
         # Reuse the parent-transcript parser, but pass
         # ``include_sidechains=True`` — every record in a sub-agent's
@@ -1486,13 +1644,10 @@ async def _forward_available_subagents(
                     # someone needs to recover it.
                     seen.add(item.source_id)
                     seen_source_ids.append(item.source_id)
-                    new_entry = SubagentEntry(
-                        subagent_id=entry.subagent_id,
-                        child_conversation_id=entry.child_conversation_id,
+                    new_entry = replace(
+                        new_entry,
                         byte_offset=entry.byte_offset,
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=new_entry.last_status,
                     )
                     updated = SubagentForwardState(
                         subagents={**updated.subagents, subagent_id: new_entry}
@@ -1515,13 +1670,10 @@ async def _forward_available_subagents(
                     item_retry_tracker.clear(retry_key)
                     seen.add(item.source_id)
                     seen_source_ids.append(item.source_id)
-                    new_entry = SubagentEntry(
-                        subagent_id=entry.subagent_id,
-                        child_conversation_id=entry.child_conversation_id,
+                    new_entry = replace(
+                        new_entry,
                         byte_offset=entry.byte_offset,
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=new_entry.last_status,
                     )
                     updated = SubagentForwardState(
                         subagents={**updated.subagents, subagent_id: new_entry}
@@ -1551,13 +1703,11 @@ async def _forward_available_subagents(
             had_item = True
             seen.add(item.source_id)
             seen_source_ids.append(item.source_id)
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
+            new_entry = replace(
+                new_entry,
                 byte_offset=entry.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now,
-                last_status=new_entry.last_status,
             )
             updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
             await _write_subagent_forward_state_async(bridge_dir, updated)
@@ -1565,74 +1715,70 @@ async def _forward_available_subagents(
         # posted successfully (or there were no items at all).
         # Advancing past a failed item permanently skips it.
         if not items_failed and (result.byte_offset != entry.byte_offset or had_item):
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
+            new_entry = replace(
+                new_entry,
                 byte_offset=result.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now if had_item else entry.last_activity_ts,
-                last_status=entry.last_status,
             )
         elif had_item:
             # Items DID flow but a later post failed — still record
             # the activity timestamp so the status badge advances,
             # but leave byte_offset at the previous tick's value so
             # the failed items get retried.
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
+            new_entry = replace(
+                new_entry,
                 byte_offset=entry.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now,
-                last_status=entry.last_status,
             )
 
-        # Quiescence-based status. Sub-agent transcripts don't carry
-        # an explicit "done" record (Claude doesn't expose one), so
-        # we infer "running" from item flow and "idle" from quiet
-        # time. The dedupe on ``last_status`` avoids spamming the
-        # cache on every tick when nothing changed.
-        desired_status: str | None = None
-        if had_item:
-            desired_status = "running"
-        elif (
-            new_entry.last_activity_ts is not None
-            and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
-            and new_entry.last_status != "idle"
-        ):
-            desired_status = "idle"
-        if desired_status is not None and desired_status != new_entry.last_status:
-            retry_key = f"subagent_status:{entry.child_conversation_id}"
-            if status_retry_tracker.retry_delay_s(retry_key) is None:
-                try:
-                    await post_external_session_status(
-                        client,
-                        session_id=entry.child_conversation_id,
-                        status=desired_status,
-                    )
-                except httpx.HTTPError as exc:
-                    decision = status_retry_tracker.record_failure(retry_key, exc)
-                    _logger.warning(
-                        "Failed to forward claude-native sub-agent status; "
-                        "child=%s status=%s attempt=%s next_retry_s=%.3f "
-                        "http_status=%s",
-                        entry.child_conversation_id,
-                        desired_status,
-                        decision.attempts,
-                        decision.delay_s,
-                        _http_status_for_log(exc),
-                        exc_info=True,
-                    )
-                else:
-                    status_retry_tracker.clear(retry_key)
-                    new_entry = SubagentEntry(
-                        subagent_id=new_entry.subagent_id,
-                        child_conversation_id=new_entry.child_conversation_id,
-                        byte_offset=new_entry.byte_offset,
-                        seen_source_ids=new_entry.seen_source_ids,
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=desired_status,
-                    )
+        # Claude's parent transcript carries the authoritative terminal
+        # ``<task-notification>``. Quiescence is only a display badge;
+        # the long fallback marks an unfinished child failed.
+        if new_entry.terminal_status is not None:
+            terminal_entry = await _post_subagent_terminal_status(
+                client,
+                entry=new_entry,
+                retry_tracker=status_retry_tracker,
+            )
+            if terminal_entry is not new_entry:
+                new_entry = terminal_entry
+        else:
+            desired_status: str | None = None
+            if had_item:
+                desired_status = "running"
+            elif (
+                new_entry.last_activity_ts is not None
+                and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
+                and new_entry.last_status != "waiting"
+            ):
+                desired_status = "waiting"
+            if desired_status is not None and desired_status != new_entry.last_status:
+                retry_key = f"subagent_status:{entry.child_conversation_id}"
+                if status_retry_tracker.retry_delay_s(retry_key) is None:
+                    try:
+                        await post_external_session_status(
+                            client,
+                            session_id=entry.child_conversation_id,
+                            status=desired_status,
+                        )
+                    except httpx.HTTPError as exc:
+                        decision = status_retry_tracker.record_failure(retry_key, exc)
+                        _logger.warning(
+                            "Failed to forward claude-native sub-agent status; "
+                            "child=%s status=%s attempt=%s next_retry_s=%.3f "
+                            "http_status=%s",
+                            entry.child_conversation_id,
+                            desired_status,
+                            decision.attempts,
+                            decision.delay_s,
+                            _http_status_for_log(exc),
+                            exc_info=True,
+                        )
+                    else:
+                        status_retry_tracker.clear(retry_key)
+                        new_entry = replace(new_entry, last_status=desired_status)
 
         if new_entry is not entry:
             updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
@@ -3253,6 +3399,7 @@ async def _forward_available_items(
     retry_tracker: _PostRetryTracker,
     skip_user_messages: bool = False,
     dedupe: _ForwardDedupeState,
+    task_notifications: dict[str, _SubagentTaskNotification] | None = None,
 ) -> TranscriptForwardState:
     """
     Forward currently available transcript items after ``state``.
@@ -3352,6 +3499,10 @@ async def _forward_available_items(
             )
             await _write_forward_state_async(bridge_dir, updated)
             continue
+        if task_notifications is not None:
+            notification = _task_notification_from_item(item)
+            if notification is not None:
+                task_notifications[notification.subagent_id] = notification
         if skip_user_messages and item.item_type == "message" and item.data.get("role") == "user":
             seen_source_ids.append(item.source_id)
             seen.add(item.source_id)
