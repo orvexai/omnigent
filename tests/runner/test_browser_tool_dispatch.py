@@ -16,10 +16,14 @@ Covers the runner-side half of the feature:
 
 from __future__ import annotations
 
+import base64
+import io
 import json
+import random
 
 import httpx
 import pytest
+from PIL import Image
 
 import omnigent.tools.builtins as builtins_mod
 from omnigent.runner.tool_dispatch import (
@@ -81,6 +85,24 @@ class _ErrorClient:
         raise httpx.ConnectError("connection refused")
 
 
+def _png_data_url(width: int, height: int, *, detailed: bool = False) -> str:
+    """Create a real PNG data URL for screenshot dispatch tests."""
+    if detailed:
+        rng = random.Random(0)
+        tile = Image.frombytes(
+            "RGB",
+            (120, 120),
+            bytes(rng.randrange(256) for _ in range(120 * 120 * 3)),
+        )
+        image = tile.resize((width, height), Image.Resampling.NEAREST)
+    else:
+        image = Image.new("RGB", (width, height), "white")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
 # ── _execute_browser_tool ────────────────────────────────────────
 
 
@@ -124,6 +146,105 @@ async def test_browser_tool_strips_prefix_for_every_action() -> None:
         client = _RecordingClient()
         await _execute_browser_tool(tool_name, {}, server_client=client, conversation_id="conv_x")
         assert client.calls[0][1]["action"] == action
+
+
+@pytest.mark.asyncio
+async def test_screenshot_bounds_the_realistic_large_image() -> None:
+    """A 1380x1744 screenshot is resized/re-encoded under the default budget."""
+    data_url = _png_data_url(1380, 1744, detailed=True)
+    client = _RecordingClient(_RecordingResponse(body={"ok": True, "data_url": data_url}))
+
+    out = json.loads(
+        await _execute_browser_tool(
+            "browser_screenshot",
+            {},
+            server_client=client,
+            conversation_id="conv_x",
+        )
+    )
+
+    returned_payload = out["data_url"].split(",", 1)[1]
+    assert len(returned_payload) <= 48_000
+    assert out["original_width"] == 1380
+    assert out["original_height"] == 1744
+    assert out["returned_width"] <= 900
+    assert out["returned_height"] <= 900
+    assert out["downscaled"] is True
+    assert out["truncated"] is True
+    assert out["encoding"] in {"png", "jpeg"}
+    assert client.calls[0][1]["args"] == {}
+
+
+@pytest.mark.asyncio
+async def test_small_screenshot_keeps_data_url_unchanged() -> None:
+    """An already-fitting image is not silently re-encoded."""
+    data_url = _png_data_url(20, 10)
+    client = _RecordingClient(_RecordingResponse(body={"ok": True, "data_url": data_url}))
+
+    out = json.loads(
+        await _execute_browser_tool(
+            "browser_screenshot",
+            {},
+            server_client=client,
+            conversation_id="conv_x",
+        )
+    )
+
+    assert out["data_url"] == data_url
+    assert out["original_width"] == out["returned_width"] == 20
+    assert out["original_height"] == out["returned_height"] == 10
+    assert out["encoding"] == "png"
+    assert out["downscaled"] is False
+    assert out["truncated"] is False
+    assert "returned unchanged" in out["truncation_note"]
+
+
+@pytest.mark.asyncio
+async def test_screenshot_parameters_override_default_bounds() -> None:
+    """Screenshot-specific edge and payload limits are honored by the runner."""
+    data_url = _png_data_url(40, 20)
+    client = _RecordingClient(_RecordingResponse(body={"ok": True, "data_url": data_url}))
+
+    out = json.loads(
+        await _execute_browser_tool(
+            "browser_screenshot",
+            {"max_edge": 5, "max_chars": 1_000},
+            server_client=client,
+            conversation_id="conv_x",
+        )
+    )
+
+    assert out["returned_width"] <= 5
+    assert out["returned_height"] <= 5
+    assert len(out["data_url"].split(",", 1)[1]) <= 1_000
+    assert client.calls[0][1]["args"] == {}
+
+
+@pytest.mark.asyncio
+async def test_screenshot_without_pillow_returns_original_payload(monkeypatch) -> None:
+    """Without Pillow, an oversized image remains available with an explicit note."""
+    import omnigent.runner.tool_dispatch as tool_dispatch
+
+    data_url = _png_data_url(1380, 1744, detailed=True)
+    client = _RecordingClient(_RecordingResponse(body={"ok": True, "data_url": data_url}))
+    monkeypatch.setattr(tool_dispatch, "_PILImage", None)
+
+    out = json.loads(
+        await _execute_browser_tool(
+            "browser_screenshot",
+            {"max_chars": 48_000},
+            server_client=client,
+            conversation_id="conv_x",
+        )
+    )
+
+    assert out["ok"] is True
+    assert out["data_url"] == data_url
+    assert out["truncated"] is False
+    assert out["downscaled"] is False
+    assert out["returned_base64_chars"] > 48_000
+    assert "Pillow is unavailable" in out["truncation_note"]
+    assert "data_url" in out
 
 
 @pytest.mark.asyncio
@@ -233,6 +354,11 @@ def test_toolmanager_always_registers_browser_tools() -> None:
         schema = tool.get_schema()
         assert schema["function"]["name"] == name
         assert schema["function"]["description"]
+        if name == "browser_screenshot":
+            assert set(schema["function"]["parameters"]["properties"]) == {
+                "max_edge",
+                "max_chars",
+            }
 
 
 # ── Native-relay exposure ────────────────────────────────────────
@@ -343,6 +469,28 @@ def test_renderer_script_failure_becomes_fresh_snapshot_guidance() -> None:
     assert "most likely cause" in out["message"]
     assert "fresh browser_snapshot" in out["message"]
     assert "ref from that new snapshot" in out["message"]
+    assert out["detail"] == raw[:200]
+
+
+def test_browser_action_timeout_becomes_action_specific_guidance() -> None:
+    """The server timeout identifies an unanswered action, not a dead session."""
+    from omnigent.runner.tool_dispatch import _browser_action_guidance
+
+    raw = (
+        '{"error": "browser action timed out — is the session open in the '
+        'Omnigent desktop app?", "request_id": "abc"}'
+    )
+
+    out = json.loads(_browser_action_guidance(raw))
+
+    assert out["error"] == "browser_action_timed_out"
+    assert "this particular browser action" in out["message"]
+    assert "30-second window" in out["message"]
+    assert "browser_snapshot" in out["message"]
+    assert "browser_screenshot" in out["message"]
+    assert "visible or composited" in out["message"]
+    assert "closed" not in out["message"].casefold()
+    assert "not open" not in out["message"].casefold()
     assert out["detail"] == raw[:200]
 
 

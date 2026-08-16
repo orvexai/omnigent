@@ -20,7 +20,10 @@ Tool categories:
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import dataclasses
+import io
 import json
 import logging
 import mimetypes
@@ -46,6 +49,11 @@ if TYPE_CHECKING:
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
+
+try:
+    from PIL import Image as _PILImage
+except ImportError:  # pragma: no cover - exercised in installations without Pillow
+    _PILImage = None
 
 from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
@@ -433,6 +441,12 @@ _BROWSER_TOOLS = frozenset(
 # to scope it, so an unbounded snapshot can consume a large slice of the
 # caller's context for one page. Truncating here is the only layer we control.
 _BROWSER_SNAPSHOT_DEFAULT_MAX_REFS = 120
+
+# Screenshot output is bounded here because the renderer returns a data URL
+# whose base64 payload otherwise counts against the agent's entire result.
+_BROWSER_SCREENSHOT_DEFAULT_MAX_EDGE = 900
+_BROWSER_SCREENSHOT_DEFAULT_MAX_CHARS = 48_000
+_BROWSER_SCREENSHOT_JPEG_QUALITIES = (80, 70, 60, 50)
 
 # Poll cadence and ceiling for the synthesised ``browser_wait_for``.
 _BROWSER_WAIT_POLL_S = 1.0
@@ -4153,10 +4167,9 @@ def _browser_action_guidance(raw: str) -> str:
       cover them — and that suppression is STICKY. Only ``screenshot`` needs a
       compositor surface, which is why every other verb keeps working and the
       raw error looks like a bug in the tool.
-    - The server's timeout text asserts the desktop app is not open. That is
-      often wrong: it fires for any action the renderer failed to answer, so
-      an agent whose other calls are succeeding is sent to debug a connection
-      that demonstrably works.
+    - The server's timeout text is translated into guidance that identifies
+      the renderer as failing to answer this action. It fires for any action
+      the renderer failed to answer, so other browser calls may still work.
     - The renderer's generic script-execution failure gives an agent no useful
       recovery path. A ref from a superseded snapshot or invalidated
       navigation is the most common cause, but the renderer error is generic.
@@ -4194,6 +4207,23 @@ def _browser_action_guidance(raw: str) -> str:
                     "browser_snapshot, then retry with a ref from that new snapshot. "
                     "If that does not resolve it, the renderer failure may have "
                     "another cause."
+                ),
+                "detail": raw[:200],
+            }
+        )
+    if "browser action timed out" in renderer_error:
+        return json.dumps(
+            {
+                "error": "browser_action_timed_out",
+                "message": (
+                    "The renderer did not answer this particular browser action "
+                    "within the server's 30-second window. Try browser_snapshot "
+                    "first; it is a cheap way to confirm the connection is alive, "
+                    "and other browser verbs may still work. If this was "
+                    "browser_screenshot, a known and likely cause is that the "
+                    "browser pane is not visible or composited in the desktop app; "
+                    "make the pane visible, then retry. This timeout is generic, "
+                    "so other actions can reach it for other renderer-side reasons."
                 ),
                 "detail": raw[:200],
             }
@@ -4242,6 +4272,173 @@ def _truncate_browser_snapshot(raw: str, max_refs: int) -> str:
         "than assuming it is absent."
     )
     return json.dumps(payload)
+
+
+def _browser_screenshot_error(message: str, **details: object) -> str:
+    """Return a screenshot-bounding failure without including the image."""
+    return json.dumps(
+        {
+            "ok": False,
+            "error": "browser_screenshot_could_not_be_bounded",
+            "message": message,
+            **details,
+        }
+    )
+
+
+def _bound_browser_screenshot(raw: str, max_edge: int, max_chars: int) -> str:
+    """
+    Bound a successful screenshot data URL to an edge and base64 budget.
+
+    :param raw: The renderer's screenshot response body.
+    :param max_edge: Longest returned image edge.
+    :param max_chars: Maximum base64 payload length.
+    :returns: The bounded, explicitly annotated response or a structured error.
+    """
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return raw
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return raw
+    data_url = payload.get("data_url")
+    if not isinstance(data_url, str) or "," not in data_url:
+        return _browser_screenshot_error("The renderer returned no usable screenshot data URL.")
+    header, encoded = data_url.split(",", 1)
+    if ";base64" not in header or not header.startswith("data:image/"):
+        return _browser_screenshot_error("The renderer returned a non-base64 screenshot data URL.")
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        return _browser_screenshot_error("The renderer returned an invalid base64 screenshot.")
+
+    actual_chars = len(encoded)
+    source_encoding = header.removeprefix("data:image/").split(";", 1)[0].lower()
+    if source_encoding == "jpg":
+        source_encoding = "jpeg"
+
+    if _PILImage is None:
+        size_note = (
+            f"exceeds the {max_chars}-character budget"
+            if actual_chars > max_chars
+            else f"is within the {max_chars}-character budget"
+        )
+        payload.update(
+            {
+                "original_width": None,
+                "original_height": None,
+                "returned_width": None,
+                "returned_height": None,
+                "encoding": source_encoding,
+                "downscaled": False,
+                "truncated": False,
+                "truncation_note": (
+                    "Screenshot could not be bounded because Pillow is unavailable; "
+                    f"the base64 payload is {actual_chars} characters and {size_note}. "
+                    "The original data_url was returned unchanged."
+                ),
+                "original_base64_chars": actual_chars,
+                "returned_base64_chars": actual_chars,
+            }
+        )
+        return json.dumps(payload)
+
+    try:
+        with _PILImage.open(io.BytesIO(image_bytes)) as source:
+            image = source.copy()
+            original_width, original_height = source.size
+    except (OSError, ValueError) as exc:
+        return _browser_screenshot_error(
+            f"The screenshot could not be decoded for bounding: {type(exc).__name__}."
+        )
+
+    if actual_chars <= max_chars and max(original_width, original_height) <= max_edge:
+        payload.update(
+            {
+                "original_width": original_width,
+                "original_height": original_height,
+                "returned_width": original_width,
+                "returned_height": original_height,
+                "encoding": source_encoding,
+                "downscaled": False,
+                "truncated": False,
+                "truncation_note": (
+                    f"Screenshot already fit within the {max_edge}px max edge and "
+                    f"{max_chars}-character base64 budget; returned unchanged."
+                ),
+                "original_base64_chars": actual_chars,
+                "returned_base64_chars": actual_chars,
+            }
+        )
+        return json.dumps(payload)
+
+    original_longest = max(original_width, original_height)
+    starting_edge = min(max_edge, original_longest)
+    edge = starting_edge
+    while True:
+        scale = edge / original_longest
+        returned_size = (
+            max(1, round(original_width * scale)),
+            max(1, round(original_height * scale)),
+        )
+        bounded_image = (
+            image
+            if returned_size == image.size
+            else image.resize(returned_size, _PILImage.Resampling.LANCZOS)
+        )
+
+        encoded_variants: list[tuple[str, bytes]] = []
+        png_buffer = io.BytesIO()
+        bounded_image.save(png_buffer, format="PNG", optimize=True)
+        encoded_variants.append(("png", png_buffer.getvalue()))
+
+        jpeg_image = bounded_image.convert("RGB")
+        for quality in _BROWSER_SCREENSHOT_JPEG_QUALITIES:
+            jpeg_buffer = io.BytesIO()
+            jpeg_image.save(jpeg_buffer, format="JPEG", quality=quality, optimize=True)
+            encoded_variants.append(("jpeg", jpeg_buffer.getvalue()))
+
+        for encoding, encoded_bytes in encoded_variants:
+            encoded_payload = base64.b64encode(encoded_bytes).decode("ascii")
+            if len(encoded_payload) > max_chars:
+                continue
+            returned_width, returned_height = bounded_image.size
+            payload["data_url"] = f"data:image/{encoding};base64,{encoded_payload}"
+            payload.update(
+                {
+                    "original_width": original_width,
+                    "original_height": original_height,
+                    "returned_width": returned_width,
+                    "returned_height": returned_height,
+                    "encoding": encoding,
+                    "downscaled": returned_size != image.size,
+                    "truncated": True,
+                    "truncation_note": (
+                        f"Screenshot was bounded from {original_width}x{original_height} "
+                        f"to {returned_width}x{returned_height} as {encoding}; the "
+                        f"base64 payload is {len(encoded_payload)} characters within "
+                        f"the {max_chars}-character budget."
+                    ),
+                    "original_base64_chars": actual_chars,
+                    "returned_base64_chars": len(encoded_payload),
+                }
+            )
+            return json.dumps(payload)
+
+        if edge == 1:
+            break
+        next_edge = max(1, int(edge * 0.75))
+        edge = next_edge if next_edge < edge else edge - 1
+
+    return _browser_screenshot_error(
+        "The screenshot could not be bounded within the requested base64 budget after "
+        "trying PNG, JPEG quality 80/70/60/50, and progressively smaller edges.",
+        original_width=original_width,
+        original_height=original_height,
+        actual_base64_chars=actual_chars,
+        max_edge=max_edge,
+        max_chars=max_chars,
+    )
 
 
 async def _browser_wait_for(
@@ -4351,7 +4548,8 @@ async def _execute_browser_tool(
     embedded browser: POST ``/v1/sessions/{conversation_id}/browser/
     action_request`` with ``{action, args}`` (where ``action`` is the
     tool name minus the ``browser_`` prefix) and return the server's JSON
-    response verbatim as the tool output. The server parks a Future,
+    response as the tool output. Successful screenshots are bounded and
+    annotated before they reach the agent. The server parks a Future,
     publishes ``browser.action_request`` on the session stream, and
     resolves the Future when the winning renderer POSTs the action
     result — so this POST stays open until the action completes or the
@@ -4387,7 +4585,12 @@ async def _execute_browser_tool(
     # Strip the ``browser_`` prefix so the wire ``action`` matches the
     # frozen contract (navigate / snapshot / click / type / screenshot).
     action = tool_name[len("browser_") :]
-    raw = await _post_browser_action(action, args, server_client, conversation_id)
+    action_args = args
+    if action == "screenshot":
+        action_args = {
+            key: value for key, value in args.items() if key not in {"max_edge", "max_chars"}
+        }
+    raw = await _post_browser_action(action, action_args, server_client, conversation_id)
     if action == "snapshot":
         raw_max = args.get("max_refs")
         max_refs = (
@@ -4396,6 +4599,28 @@ async def _execute_browser_tool(
             else _BROWSER_SNAPSHOT_DEFAULT_MAX_REFS
         )
         return _truncate_browser_snapshot(raw, max_refs)
+    if action == "screenshot":
+        raw_max_edge = args.get("max_edge")
+        max_edge = (
+            raw_max_edge
+            if (
+                isinstance(raw_max_edge, int)
+                and not isinstance(raw_max_edge, bool)
+                and raw_max_edge > 0
+            )
+            else _BROWSER_SCREENSHOT_DEFAULT_MAX_EDGE
+        )
+        raw_max_chars = args.get("max_chars")
+        max_chars = (
+            raw_max_chars
+            if (
+                isinstance(raw_max_chars, int)
+                and not isinstance(raw_max_chars, bool)
+                and raw_max_chars > 0
+            )
+            else _BROWSER_SCREENSHOT_DEFAULT_MAX_CHARS
+        )
+        return _browser_action_guidance(_bound_browser_screenshot(raw, max_edge, max_chars))
     # Rewrite the failures whose raw text sends an agent after the wrong cause.
     return _browser_action_guidance(raw)
 

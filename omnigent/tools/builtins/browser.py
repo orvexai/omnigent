@@ -286,7 +286,7 @@ class BrowserTypeTool(Tool):
 
 
 class BrowserScreenshotTool(Tool):
-    """Capture a PNG screenshot of the browser pane (schema only)."""
+    """Capture a bounded screenshot of the browser pane (schema only)."""
 
     @classmethod
     def name(cls) -> str:
@@ -297,7 +297,11 @@ class BrowserScreenshotTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Capture a PNG screenshot of the embedded browser pane. "
+            "Capture a screenshot of the embedded browser pane. Large "
+            "screenshots are downscaled and, when needed, re-encoded to fit "
+            "the agent result budget (default max edge 900px and 48,000 "
+            "base64 characters). Set `max_edge` and `max_chars` to override "
+            "those limits. "
             "Returns image content the agent surface renders inline. "
             "INTENDED FOR VISUAL INSPECTION ONLY — prefer "
             "browser_snapshot for picking elements to act on, since "
@@ -325,7 +329,18 @@ class BrowserScreenshotTool(Tool):
                 "description": BrowserScreenshotTool.description(),
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "max_edge": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum returned image edge in pixels (default 900).",
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum base64 payload length (default 48000).",
+                        },
+                    },
                     "additionalProperties": False,
                 },
             },
