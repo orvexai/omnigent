@@ -58,6 +58,7 @@ from omnigent.model_override import (
     validate_model_override,
 )
 from omnigent.native_coding_agents import public_agent_name
+from omnigent.runner.event_delivery import event_denial_reason
 from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
@@ -2448,28 +2449,6 @@ def _validated_child_workspace(
     return (str(target),)
 
 
-def _message_event_denied(resp: httpx.Response) -> str | None:
-    """
-    Return the denial reason when an accepted-looking event POST was refused.
-
-    ``POST /v1/sessions/{id}/events`` answers a policy denial with HTTP **202**
-    and ``{"queued": false, "denied": true, "reason": ...}``. A status-only
-    check therefore reads a refused message as delivered, registers work, and
-    waits forever for a turn that never starts.
-
-    :param resp: The event POST response.
-    :returns: The denial reason when the message was refused, else ``None``.
-    """
-    try:
-        body = resp.json()
-    except ValueError:
-        return None
-    if not isinstance(body, dict) or not body.get("denied"):
-        return None
-    reason = body.get("reason")
-    return reason if isinstance(reason, str) and reason else "denied by policy"
-
-
 async def _newest_item_id(
     session_id: str,
     server_client: httpx.AsyncClient,
@@ -2651,7 +2630,7 @@ async def _send_to_peer_session(
             f"Error: failed to send message to session: "
             f"{msg_resp.status_code} {msg_resp.text[:200]}"
         )
-    denial = _message_event_denied(msg_resp)
+    denial = event_denial_reason(msg_resp)
     if denial is not None:
         _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
         return json.dumps(
@@ -2826,7 +2805,7 @@ async def _send_to_existing_session(
         return (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
-    denial = _message_event_denied(msg_resp)
+    denial = event_denial_reason(msg_resp)
     if denial is not None:
         # A policy denial answers 202, so the status check above misses it.
         # Without this the child never starts a turn while its work entry
@@ -3355,6 +3334,18 @@ async def _post_child_first_message(
         return json.dumps(
             {
                 "error": f"child session created but message failed: {exc}",
+                "conversation_id": child_session_id,
+            }
+        )
+    denial = event_denial_reason(msg_resp)
+    if denial is not None:
+        # A denial answers 202, so the status check below misses it. The
+        # child exists but will never start its turn; reporting success
+        # would leave the orchestrator waiting on a session that is idle
+        # by construction.
+        return json.dumps(
+            {
+                "error": f"child session created but the message was refused: {denial}",
                 "conversation_id": child_session_id,
             }
         )
@@ -3986,6 +3977,16 @@ async def _timer_loop(
                 # httpx does not raise on 4xx/5xx by default; treat those
                 # as delivery failures so they share the warning path below.
                 resp.raise_for_status()
+                # A policy denial answers 202, so raise_for_status misses it
+                # and the timer would look delivered while the session was
+                # never actually woken.
+                if (denial := event_denial_reason(resp)) is not None:
+                    _logger.warning(
+                        "Timer %s fired but its notice was refused for session %s: %s",
+                        timer_id,
+                        conversation_id,
+                        denial,
+                    )
             except (httpx.HTTPError, asyncio.TimeoutError):
                 _logger.warning(
                     "Timer %s firing persist failed for %s",

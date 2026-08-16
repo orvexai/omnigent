@@ -124,7 +124,7 @@ async def test_wake_post_retries_transient_503_then_succeeds(
         [_wake_response(503, parent_id), _wake_response(200, parent_id)]
     )
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    result = await runner_app_mod._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -134,7 +134,7 @@ async def test_wake_post_retries_transient_503_then_succeeds(
     # 200. If the status check were missing, the first 503 would be treated
     # as success and there would be exactly one call with delivered already
     # True — so both the count and the value below pin the fix.
-    assert delivered is True
+    assert result.delivered is True
     # Exactly two POSTs: the 503 attempt + the 200 retry. One call would mean
     # the 503 was silently accepted; three would mean it retried past success.
     assert len(client.calls) == 2, (
@@ -155,14 +155,14 @@ async def test_wake_post_carries_dispatch_actor() -> None:
     parent_id = "5a81ef19fce549929c8f9925c2ee034f"
     client = _QueuedResponseServerClient([_wake_response(200, parent_id)])
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    result = await runner_app_mod._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
         created_by="bob@example.com",
     )
 
-    assert delivered is True
+    assert result.delivered is True
     assert len(client.calls) == 1
     assert client.calls[0].created_by == "bob@example.com"
 
@@ -174,14 +174,14 @@ async def test_wake_post_retries_without_actor_when_attribution_is_rejected() ->
         [_wake_response(403, parent_id), _wake_response(200, parent_id)]
     )
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    result = await runner_app_mod._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
         created_by="bob@example.com",
     )
 
-    assert delivered is True
+    assert result.delivered is True
     assert len(client.calls) == 2
     assert client.calls[0].created_by == "bob@example.com"
     assert client.calls[1].created_by is None
@@ -202,7 +202,7 @@ async def test_wake_post_persistent_503_returns_failure(
         [_wake_response(503, parent_id) for _ in range(runner_app_mod._WAKE_POST_MAX_ATTEMPTS)]
     )
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    result = await runner_app_mod._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -210,7 +210,7 @@ async def test_wake_post_persistent_503_returns_failure(
 
     # False = the non-2xx response was treated as a failure. Before the fix
     # this returned (implicitly) success and the wake was considered delivered.
-    assert delivered is False
+    assert result.delivered is False
     # Attempted exactly the bounded budget — not once (no retry) and not
     # unbounded. The stub would have asserted on a call past the queue.
     assert len(client.calls) == runner_app_mod._WAKE_POST_MAX_ATTEMPTS, (
@@ -236,14 +236,14 @@ async def test_wake_post_permanent_4xx_not_retried(
     parent_id = "43cc3eccd350fed1b91854b2adf5ec3e"
     client = _QueuedResponseServerClient([_wake_response(400, parent_id)])
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    result = await runner_app_mod._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
     )
 
     # Permanent rejection => failure, no delivery.
-    assert delivered is False
+    assert result.delivered is False
     # Exactly one attempt: a permanent 4xx is not retried. Two+ would mean the
     # classifier wrongly treated 400 as transient.
     assert len(client.calls) == 1, (
@@ -1031,3 +1031,132 @@ async def test_forwarder_task_exit_paths_are_logged(
     finally:
         for sid in (cancelled_id, died_id, returned_id):
             runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
+
+
+async def test_wake_post_treats_a_policy_denial_as_undelivered_and_does_not_retry(
+    _no_wake_backoff: list[float],
+) -> None:
+    """
+    A 202 carrying ``denied`` is a refusal, not a delivery — and is not retried.
+
+    This is the sharpest instance of the denial class. The wake notice IS the
+    only delivery signal for a completed child, and the parent is idle by
+    definition, so reporting a refused wake as delivered strands the result in
+    an inbox with nothing left to rouse it: the agent sleeps forever holding
+    an answer it never sees.
+
+    Retrying is equally wrong. The policy will refuse again, and a gate that
+    parks on a human ASK spawns a fresh approval card per attempt — the exact
+    duplicate-card failure the long read timeout was introduced to avoid. So
+    exactly ONE POST, reported as not delivered, with the reason preserved.
+    """
+    parent_id = "dd17997e050fc080efac96bc9ec22b55"
+    request = httpx.Request("POST", f"http://test/v1/sessions/{parent_id}/events")
+    denied = httpx.Response(
+        202,
+        request=request,
+        json={"queued": False, "denied": True, "reason": "blocked by session_cost_budget"},
+    )
+    client = _QueuedResponseServerClient([denied])
+
+    result = await runner_app_mod._deliver_subagent_wake_post(
+        client,  # type: ignore[arg-type]
+        parent_id,
+        "[System: worker completed]",
+    )
+
+    assert result.delivered is False
+    assert result.denied is True
+    assert "session_cost_budget" in str(result.denial_reason)
+    # Exactly one attempt — a retry would re-park the gate.
+    assert len(client.calls) == 1, f"a denial must not be retried; got {len(client.calls)} POSTs"
+
+
+async def test_wake_post_accepts_an_ordinary_202(_no_wake_backoff: list[float]) -> None:
+    """
+    A 202 without a denial is still a normal success.
+
+    Guards the obvious over-correction: the route answers accepted events with
+    202 as well, so treating every 202 as suspicious would break every wake.
+    """
+    parent_id = "dd17997e050fc080efac96bc9ec22b55"
+    request = httpx.Request("POST", f"http://test/v1/sessions/{parent_id}/events")
+    client = _QueuedResponseServerClient(
+        [httpx.Response(202, request=request, json={"queued": True})]
+    )
+
+    result = await runner_app_mod._deliver_subagent_wake_post(
+        client,  # type: ignore[arg-type]
+        parent_id,
+        "[System: worker completed]",
+    )
+
+    assert result.delivered is True
+    assert result.denied is False
+
+
+def test_parent_needs_rewake_covers_a_wake_that_never_landed() -> None:
+    """
+    A parent whose wake was REFUSED or FAILED still qualifies for a re-wake.
+
+    This is the case the original guard excluded. The failure path cleared
+    the ``pending`` flag, and the recovery gated on exactly that flag — so a
+    parent left asleep holding a completed result was the one parent the
+    rescue skipped. It is the worst case, not an edge case: the wake is the
+    only delivery signal a sub-agent result has, so nothing else was ever
+    going to fire.
+    """
+    assert (
+        runner_app_mod.parent_needs_rewake(
+            "conv_parent",
+            wake_pending=set(),
+            wake_owed={"conv_parent"},
+            inbox_size=1,
+        )
+        is True
+    )
+
+
+def test_parent_needs_rewake_still_covers_an_undrained_delivered_wake() -> None:
+    """The pre-existing case — wake sent, results not drained — still fires."""
+    assert (
+        runner_app_mod.parent_needs_rewake(
+            "conv_parent",
+            wake_pending={"conv_parent"},
+            wake_owed=set(),
+            inbox_size=2,
+        )
+        is True
+    )
+
+
+def test_parent_needs_rewake_is_false_with_an_empty_inbox() -> None:
+    """
+    Nothing to deliver means nothing to wake for.
+
+    Without this a parent would be re-woken on every poke for a result it
+    already consumed, injecting a spurious system message each turn.
+    """
+    for pending, owed in (({"conv_parent"}, set()), (set(), {"conv_parent"})):
+        assert (
+            runner_app_mod.parent_needs_rewake(
+                "conv_parent",
+                wake_pending=pending,  # type: ignore[arg-type]
+                wake_owed=owed,  # type: ignore[arg-type]
+                inbox_size=0,
+            )
+            is False
+        )
+
+
+def test_parent_needs_rewake_is_false_for_an_untracked_parent() -> None:
+    """A parent in neither state is not owed anything, inbox or not."""
+    assert (
+        runner_app_mod.parent_needs_rewake(
+            "conv_parent",
+            wake_pending=set(),
+            wake_owed=set(),
+            inbox_size=3,
+        )
+        is False
+    )
