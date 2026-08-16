@@ -4163,7 +4163,7 @@ async def _execute_comment_tool(
 def _browser_action_guidance(
     raw: str,
     *,
-    addressing: Literal["ref", "selector", "unknown"] = "unknown",
+    addressing: Literal["ref", "ref-current", "ref-superseded", "selector", "unknown"] = "unknown",
 ) -> str:
     """
     Turn an opaque renderer/browser failure into something an agent can act on.
@@ -4207,7 +4207,17 @@ def _browser_action_guidance(
         "script failed to execute" in renderer_error
         or "check the renderer console" in renderer_error
     ):
-        if addressing == "ref":
+        if addressing == "ref-current":
+            message = (
+                "The browser action failed in the renderer. The ref resolved "
+                "against the current browser snapshot, but the renderer could "
+                "not act on that element. The element may not be interactable — "
+                "for example, it may be hidden, offscreen, or a non-interactive "
+                "container. Try a different ref, or address it with a CSS "
+                "selector instead. If that does not resolve it, the renderer "
+                "failure may have another cause."
+            )
+        elif addressing in {"ref", "ref-superseded"}:
             message = (
                 "The browser action failed in the renderer. The most likely "
                 "cause is that its ref came from a superseded browser snapshot "
@@ -4692,10 +4702,16 @@ async def _execute_browser_tool(
         )
         return _browser_action_guidance(_bound_browser_screenshot(raw, max_edge, max_chars))
     # Rewrite the failures whose raw text sends an agent after the wrong cause.
-    addressing: Literal["ref", "selector", "unknown"] = "unknown"
+    addressing: Literal["ref", "ref-current", "ref-superseded", "selector", "unknown"] = "unknown"
     if action in {"click", "type"}:
         if "ref" in args:
             addressing = "ref"
+            snapshot_id = args.get("snapshot_id")
+            latest_snapshot_id = _browser_snapshot_ids.get(conversation_id)
+            if isinstance(snapshot_id, str) and latest_snapshot_id:
+                addressing = (
+                    "ref-current" if snapshot_id == latest_snapshot_id else "ref-superseded"
+                )
         elif "selector" in args:
             addressing = "selector"
         if "snapshot_id" in args:
