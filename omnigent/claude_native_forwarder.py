@@ -74,9 +74,8 @@ _MAX_SEEN_DELTA_KEYS = 5000
 # a sub-agent. This is a display-only badge: it must never be treated as
 # the Task's terminal signal.
 _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
-# Inactivity window for a Task child without Claude's authoritative
-# ``<task-notification>`` record. The 30-minute window accommodates blocking
-# tools in this repo that can legitimately run for 25+ minutes.
+# Inactivity window for a Task child without an observed terminal state. The
+# 30-minute window accommodates blocking tools in this repo that can run 25+ minutes.
 _SUBAGENT_TERMINAL_FALLBACK_S = 1800.0
 _TASK_NOTIFICATION_FIELD_RE = re.compile(
     r"<(task-id|status|result|summary)>(.*?)</\1>",
@@ -390,9 +389,10 @@ class SubagentEntry:
         ``waiting`` events on every tick when nothing changed. ``None``
         means no status has been posted yet.
     :param started_at_ts: Unix timestamp when the child was registered;
-        used by the long failure fallback when no transcript item exists.
-    :param terminal_status: Authoritative terminal status learned from the
-        parent ``<task-notification>`` record or the failure fallback.
+        used by the long failure fallback when no terminal state exists.
+    :param terminal_status: Terminal status learned from the parent
+        ``<task-notification>`` record, the transcript tail, or the failure
+        fallback.
     :param terminal_output: Result or failure detail paired with
         ``terminal_status``.
     """
@@ -1345,6 +1345,59 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     }
 
 
+def _subagent_terminal_state(jsonl_path: Path) -> tuple[str, str] | None:
+    """
+    Classify the last complete record in a sub-agent transcript.
+
+    :param jsonl_path: Sub-agent ``agent-<id>.jsonl`` transcript path.
+    :returns: ``("completed", result)`` for a final assistant answer,
+        ``("failed", reason)`` for a user interruption, or ``None`` when
+        the transcript tail is not terminal.
+    """
+    last_entry: object | None = None
+    try:
+        with jsonl_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.endswith("\n"):
+                    break
+                try:
+                    last_entry = json.loads(line)
+                except json.JSONDecodeError:
+                    last_entry = None
+    except OSError:
+        return None
+
+    if not isinstance(last_entry, dict):
+        return None
+    message = last_entry.get("message")
+    if not isinstance(message, dict):
+        return None
+    role = message.get("role")
+    content = message.get("content")
+    has_text_block = False
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text_parts: list[str] = []
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            ):
+                has_text_block = True
+                text_parts.append(block["text"])
+        text = "".join(text_parts)
+    else:
+        text = ""
+
+    if role == "assistant" and message.get("stop_reason") == "end_turn" and has_text_block:
+        return "completed", text
+    if role == "user" and text.strip().startswith("[Request interrupted by user"):
+        return "failed", "Error: sub-agent interrupted by user."
+    return None
+
+
 async def _post_subagent_terminal_status(
     client: httpx.AsyncClient,
     *,
@@ -1538,6 +1591,19 @@ async def _forward_available_subagents(
                 terminal_status=notification.status,
                 terminal_output=notification.result,
             )
+        jsonl_path = subagents_dir / f"agent-{subagent_id}.jsonl"
+        if new_entry.terminal_status is None and jsonl_path.exists():
+            transcript_terminal = await asyncio.to_thread(
+                _subagent_terminal_state,
+                jsonl_path,
+            )
+            if transcript_terminal is not None:
+                terminal_status, terminal_output = transcript_terminal
+                new_entry = replace(
+                    new_entry,
+                    terminal_status=terminal_status,
+                    terminal_output=terminal_output,
+                )
         fallback_ts = (
             new_entry.last_activity_ts
             if new_entry.last_activity_ts is not None
@@ -1552,15 +1618,13 @@ async def _forward_available_subagents(
                 new_entry,
                 terminal_status="failed",
                 terminal_output=(
-                    "Error: sub-agent did not produce a terminal task-notification "
-                    "before the fallback deadline."
+                    "Error: no terminal state observed before the fallback deadline."
                 ),
             )
         if new_entry is not entry:
             updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
             await _write_subagent_forward_state_async(bridge_dir, updated)
         entry = new_entry
-        jsonl_path = subagents_dir / f"agent-{subagent_id}.jsonl"
         if not jsonl_path.exists():
             terminal_entry = await _post_subagent_terminal_status(
                 client,
@@ -1733,9 +1797,8 @@ async def _forward_available_subagents(
                 last_activity_ts=now,
             )
 
-        # Claude's parent transcript carries the authoritative terminal
-        # ``<task-notification>``. Quiescence is only a display badge;
-        # the long fallback marks an unfinished child failed.
+        # Notifications are authoritative; transcript tails cover inline
+        # results. Quiescence is only a display badge.
         if new_entry.terminal_status is not None:
             terminal_entry = await _post_subagent_terminal_status(
                 client,

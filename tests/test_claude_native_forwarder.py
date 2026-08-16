@@ -4572,6 +4572,70 @@ def _seed_subagent_on_disk(
     return jsonl_path
 
 
+async def _run_subagent_terminal_case(
+    tmp_path: Path,
+    *,
+    subagent_id: str,
+    transcript_records: list[dict[str, Any]],
+    task_notifications: dict[str, forwarder._SubagentTaskNotification] | None = None,
+) -> tuple[forwarder.SubagentEntry, list[dict[str, Any]]]:
+    """
+    Forward one seeded child transcript and collect its status events.
+
+    :param tmp_path: Test temporary directory.
+    :param subagent_id: Stable child transcript identifier.
+    :param transcript_records: Complete child JSONL records.
+    :param task_notifications: Optional parent-side completion signals.
+    :returns: Updated child entry and all child status payloads.
+    """
+    bridge_dir = tmp_path / "bridge"
+    parent_path = tmp_path / "session.jsonl"
+    parent_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=parent_path,
+        subagent_id=subagent_id,
+        agent_type="general-purpose",
+        description="terminal-state test",
+        tool_use_id=f"toolu_{subagent_id}",
+        transcript_records=transcript_records,
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            subagent_id: forwarder.SubagentEntry(
+                subagent_id=subagent_id,
+                child_conversation_id=f"conv_{subagent_id}",
+                started_at_ts=time.time(),
+            )
+        }
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        updated = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=parent_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(),
+            item_retry_tracker=forwarder._PostRetryTracker(),
+            status_retry_tracker=forwarder._PostRetryTracker(),
+            task_notifications=task_notifications,
+        )
+
+    status_requests = [
+        request["data"] for request in requests if request["type"] == "external_session_status"
+    ]
+    return updated.subagents[subagent_id], status_requests
+
+
 async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
     tmp_path: Path,
 ) -> None:
@@ -4872,6 +4936,230 @@ async def test_subagent_watcher_task_notification_delivers_result(
 
 
 @pytest.mark.asyncio
+async def test_subagent_transcript_end_turn_reports_final_result_without_notification(
+    tmp_path: Path,
+) -> None:
+    """A final child ``end_turn`` answer closes an inline Task result."""
+    entry, statuses = await _run_subagent_terminal_case(
+        tmp_path,
+        subagent_id="inline42",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "user",
+                "uuid": "inline-user",
+                "message": {"role": "user", "content": "Investigate the issue"},
+            },
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "inline-narration",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "EARLIER_NARRATION"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read_inline",
+                            "name": "Read",
+                            "input": {"file_path": "README.md"},
+                        },
+                    ],
+                    "stop_reason": "tool_use",
+                },
+            },
+            {
+                "isSidechain": True,
+                "type": "user",
+                "uuid": "inline-tool-result",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read_inline",
+                            "content": "relevant source",
+                        }
+                    ],
+                },
+            },
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "inline-answer",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "FINAL_INLINE_RESULT"}],
+                    "stop_reason": "end_turn",
+                },
+            },
+        ],
+    )
+
+    assert statuses == [{"status": "idle", "output": "FINAL_INLINE_RESULT"}]
+    assert entry.terminal_status == "completed"
+    assert entry.terminal_output == "FINAL_INLINE_RESULT"
+    assert all("EARLIER_NARRATION" not in str(status) for status in statuses)
+
+
+@pytest.mark.asyncio
+async def test_subagent_transcript_interruption_reports_failed_reason(tmp_path: Path) -> None:
+    """A final user interruption closes the child as an honest failure."""
+    entry, statuses = await _run_subagent_terminal_case(
+        tmp_path,
+        subagent_id="interrupted42",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "interrupted-work",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "WORKING"}],
+                    "stop_reason": "tool_use",
+                },
+            },
+            {
+                "isSidechain": True,
+                "type": "user",
+                "uuid": "interrupted-final",
+                "message": {"role": "user", "content": "[Request interrupted by user]"},
+            },
+        ],
+    )
+
+    assert statuses == [{"status": "failed", "output": "Error: sub-agent interrupted by user."}]
+    assert entry.terminal_status == "failed"
+    assert entry.terminal_output == "Error: sub-agent interrupted by user."
+
+
+@pytest.mark.asyncio
+async def test_subagent_transcript_tool_use_interruption_reports_failed_reason(
+    tmp_path: Path,
+) -> None:
+    """A tool-use interruption variant is also an interruption failure."""
+    entry, statuses = await _run_subagent_terminal_case(
+        tmp_path,
+        subagent_id="interrupted-tool-use42",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "user",
+                "uuid": "interrupted-tool-use-final",
+                "message": {
+                    "role": "user",
+                    "content": "[Request interrupted by user for tool use]",
+                },
+            },
+        ],
+    )
+
+    assert statuses == [{"status": "failed", "output": "Error: sub-agent interrupted by user."}]
+    assert entry.terminal_status == "failed"
+    assert entry.terminal_output == "Error: sub-agent interrupted by user."
+
+
+@pytest.mark.asyncio
+async def test_subagent_transcript_tool_use_tail_is_not_terminal(tmp_path: Path) -> None:
+    """A child whose final assistant turn still uses tools remains running."""
+    entry, statuses = await _run_subagent_terminal_case(
+        tmp_path,
+        subagent_id="working42",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "working-narration",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "EARLIER_NARRATION"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_first_working",
+                            "name": "Read",
+                            "input": {"file_path": "one.txt"},
+                        },
+                    ],
+                    "stop_reason": "tool_use",
+                },
+            },
+            {
+                "isSidechain": True,
+                "type": "user",
+                "uuid": "working-tool-result",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_first_working",
+                            "content": "more to inspect",
+                        }
+                    ],
+                },
+            },
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "working-latest",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "LATEST_IN_PROGRESS_TEXT"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_second_working",
+                            "name": "Read",
+                            "input": {"file_path": "two.txt"},
+                        },
+                    ],
+                    "stop_reason": "tool_use",
+                },
+            },
+        ],
+    )
+
+    assert statuses == [{"status": "running"}]
+    assert entry.terminal_status is None
+    assert entry.terminal_output is None
+    assert all("EARLIER_NARRATION" not in str(status) for status in statuses)
+    assert all("LATEST_IN_PROGRESS_TEXT" not in str(status) for status in statuses)
+
+
+@pytest.mark.asyncio
+async def test_task_notification_wins_over_subagent_transcript_tail(tmp_path: Path) -> None:
+    """The parent notification remains authoritative over a child tail."""
+    entry, statuses = await _run_subagent_terminal_case(
+        tmp_path,
+        subagent_id="authoritative42",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "authoritative-answer",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "TRANSCRIPT_TAIL_RESULT"}],
+                    "stop_reason": "end_turn",
+                },
+            }
+        ],
+        task_notifications={
+            "authoritative42": forwarder._SubagentTaskNotification(
+                subagent_id="authoritative42",
+                status="failed",
+                result="PARENT_NOTIFICATION_RESULT",
+            )
+        },
+    )
+
+    assert statuses == [{"status": "failed", "output": "PARENT_NOTIFICATION_RESULT"}]
+    assert entry.terminal_status == "failed"
+    assert entry.terminal_output == "PARENT_NOTIFICATION_RESULT"
+
+
+@pytest.mark.asyncio
 async def test_subagent_quiescence_posts_waiting_not_terminal_idle(tmp_path: Path) -> None:
     """Five seconds of quiet marks a child waiting, never completed."""
     bridge_dir = tmp_path / "bridge"
@@ -5035,10 +5323,7 @@ async def test_subagent_terminal_fallback_reports_failed(tmp_path: Path) -> None
     assert status_requests == [
         {
             "status": "failed",
-            "output": (
-                "Error: sub-agent did not produce a terminal task-notification "
-                "before the fallback deadline."
-            ),
+            "output": ("Error: no terminal state observed before the fallback deadline."),
         }
     ]
     assert updated.subagents["stuck42"].terminal_status == "failed"
