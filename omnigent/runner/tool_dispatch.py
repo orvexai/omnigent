@@ -2499,6 +2499,24 @@ async def _newest_item_id(
     return _optional_string(rows[0].get("id"))
 
 
+def _session_is_local_to_caller(
+    target_session_id: str,
+    conversation_id: str,
+    snap_data: _JsonObject,
+) -> bool:
+    """
+    Reuse the session-send ownership boundary for runner-local state.
+
+    :param target_session_id: Session being inspected or messaged.
+    :param conversation_id: Calling session id.
+    :param snap_data: Target session snapshot.
+    :returns: ``True`` for the caller itself or one of its direct children.
+    """
+    return target_session_id == conversation_id or snap_data.get("parent_session_id") == (
+        conversation_id
+    )
+
+
 async def _send_to_peer_session(
     target_session_id: str,
     message: str,
@@ -2727,7 +2745,9 @@ async def _send_to_existing_session(
     if snap.status_code != 200:
         return f"Error: sys_session_send lookup returned {snap.status_code}"
     snap_data = snap.json()
-    if snap_data.get("parent_session_id") != conversation_id:
+    if target_session_id == conversation_id or not _session_is_local_to_caller(
+        target_session_id, conversation_id, snap_data
+    ):
         # Not our child. A child always runs on its parent's runner, so any
         # target that is NOT one may be served by a different runner process,
         # whose completion events this process never sees. Route it through
@@ -4814,7 +4834,10 @@ async def _session_get_info_via_rest(
     binding, runner binding, host, reasoning effort, effective model,
     parent linkage, workspace / git branch, persisted last-activity time,
     and the outstanding approval prompts (the prompts themselves plus a
-    count). Runner connectivity
+    count). ``turn_active`` reports whether this runner holds an active turn
+    for a local session; it is ``None`` for a peer session. It does not detect
+    a hung or unresponsive harness — a wedged process can still hold an
+    active turn. Runner connectivity
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
     the lookup fails or no runner is bound). The full transcript is
@@ -4855,6 +4878,11 @@ async def _session_get_info_via_rest(
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
     placement = await _effective_placement(snap, server_client)
+    turn_active: bool | None = None
+    if _session_is_local_to_caller(raw_target, conversation_id, snap):
+        from omnigent.runner.app import session_has_active_turn
+
+        turn_active = session_has_active_turn(raw_target)
     return json.dumps(
         {
             "session_id": snap.get("id"),
@@ -4875,6 +4903,9 @@ async def _session_get_info_via_rest(
             "agent_name": public_agent_name(snap_agent_name),
             "runner_id": snap.get("runner_id"),
             "runner_online": await _runner_online_or_none(snap_runner_id, server_client),
+            # This is runner-local state. A peer's process-local registries
+            # are invisible here, so peers remain explicitly unknown.
+            "turn_active": turn_active,
             "host_id": placement.host_id,
             "parent_session_id": snap.get("parent_session_id"),
             "sub_agent_name": snap.get("sub_agent_name"),
