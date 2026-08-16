@@ -575,6 +575,120 @@ def test_ref_renderer_script_failure_becomes_fresh_snapshot_guidance() -> None:
     assert out["detail"] == raw[:200]
 
 
+@pytest.mark.asyncio
+async def test_current_ref_renderer_script_failure_suggests_interactable_element() -> None:
+    """A ref from the latest snapshot gets interaction-specific guidance."""
+    import omnigent.runner.tool_dispatch as tool_dispatch
+    from omnigent.runner.tool_dispatch import _truncate_browser_snapshot
+
+    tool_dispatch._browser_snapshot_ids.clear()
+    conversation_id = "conv_current_ref_guidance"
+    _truncate_browser_snapshot(
+        json.dumps(
+            {
+                "ok": True,
+                "data": {"snapshot_id": "snapshot-current", "tree": ""},
+            }
+        ),
+        1,
+        conversation_id=conversation_id,
+    )
+    raw = {"ok": False, "error": "Script failed to execute; check the renderer console."}
+
+    out = json.loads(
+        await _execute_browser_tool(
+            "browser_click",
+            {"ref": 1, "snapshot_id": "snapshot-current"},
+            server_client=_RecordingClient(_RecordingResponse(body=raw)),
+            conversation_id=conversation_id,
+        )
+    )
+
+    assert out["error"] == "browser_action_failed_in_renderer"
+    assert "superseded" not in out["message"].casefold()
+    assert "stale" not in out["message"].casefold()
+    assert "current browser snapshot" in out["message"]
+    assert "not be interactable" in out["message"]
+    assert "selector" in out["message"]
+    assert out["detail"] == json.dumps(raw)[:200]
+
+
+@pytest.mark.asyncio
+async def test_superseded_ref_renderer_script_failure_keeps_stale_guidance() -> None:
+    """A ref from an older recorded snapshot keeps stale-ref guidance."""
+    import omnigent.runner.tool_dispatch as tool_dispatch
+    from omnigent.runner.tool_dispatch import _truncate_browser_snapshot
+
+    tool_dispatch._browser_snapshot_ids.clear()
+    conversation_id = "conv_superseded_ref_guidance"
+    for snapshot_id in ("snapshot-old", "snapshot-current"):
+        _truncate_browser_snapshot(
+            json.dumps({"ok": True, "data": {"snapshot_id": snapshot_id, "tree": ""}}),
+            1,
+            conversation_id=conversation_id,
+        )
+    raw = {"ok": False, "error": "Script failed to execute; check the renderer console."}
+
+    out = json.loads(
+        await _execute_browser_tool(
+            "browser_click",
+            {"ref": 1, "snapshot_id": "snapshot-old"},
+            server_client=_RecordingClient(_RecordingResponse(body=raw)),
+            conversation_id=conversation_id,
+        )
+    )
+
+    assert "most likely cause" in out["message"]
+    assert "superseded browser snapshot" in out["message"]
+    assert "fresh browser_snapshot" in out["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args", "record_snapshot"),
+    [
+        ({"ref": 1}, True),
+        ({"ref": 1, "snapshot_id": "snapshot-unknown"}, False),
+    ],
+)
+async def test_ref_without_known_snapshot_keeps_hedged_guidance(
+    args: dict[str, object], record_snapshot: bool
+) -> None:
+    """Refs without enough snapshot knowledge remain hedged."""
+    import omnigent.runner.tool_dispatch as tool_dispatch
+    from omnigent.runner.tool_dispatch import _truncate_browser_snapshot
+
+    tool_dispatch._browser_snapshot_ids.clear()
+    conversation_id = (
+        "conv_ref_without_snapshot_id" if record_snapshot else "conv_ref_without_record"
+    )
+    if record_snapshot:
+        _truncate_browser_snapshot(
+            json.dumps(
+                {
+                    "ok": True,
+                    "data": {"snapshot_id": "snapshot-current", "tree": ""},
+                }
+            ),
+            1,
+            conversation_id=conversation_id,
+        )
+    raw = {"ok": False, "error": "Script failed to execute; check the renderer console."}
+
+    out = json.loads(
+        await _execute_browser_tool(
+            "browser_click",
+            args,
+            server_client=_RecordingClient(_RecordingResponse(body=raw)),
+            conversation_id=conversation_id,
+        )
+    )
+
+    assert "most likely cause" in out["message"]
+    assert "superseded browser snapshot" in out["message"]
+    assert "fresh browser_snapshot" in out["message"]
+
+
 def test_selector_renderer_script_failure_names_missing_element() -> None:
     """Selector failures advise checking the selector, not stale refs."""
     from omnigent.runner.tool_dispatch import _browser_action_guidance
