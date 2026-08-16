@@ -878,10 +878,8 @@ class SysSessionCreateTool(Tool):
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
             "message. The new session is always a child of the calling "
-            "session (you cannot create top-level or sibling sessions), "
-            "but it need not run on your machine: pass host_id (with "
-            "workspace) to place it on another host, or omit both to "
-            "co-locate it with you. "
+            "session (you cannot create top-level or sibling sessions) "
+            "and always runs on your machine, co-located with you. "
             "Returns {conversation_id, agent_id, title, status}; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
@@ -954,22 +952,6 @@ class SysSessionCreateTool(Tool):
                                 "or 'provider-local-model-id'. Sets the harness "
                                 "model at session creation; omit to use the "
                                 "agent's default."
-                            ),
-                        },
-                        "host_id": {
-                            "type": "string",
-                            "description": (
-                                "Optional host that should run the child, "
-                                "e.g. 'host_a1b2c3d4'. Omit to co-locate it "
-                                "with you (the default). Requires workspace."
-                            ),
-                        },
-                        "workspace": {
-                            "type": "string",
-                            "description": (
-                                "Absolute path on the chosen host where the "
-                                "child should start, e.g. '/srv/work/repo'. "
-                                "Required when host_id is set."
                             ),
                         },
                     },
@@ -1174,7 +1156,11 @@ def _agent_title_from_conversation(child: Conversation) -> _AgentTitle:
         before the split, so a tombstoned colon-less title round-trips.
     """
     stripped = title_without_closed_marker(child.title) or ""
-    if ":" not in stripped:
+    # ``sub_agent_name`` is the durable record that this child was spawned
+    # as a NAMED sub-agent and so stores "<agent>:<title>". Splitting on a
+    # colon without it invents an agent from any free-form title that
+    # happens to contain one ("bug: login 500" -> agent "bug").
+    if child.sub_agent_name is None or ":" not in stripped:
         return _AgentTitle(agent=None, title=stripped)
     sa_agent, _, sa_title = stripped.partition(":")
     return _AgentTitle(agent=sa_agent, title=sa_title)

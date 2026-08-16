@@ -114,6 +114,11 @@ def session_fixture(
         kind="sub_agent",
         title="researcher:auth",
         parent_conversation_id=parent_conv.id,
+        # Production's named-mode create sets BOTH (see the runner's
+        # create body: title=f"{sub_agent_name}:{session_name}" alongside
+        # sub_agent_name=sub_agent_name). Omitting it here made the fixture
+        # unrepresentative and let a title-shape heuristic look correct.
+        sub_agent_name="researcher",
     )
     conv_store.append(
         child_conv.id,
@@ -789,6 +794,40 @@ def test_session_list_surfaces_free_form_titled_child(session_fixture: _Fixture)
     }
     # The conventional child is unaffected.
     assert listed[session_fixture.child_conv_id]["agent"] == "researcher"
+
+
+def test_session_list_does_not_invent_an_agent_from_a_colon_in_a_free_form_title(
+    session_fixture: _Fixture,
+) -> None:
+    """
+    A free-form title containing ``":"`` must not be split into an agent name.
+
+    ``sys_session_create`` takes an arbitrary title, and an LLM naturally
+    picks labels like ``"team:alpha"`` or ``"bug: login 500"``. Keying the
+    split on the colon reported those children as bound to agents named
+    ``"team"`` / ``"bug"`` — names no agent has. An orchestrator feeding one
+    back into named-mode ``sys_session_send`` would spawn an unrelated child
+    instead of reaching this one. ``sub_agent_name`` is the real binding.
+    """
+    child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="team:alpha",
+        parent_conversation_id=session_fixture.parent_conv_id,
+    )
+    payload = json.loads(SysSessionListTool().invoke("{}", session_fixture.ctx))
+
+    listed = {entry["conversation_id"]: entry for entry in payload["sub_agents"]}
+    assert listed[child.id] == {
+        "agent": None,
+        "title": "team:alpha",
+        "conversation_id": child.id,
+    }
+    # The genuinely named sibling is unaffected — it carries sub_agent_name.
+    assert listed[session_fixture.child_conv_id] == {
+        "agent": "researcher",
+        "title": "auth",
+        "conversation_id": session_fixture.child_conv_id,
+    }
 
 
 def test_session_list_still_hides_closed_free_form_child(session_fixture: _Fixture) -> None:
