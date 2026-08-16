@@ -294,8 +294,10 @@ class SysReadInboxTool(Tool):
             "and return them inline. Use this mid-turn when you "
             "want to inspect completions before yielding — e.g., "
             "to plan follow-up work based on the results. Returns "
-            "a textual summary; an empty inbox returns a sentinel "
-            "string."
+            "a textual summary. Large backlogs are delivered across "
+            "multiple reads; when messages remain queued, call "
+            "sys_read_inbox again to receive them. An empty inbox "
+            "returns a sentinel string."
         )
 
     def get_schema(self) -> dict[str, Any]:

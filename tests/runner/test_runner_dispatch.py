@@ -4785,6 +4785,160 @@ async def test_sys_read_inbox_requeues_subagent_output_on_transient_policy_failu
     assert work_after_second_drain is None
 
 
+@pytest.mark.asyncio
+async def test_drain_inbox_bounds_many_large_messages_and_keeps_queue() -> None:
+    """A large inbox drain respects the aggregate budget and keeps the tail."""
+    from omnigent.runner.tool_dispatch import _INBOX_DRAIN_MAX_CHARS, _drain_inbox
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    for index in range(20):
+        inbox.put_nowait(
+            {
+                "handle_id": f"large-{index}",
+                "tool_name": "worker",
+                "status": "completed",
+                "output": "x" * 12000,
+            }
+        )
+
+    result = await _drain_inbox(inbox)
+
+    assert len(result) <= _INBOX_DRAIN_MAX_CHARS
+    assert inbox.qsize() == 17
+    assert "17 message(s) remain queued" in result
+
+
+@pytest.mark.asyncio
+async def test_drain_inbox_second_read_delivers_remainder_once_in_fifo_order() -> None:
+    """Two bounded reads deliver every queued message exactly once in order."""
+    from omnigent.runner.tool_dispatch import _drain_inbox
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    expected_handles = [f"fifo-{index}" for index in range(6)]
+    for handle_id in expected_handles:
+        inbox.put_nowait(
+            {
+                "handle_id": handle_id,
+                "tool_name": "worker",
+                "status": "completed",
+                "output": "y" * 12000,
+            }
+        )
+
+    first_result = await _drain_inbox(inbox)
+    second_result = await _drain_inbox(inbox)
+    combined_result = f"{first_result}\n\n{second_result}"
+
+    assert inbox.qsize() == 0
+    assert all(combined_result.count(handle_id) == 1 for handle_id in expected_handles)
+    positions = [combined_result.index(handle_id) for handle_id in expected_handles]
+    assert positions == sorted(positions)
+    assert "remain queued" in first_result
+    assert "remain queued" not in second_result
+
+
+@pytest.mark.asyncio
+async def test_drain_inbox_requeues_deferred_items_before_new_messages() -> None:
+    """A bounded queue remains usable and preserves order after new input."""
+    from omnigent.runner.tool_dispatch import _INBOX_DRAIN_MAX_CHARS, _drain_inbox
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    for index in range(5):
+        inbox.put_nowait(
+            {
+                "handle_id": f"usable-{index}",
+                "tool_name": "worker",
+                "status": "completed",
+                "output": "z" * 12000,
+            }
+        )
+
+    first_result = await _drain_inbox(inbox)
+    assert len(first_result) <= _INBOX_DRAIN_MAX_CHARS
+    assert inbox.qsize() == 2
+
+    inbox.put_nowait(
+        {
+            "handle_id": "usable-new",
+            "tool_name": "worker",
+            "status": "completed",
+            "output": "new",
+        }
+    )
+    second_result = await _drain_inbox(inbox)
+
+    assert inbox.qsize() == 0
+    positions = [
+        second_result.index(handle_id) for handle_id in ("usable-3", "usable-4", "usable-new")
+    ]
+    assert positions == sorted(positions)
+
+
+@pytest.mark.asyncio
+async def test_drain_inbox_returns_single_item_over_budget_and_drains_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first item is delivered even when the configured budget is smaller."""
+    from omnigent.runner import tool_dispatch
+
+    monkeypatch.setattr(tool_dispatch, "_INBOX_DRAIN_MAX_CHARS", 1)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    inbox.put_nowait(
+        {
+            "handle_id": "oversized",
+            "tool_name": "worker",
+            "status": "completed",
+            "output": "forward-progress",
+        }
+    )
+
+    result = await tool_dispatch._drain_inbox(inbox)
+
+    assert "oversized" in result
+    assert inbox.qsize() == 0
+    assert await tool_dispatch._drain_inbox(inbox) == "Inbox is empty — no completed tasks."
+
+
+@pytest.mark.asyncio
+async def test_drain_inbox_returns_small_inbox_without_remaining_line() -> None:
+    """A small inbox is returned completely without a deferral notice."""
+    from omnigent.runner.tool_dispatch import _drain_inbox, _format_async_task_item
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    payloads = [
+        {
+            "handle_id": "small-0",
+            "tool_name": "worker",
+            "status": "completed",
+            "output": "one",
+        },
+        {
+            "handle_id": "small-1",
+            "tool_name": "worker",
+            "status": "completed",
+            "output": "two",
+        },
+    ]
+    for payload in payloads:
+        inbox.put_nowait(payload)
+
+    result = await _drain_inbox(inbox)
+
+    assert result == "\n\n".join(_format_async_task_item(payload) for payload in payloads)
+    assert "remain queued" not in result
+    assert inbox.qsize() == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_inbox_empty_returns_sentinel() -> None:
+    """An empty inbox keeps the exact user-facing sentinel."""
+    from omnigent.runner.tool_dispatch import _drain_inbox
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    assert await _drain_inbox(inbox) == "Inbox is empty — no completed tasks."
+
+
 def test_list_tasks_is_not_runner_local_builtin() -> None:
     """
     ``list_tasks`` is no longer a framework builtin.

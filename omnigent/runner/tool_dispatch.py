@@ -172,6 +172,7 @@ def _string_mapping(value: object) -> dict[str, str] | None:
 
 
 _INBOX_OUTPUT_MAX_CHARS = 12000
+_INBOX_DRAIN_MAX_CHARS = 40000
 _OS_ENV_SHELL_DEFAULT_TIMEOUT_S = 120.0
 _RUNNER_EXECUTION_TIMEOUT_S = 7200.0
 _SUBAGENT_POLICY_STATUSES = frozenset({"completed", "failed"})
@@ -8219,7 +8220,8 @@ async def _drain_inbox(
     """
     Non-blocking drain of the per-session inbox queue.
 
-    Returns formatted completion payloads or "Inbox is empty."
+    Returns formatted completion payloads or "Inbox is empty." A large
+    backlog is delivered over multiple calls.
 
     :param inbox: The session's asyncio.Queue, or ``None`` if
         no queue has been created yet.
@@ -8232,6 +8234,7 @@ async def _drain_inbox(
         return "Inbox is empty — no completed tasks."
     items: list[str] = []
     retry_payloads: list[_JsonObject] = []
+    deferred_payloads: list[_JsonObject] = []
     while not inbox.empty():
         try:
             payload = inbox.get_nowait()
@@ -8239,28 +8242,64 @@ async def _drain_inbox(
             break
         if payload.get("type") == "terminal_idle":
             try:
-                items.append(_format_terminal_idle_item(payload))
+                formatted_item = _format_terminal_idle_item(payload)
             except ValueError as exc:
                 _logger.warning(
                     "malformed terminal-idle inbox item ignored: %s",
                     exc,
                     exc_info=True,
                 )
-                items.append(f"[System: malformed terminal_idle inbox item ignored — {exc}]")
-            continue
-        evaluation = await _evaluate_subagent_inbox_output(
-            payload,
-            server_client=server_client,
-            conversation_id=conversation_id,
-        )
-        items.append(_format_async_task_item(evaluation.payload))
-        if evaluation.retry_original:
+                formatted_item = f"[System: malformed terminal_idle inbox item ignored — {exc}]"
+            retry_original = False
+            evaluated_payload = payload
+        else:
+            evaluation = await _evaluate_subagent_inbox_output(
+                payload,
+                server_client=server_client,
+                conversation_id=conversation_id,
+            )
+            formatted_item = _format_async_task_item(evaluation.payload)
+            retry_original = evaluation.retry_original
+            evaluated_payload = evaluation.payload
+
+        remaining_if_returned = inbox.qsize() + len(retry_payloads) + int(retry_original)
+        candidate_items = [*items, formatted_item]
+        candidate = "\n\n".join(candidate_items)
+        if remaining_if_returned:
+            remaining_line = (
+                f"[System: {remaining_if_returned} message(s) remain queued; "
+                "call sys_read_inbox again to receive them.]"
+            )
+            candidate = f"{candidate}\n\n{remaining_line}"
+        if items and len(candidate) > _INBOX_DRAIN_MAX_CHARS:
+            deferred_payloads.append(payload)
+            break
+
+        items.append(formatted_item)
+        if retry_original:
             retry_payloads.append(payload)
         else:
-            _cleanup_drained_subagent_work(evaluation.payload)
-    for payload in retry_payloads:
+            _cleanup_drained_subagent_work(evaluated_payload)
+
+    tail: list[_JsonObject] = []
+    while not inbox.empty():
+        try:
+            tail.append(inbox.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    for payload in [*retry_payloads, *deferred_payloads, *tail]:
         inbox.put_nowait(payload)
-    return "\n\n".join(items) if items else "Inbox is empty — no completed tasks."
+
+    if not items:
+        return "Inbox is empty — no completed tasks."
+    remaining_count = inbox.qsize()
+    if remaining_count:
+        remaining_line = (
+            f"[System: {remaining_count} message(s) remain queued; "
+            "call sys_read_inbox again to receive them.]"
+        )
+        return "\n\n".join([*items, remaining_line])
+    return "\n\n".join(items)
 
 
 async def _evaluate_async_tool_call_policy(
