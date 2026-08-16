@@ -140,11 +140,20 @@ def _clean_subagent_work_registry() -> Any:
     """
     from omnigent.runner import app as runner_app
 
+    # ``_drained_delivered_subagent_children`` must be cleared too. Child ids
+    # are hardcoded and reused across this file, and a drained terminal item
+    # adds its child id to that set — after which a later test's
+    # mark_subagent_work_terminal for the SAME id returns ALREADY_DELIVERED
+    # for a delivery that never happened in that test, and
+    # _ensure_subagent_work_entry refuses to rebuild the entry. That is an
+    # order-dependent false pass.
     runner_app._subagent_work_by_child.clear()
     runner_app._subagent_work_by_parent.clear()
+    runner_app._drained_delivered_subagent_children.clear()
     yield
     runner_app._subagent_work_by_child.clear()
     runner_app._subagent_work_by_parent.clear()
+    runner_app._drained_delivered_subagent_children.clear()
 
 
 @asynccontextmanager
@@ -6491,6 +6500,45 @@ async def test_get_info_stops_at_nearest_placed_ancestor() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.asyncio
+async def test_get_info_output_carries_supports_midturn_steer() -> None:
+    """
+    The capability is asserted in the tool's ACTUAL output, not just the helper.
+
+    The tool description tells calling models to check this field before
+    counting on a correction landing promptly, so renaming or dropping the
+    key would leave the description lying — and the existing check called the
+    private helper directly, so that rename kept the suite green.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_codex":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_codex",
+                    "status": "running",
+                    "host_id": "host_a",
+                    "workspace": "/srv/a",
+                    "labels": {"omnigent.wrapper": "codex-native-ui"},
+                },
+            )
+        raise AssertionError(f"unexpected {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_info",
+                json.dumps({"session_id": "conv_codex"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["supports_midturn_steer"] is True
+
+
+@pytest.mark.asyncio
 async def test_get_info_reports_unknown_inheritance_when_an_ancestor_read_fails() -> None:
     """
     A failed ancestor lookup reports ``placement_inherited: null``, not ``false``.
@@ -6661,6 +6709,174 @@ async def test_get_info_keeps_own_placement_without_extra_lookup() -> None:
 
     assert out["host_id"] == "host_own"
     assert out["placement_inherited"] is False
+
+
+@pytest.mark.asyncio
+async def test_send_failure_releases_the_work_entry() -> None:
+    """
+    A failed message POST must release the registry entry it just took.
+
+    Without the rollback the child keeps a permanent ``launching`` entry:
+    every later send is refused as busy, and the parent's turn end publishes
+    ``waiting`` forever, because nothing else clears an entry until the
+    child's terminal item is delivered AND drained — which cannot happen for
+    a turn that never started. Deleting the rollback previously kept the
+    whole suite green.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_flaky":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_flaky",
+                    "parent_session_id": "conv_caller",
+                    "title": "researcher:auth",
+                    "sub_agent_name": "researcher",
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_flaky/events":
+            return httpx.Response(503, text="runner unavailable")
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_flaky", "args": "go"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=session_inbox,
+            )
+    finally:
+        runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    assert "failed to send message to child" in output
+    # The child must be sendable again, not wedged busy forever.
+    assert runner_app.get_subagent_work("conv_flaky") is None
+
+
+@pytest.mark.asyncio
+async def test_send_handle_work_id_is_the_one_echoed_on_the_inbox_result() -> None:
+    """
+    The id returned in the handle is the id delivered on the inbox line.
+
+    That equality IS the advertised contract ("work_id identifies this
+    dispatch and is echoed on the inbox result"). Every existing check
+    asserted the marker's SHAPE, so renaming the handle key or minting a
+    different id on delivery kept the suite green.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _format_async_task_item, execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_echo":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_echo",
+                    "parent_session_id": "conv_caller",
+                    "title": "researcher:auth",
+                    "sub_agent_name": "researcher",
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_echo/events":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            handle = json.loads(
+                await execute_tool(
+                    tool_name="sys_session_send",
+                    arguments=json.dumps({"session_id": "conv_echo", "args": "go"}),
+                    server_client=server_client,
+                    conversation_id="conv_caller",
+                    agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                    session_inbox=session_inbox,
+                )
+            )
+        runner_app.mark_subagent_work_terminal("conv_echo", status="completed", output="ANSWER")
+        delivered = session_inbox.get_nowait()
+    finally:
+        runner_app.unregister_subagent_work("conv_echo")
+        runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    assert delivered["work_id"] == handle["work_id"]
+    assert f"(dispatch {handle['work_id']})" in _format_async_task_item(delivered)
+
+
+def test_subagent_inbox_line_names_the_dispatch_on_a_failed_result() -> None:
+    """
+    A FAILED dispatch is correlated too — the case where it matters most.
+
+    Only the completed and cancelled branches were covered, so dropping the
+    marker from the failure branch went unnoticed. A parent that cannot tell
+    which of its requests failed cannot retry the right one.
+    """
+    from omnigent.runner.tool_dispatch import _format_async_task_item
+
+    line = _format_async_task_item(
+        {
+            "type": "sub_agent",
+            "work_id": "subagent_feedfacecafe",
+            "handle_id": "conv_child",
+            "agent": "researcher",
+            "title": "auth",
+            "status": "failed",
+            "output": "boom",
+        }
+    )
+
+    assert "dispatch subagent_feedfacecafe" in line
+    assert "error: boom" in line
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_rejects_the_reserved_closed_marker_in_a_title() -> None:
+    """
+    A title containing ``:closed:`` is refused instead of minting a dead child.
+
+    Closedness is derived from the title as well as the label, so such a
+    child is born closed: absent from sys_session_list and refused by
+    sys_session_send, with nothing explaining why.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    posted = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal posted
+        posted = True
+        return httpx.Response(201, json={"id": "conv_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_abc", "title": "deploy:closed:beta"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "invalid_title"
+    assert posted is False
 
 
 @pytest.mark.asyncio

@@ -62,6 +62,7 @@ from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
+    CLOSED_TITLE_INFIX,
     is_session_closed,
     title_without_closed_marker,
     tombstoned_title,
@@ -2459,6 +2460,7 @@ def _finalize_created_session(
     title: object,
     publish_event: Callable[[str, _JsonObject], None] | None,
     starts_turn: bool = False,
+    created_by: str | None = None,
 ) -> str:
     """
     Register fan-out, emit ``session.created``, and build the handle.
@@ -2507,6 +2509,10 @@ def _finalize_created_session(
             agent=agent_label,
             title=label,
             wrapper_label=_session_wrapper_label(data),
+            # Same actor attribution the send path carries. Without it the
+            # parent's wake notice for create-started work is unattributed,
+            # so a policy gate keyed on the human actor sees none.
+            created_by=created_by,
         ).work_id
     evt = SessionCreatedEvent(
         type="session.created",
@@ -2598,6 +2604,24 @@ async def _execute_session_create(
                 )
             }
         )
+    # ``:closed:`` is the internal tombstone marker, and closedness is derived
+    # from the title as well as the label. A caller-supplied title containing
+    # it would create a session that is born closed: invisible to
+    # sys_session_list and refused by sys_session_send, with no error saying
+    # why. Reject it up front rather than minting an unusable child.
+    requested_title = args.get("title")
+    if isinstance(requested_title, str) and CLOSED_TITLE_INFIX in requested_title:
+        return json.dumps(
+            {
+                "error": "invalid_title",
+                "title": requested_title,
+                "message": (
+                    f"title may not contain {CLOSED_TITLE_INFIX!r}; it is the reserved "
+                    "closed-session marker and would create a session that is "
+                    "immediately treated as closed"
+                ),
+            }
+        )
     if has_config_path:
         return await _session_create_from_config_path(
             str(config_path),
@@ -2653,6 +2677,9 @@ async def _execute_session_create(
         title=args.get("title"),
         publish_event=publish_event,
         starts_turn=bool(body.get("initial_items")),
+        created_by=await _session_turn_actor(
+            server_client=server_client, conversation_id=conversation_id
+        ),
     )
 
 
@@ -2906,6 +2933,9 @@ async def _session_create_from_config_path(
         title=args.get("title"),
         publish_event=publish_event,
         starts_turn=isinstance(message, str) and bool(message),
+        created_by=await _session_turn_actor(
+            server_client=server_client, conversation_id=conversation_id
+        ),
     )
 
 
