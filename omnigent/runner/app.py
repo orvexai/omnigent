@@ -1867,6 +1867,106 @@ _session_event_queues_ref: dict[str, asyncio.Queue[_JsonObject | None]] = {}
 # used by the sub-agent work registry to deliver completions to the parent.
 _session_inboxes_ref: dict[str, asyncio.Queue[_JsonObject]] = {}
 
+# How long a cross-runner dispatch waits for its reply before reporting a
+# typed failure. Generous: the target may be running a long turn, and a
+# false timeout costs the caller a real answer. Bounded because the
+# alternative is a permanent ``launching`` entry that wedges the target.
+_REMOTE_DISPATCH_TIMEOUT_S = 1800.0
+_REMOTE_DISPATCH_POLL_INTERVAL_S = 3.0
+
+# In-flight cross-runner pollers, keyed by target session id, so session
+# teardown can cancel them instead of leaving a task polling a session the
+# parent can no longer receive into.
+_remote_dispatch_tasks: dict[str, asyncio.Task[None]] = {}
+
+# Set by :func:`create_runner_app` so the tool dispatcher can start a
+# poll-based dispatch. ``None`` outside a live runner app (the dispatcher
+# then refuses the send rather than registering work nothing will clear).
+_remote_dispatch_start_ref: Callable[..., None] | None = None
+
+
+def _optional_str(value: object) -> str | None:
+    """
+    Return a non-empty string, or ``None``.
+
+    :param value: Any JSON-decoded value.
+    :returns: The string when non-empty, else ``None``.
+    """
+    return value if isinstance(value, str) and value else None
+
+
+def _api_item_text(item: _JsonObject) -> str:
+    """
+    Extract the plain text of an API conversation item.
+
+    :param item: One ``GET /v1/sessions/{id}/items`` row.
+    :returns: Concatenated text of its content parts; ``""`` when the item
+        carries none (a tool call, a resource event).
+    """
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "".join(parts)
+
+
+def resolve_remote_reply(
+    items: list[_JsonObject],
+    *,
+    sent_text: str,
+    our_message_id: str | None,
+) -> tuple[str | None, str]:
+    """
+    Find our own message in a peer's transcript, and the reply that follows it.
+
+    A cross-runner dispatch cannot use status to decide it is done: the target
+    is a session in its own right, so it goes ``running`` → ``idle`` for turns
+    that have nothing to do with this caller. Attributing whatever text
+    happens to be newest would hand the caller a stranger's answer under this
+    dispatch's ``work_id`` — the exact misreporting this whole surface exists
+    to prevent. So completion is anchored POSITIONALLY: only assistant text
+    that appears strictly AFTER the message we posted can be a reply to it.
+
+    :param items: Items newer than the pre-send anchor, oldest first.
+    :param sent_text: The exact text posted, used to identify our own message
+        among any that arrived concurrently.
+    :param our_message_id: Previously-resolved id of our message, or ``None``
+        to search for it in *items*.
+    :returns: ``(our_message_id, reply_text)``. ``our_message_id`` is ``None``
+        while our message has not appeared yet (the server has not ingested
+        it, so the turn cannot have started); ``reply_text`` is ``""`` when no
+        assistant text follows it yet.
+    """
+    if our_message_id is None:
+        for item in items:
+            if not isinstance(item, dict) or item.get("role") != "user":
+                continue
+            if _api_item_text(item) == sent_text:
+                our_message_id = _optional_str(item.get("id"))
+                break
+    if our_message_id is None:
+        return None, ""
+    reply = ""
+    seen_ours = False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if _optional_str(item.get("id")) == our_message_id:
+            seen_ours = True
+            continue
+        if seen_ours and item.get("role") == "assistant":
+            text = _api_item_text(item)
+            if text:
+                reply = text
+    return our_message_id, reply
+
 
 def get_session_agent_id(session_id: str) -> str | None:
     """
@@ -3503,6 +3603,14 @@ def create_runner_app(
         _subagent_wake_pending.discard(session_id)
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
+        # Cancel any cross-runner poller this session started BEFORE dropping
+        # its work entries: the poller is the only thing that clears a remote
+        # dispatch, so an orphaned one would keep polling a target whose
+        # parent inbox no longer exists.
+        for _child_id in [*_subagent_work_by_parent.get(session_id, set()), session_id]:
+            _poller = _remote_dispatch_tasks.pop(_child_id, None)
+            if _poller is not None and not _poller.done():
+                _poller.cancel()
         unregister_subagent_work_for_session(session_id)
         if filesystem_registry is not None:
             filesystem_registry.unregister_conversation(session_id)
@@ -5454,6 +5562,146 @@ def create_runner_app(
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
         return ack
+
+    async def _poll_remote_dispatch(
+        *,
+        child_session_id: str,
+        work_id: str,
+        anchor_item_id: str | None,
+        sent_text: str,
+    ) -> None:
+        """
+        Await a dispatch to a session this runner does not own, then deliver it.
+
+        Sub-agent completion normally arrives as a runtime event on the runner
+        that OWNS the child. When the target is served by a different runner,
+        no such event ever reaches this process — its inbox, work registry and
+        wake notice are all process-local — so the result would never come
+        back. This poller is the missing edge: it watches the target through
+        the server's read API (which is global) and hands the outcome to the
+        SAME delivery path a local completion would take, so ``work_id``
+        correlation, dedupe and the parent wake are identical either way.
+
+        Completion is anchored POSITIONALLY, never on status alone: a shared
+        session's status flips for turns that have nothing to do with this
+        dispatch, so a status-only rule would attribute a stranger's output to
+        this ``work_id``. The turn is only considered done once the message we
+        sent is visible in the transcript AND assistant text follows it.
+
+        :param child_session_id: Target session id, e.g. ``"conv_abc123"``.
+        :param work_id: This dispatch's id, echoed on the delivered result.
+        :param anchor_item_id: Newest item id observed BEFORE posting, or
+            ``None`` for an empty transcript. Everything after it is new.
+        :param sent_text: The exact text posted, used to find our own message
+            among items that may include another caller's.
+        :returns: None. Always terminalizes the entry — on success, on
+            failure, or on timeout — so the registry never keeps a
+            ``launching`` entry that would wedge the target as busy forever.
+        """
+        deadline = time.monotonic() + _REMOTE_DISPATCH_TIMEOUT_S
+        our_message_id: str | None = None
+        try:
+            while True:
+                entry = get_subagent_work(child_session_id)
+                if entry is None or entry.work_id != work_id:
+                    # Superseded or already drained; this poller is stale.
+                    return
+                await asyncio.sleep(_REMOTE_DISPATCH_POLL_INTERVAL_S)
+                try:
+                    items_resp = await server_client.get(
+                        f"/v1/sessions/{child_session_id}/items",
+                        params={
+                            **({"after": anchor_item_id} if anchor_item_id else {}),
+                            "order": "asc",
+                            "limit": 200,
+                        },
+                        timeout=30.0,
+                    )
+                    snap_resp = await server_client.get(
+                        f"/v1/sessions/{child_session_id}",
+                        params={"include_items": "false", "include_liveness": "false"},
+                        timeout=30.0,
+                    )
+                except Exception:  # noqa: BLE001 — a transient read retries
+                    if time.monotonic() >= deadline:
+                        break
+                    continue
+                if items_resp.status_code != 200 or snap_resp.status_code != 200:
+                    if time.monotonic() >= deadline:
+                        break
+                    continue
+                items = items_resp.json().get("data", [])
+                if not isinstance(items, list):
+                    items = []
+                our_message_id, reply = resolve_remote_reply(
+                    items, sent_text=sent_text, our_message_id=our_message_id
+                )
+                status = _optional_str(snap_resp.json().get("status"))
+                if status == "failed":
+                    _mark_subagent_terminal_and_wake(
+                        child_session_id,
+                        status="failed",
+                        output=reply or "Error: remote session turn failed",
+                    )
+                    return
+                # ``idle`` alone is not enough: the target may have been idle
+                # before our message was even ingested.
+                if status == "idle" and our_message_id is not None and reply:
+                    _mark_subagent_terminal_and_wake(
+                        child_session_id, status="completed", output=reply
+                    )
+                    return
+                if time.monotonic() >= deadline:
+                    break
+        except asyncio.CancelledError:
+            # Teardown. Release the slot so a re-created parent is not stuck.
+            unregister_subagent_work(child_session_id, work_id=work_id)
+            raise
+        finally:
+            _remote_dispatch_tasks.pop(child_session_id, None)
+        # Timed out. Report it rather than leaving a permanent launching entry
+        # that would make the target un-sendable and the parent "waiting".
+        _mark_subagent_terminal_and_wake(
+            child_session_id,
+            status="failed",
+            output=(
+                f"Error: no reply from session {child_session_id!r} within "
+                f"{_REMOTE_DISPATCH_TIMEOUT_S:.0f}s; it may still be working — "
+                "read it with sys_session_get_history"
+            ),
+        )
+
+    def _start_remote_dispatch(
+        *,
+        child_session_id: str,
+        work_id: str,
+        anchor_item_id: str | None,
+        sent_text: str,
+    ) -> None:
+        """
+        Spawn the poller for a cross-runner dispatch.
+
+        :param child_session_id: Target session id.
+        :param work_id: This dispatch's id.
+        :param anchor_item_id: Newest item id observed before posting.
+        :param sent_text: The exact text posted.
+        :returns: None.
+        """
+        task = asyncio.create_task(
+            _poll_remote_dispatch(
+                child_session_id=child_session_id,
+                work_id=work_id,
+                anchor_item_id=anchor_item_id,
+                sent_text=sent_text,
+            ),
+            name=f"remote-dispatch-{child_session_id}",
+        )
+        _remote_dispatch_tasks[child_session_id] = task
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
+    global _remote_dispatch_start_ref
+    _remote_dispatch_start_ref = _start_remote_dispatch
 
     _native_interrupt_runner = NativeInterruptRunner(
         server_client=server_client,
