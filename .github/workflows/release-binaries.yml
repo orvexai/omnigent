@@ -8,12 +8,25 @@
 # with no Python toolchain at all.
 #
 # Release flow:
-#   1. Push a tag (v*) -> build and smoke the Linux binary, then publish a
-#      draft GitHub Release with its archive + SHA256SUMS attached.
+#   1. Push an `orvex-vN` tag -> build and smoke the Linux binary, then publish
+#      a draft GitHub Release with its archives, wheels + SHA256SUMS attached.
 #   2. Review the draft, then publish it by hand.
 #   Manual `workflow_dispatch` builds and uploads the Linux artifact WITHOUT
 #   touching Releases. Set `build_other_platforms` to also exercise the
 #   Windows and macOS packaging legs on their platform runners.
+#
+# Versioning: this fork does not own the version in `pyproject.toml` — that is
+# upstream's, and it moves under us on every rebase. Releases are numbered by
+# an orvex serial N carried in the tag, and stamped at BUILD TIME as
+# `<upstream base>+orvex.N` (a PEP 440 local segment). Nothing is committed, so
+# the stamp can never conflict with an upstream merge, and the version still
+# records which upstream line it was cut from. Serials sort ahead of a bare
+# upstream version and ahead of each other, so upgrades resolve correctly.
+#
+# The tag namespace is ours on purpose. Upstream owns 40-odd `v*` tags; a
+# single `git push origin --tags` after a sync would otherwise fire this
+# workflow once per upstream tag, and any tag reachable from mcp would pass
+# the ref guard and publish a bogus release.
 #
 # The SPA is built by setup.py during `pip install .` (it is skipped only when
 # OMNIGENT_SKIP_WEB_UI=true), so every platform sets up Node + pnpm and the
@@ -23,7 +36,7 @@ name: Release binaries (Linux/Windows/macOS)
 on:
   push:
     tags:
-      - "v*"
+      - "orvex-v*"
   workflow_dispatch:
     inputs:
       skip_web_ui:
@@ -79,14 +92,33 @@ jobs:
           fi
           # A tag is allowed only when the commit it names is on mcp, so a tag
           # cut from another branch cannot smuggle a build through.
-          if [ "${REF#refs/tags/v}" != "$REF" ]; then
-            git fetch --quiet origin mcp
-            if git merge-base --is-ancestor "$SHA" origin/mcp; then
-              echo "tag $REF is reachable from mcp"
-              exit 0
+          serial="${REF#refs/tags/orvex-v}"
+          if [ "$serial" != "$REF" ]; then
+            if ! [[ "$serial" =~ ^[0-9]+$ ]]; then
+              echo "::error::Tag $REF is malformed. Release tags are orvex-vN, e.g. orvex-v3."
+              exit 1
             fi
-            echo "::error::Tag $REF names $SHA, which is not on mcp. Binaries ship from mcp only."
-            exit 1
+            git fetch --quiet origin mcp
+            if ! git merge-base --is-ancestor "$SHA" origin/mcp; then
+              echo "::error::Tag $REF names $SHA, which is not on mcp. Binaries ship from mcp only."
+              exit 1
+            fi
+            # Serials must only ever climb: a reused or lowered one would
+            # publish a release that resolves as older than what is installed,
+            # so an upgrade would silently decline to move.
+            highest=0
+            for existing in $(git tag --list 'orvex-v[0-9]*'); do
+              n="${existing#orvex-v}"
+              [[ "$n" =~ ^[0-9]+$ ]] || continue
+              [ "$n" = "$serial" ] && continue
+              [ "$n" -gt "$highest" ] && highest="$n"
+            done
+            if [ "$serial" -le "$highest" ]; then
+              echo "::error::orvex-v$serial does not exceed the highest existing serial (orvex-v$highest). Tag orvex-v$((highest + 1))."
+              exit 1
+            fi
+            echo "tag $REF is reachable from mcp; serial $serial > $highest"
+            exit 0
           fi
           echo "::error::$REF is not mcp. Binaries ship from mcp only; re-run this workflow on mcp."
           exit 1
@@ -123,6 +155,20 @@ jobs:
         with:
           version: 11.15.1
           standalone: true
+
+      # Stamp the orvex release serial into the lockstep version before the
+      # build reads it. Deliberately not committed: pyproject's version is
+      # upstream's, so an in-tree edit would conflict on every rebase.
+      - name: Stamp the orvex release version
+        if: startsWith(github.ref, 'refs/tags/orvex-v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          serial="${GITHUB_REF#refs/tags/orvex-v}"
+          base="$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          python -m pip install --quiet packaging
+          python scripts/update_versions.py pre-release --new-version "${base}+orvex.${serial}"
+          echo "stamped ${base}+orvex.${serial}"
 
       - name: Install omnigent + PyInstaller
         shell: bash
@@ -341,6 +387,20 @@ jobs:
           version: 11.15.1
           standalone: true
 
+      # Stamp the orvex release serial into the lockstep version before the
+      # build reads it. Deliberately not committed: pyproject's version is
+      # upstream's, so an in-tree edit would conflict on every rebase.
+      - name: Stamp the orvex release version
+        if: startsWith(github.ref, 'refs/tags/orvex-v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          serial="${GITHUB_REF#refs/tags/orvex-v}"
+          base="$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          python -m pip install --quiet packaging
+          python scripts/update_versions.py pre-release --new-version "${base}+orvex.${serial}"
+          echo "stamped ${base}+orvex.${serial}"
+
       - name: Install omnigent + PyInstaller
         shell: bash
         env:
@@ -478,7 +538,7 @@ jobs:
   publish:
     # Tag pushes only: a manual run leaves the artifacts on the run and never
     # creates or mutates a Release.
-    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'orvexai/omnigent'
+    if: startsWith(github.ref, 'refs/tags/orvex-v') && github.repository == 'orvexai/omnigent'
     needs: build-linux
     runs-on: public-runners
     timeout-minutes: 15
