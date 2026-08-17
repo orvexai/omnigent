@@ -8,25 +8,30 @@
 # with no Python toolchain at all.
 #
 # Release flow:
-#   1. Push an `orvex-vN` tag -> build and smoke the Linux binary, then publish
-#      a draft GitHub Release with its archives, wheels + SHA256SUMS attached.
+#   1. Push an `orvex-vX.Y.Z` tag -> build and smoke the Linux binary, then
+#      publish a draft GitHub Release with its archives, wheels + SHA256SUMS.
 #   2. Review the draft, then publish it by hand.
 #   Manual `workflow_dispatch` builds and uploads the Linux artifact WITHOUT
 #   touching Releases. Set `build_other_platforms` to also exercise the
 #   Windows and macOS packaging legs on their platform runners.
 #
-# Versioning: this fork does not own the version in `pyproject.toml` — that is
-# upstream's, and it moves under us on every rebase. Releases are numbered by
-# an orvex serial N carried in the tag, and stamped at BUILD TIME as
-# `<upstream base>+orvex.N` (a PEP 440 local segment). Nothing is committed, so
-# the stamp can never conflict with an upstream merge, and the version still
-# records which upstream line it was cut from. Serials sort ahead of a bare
-# upstream version and ahead of each other, so upgrades resolve correctly.
+# Versioning: this fork numbers its own releases. The version in
+# `pyproject.toml` is upstream's — it identifies the line we rebased onto, not
+# any build we control, and it moves under us on the next rebase. The release
+# version is whatever the tag says, stamped at BUILD TIME and never committed,
+# so it can't conflict with an upstream merge. Which upstream commit a release
+# was cut from stays recoverable: the tag names it, and `omnigent --version`
+# prints it from the build-info stamp.
+#
+# Tags are `orvex-vX.Y.Z` — plain finals, not upstream's `X.Y.Z.dev0`. A
+# `.dev` version is a PEP 440 PRE-release that resolvers skip without --pre,
+# so shipping releases spelled that way would be wrong.
 #
 # The tag namespace is ours on purpose. Upstream owns 40-odd `v*` tags; a
 # single `git push origin --tags` after a sync would otherwise fire this
 # workflow once per upstream tag, and any tag reachable from mcp would pass
-# the ref guard and publish a bogus release.
+# the ref guard and publish a bogus release. It also leaves `v0.10.0` free
+# for upstream while `orvex-v0.10.0` stays unambiguously ours.
 #
 # The SPA is built by setup.py during `pip install .` (it is skipped only when
 # OMNIGENT_SKIP_WEB_UI=true), so every platform sets up Node + pnpm and the
@@ -92,10 +97,12 @@ jobs:
           fi
           # A tag is allowed only when the commit it names is on mcp, so a tag
           # cut from another branch cannot smuggle a build through.
-          serial="${REF#refs/tags/orvex-v}"
-          if [ "$serial" != "$REF" ]; then
-            if ! [[ "$serial" =~ ^[0-9]+$ ]]; then
-              echo "::error::Tag $REF is malformed. Release tags are orvex-vN, e.g. orvex-v3."
+          version="${REF#refs/tags/orvex-v}"
+          if [ "$version" != "$REF" ]; then
+            # Finals only. A `.dev`/`rc` spelling is a PEP 440 pre-release that
+            # resolvers skip without --pre, so it must not reach a release.
+            if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Tag $REF is malformed. Release tags are orvex-vX.Y.Z, e.g. orvex-v0.10.1."
               exit 1
             fi
             git fetch --quiet origin mcp
@@ -103,21 +110,23 @@ jobs:
               echo "::error::Tag $REF names $SHA, which is not on mcp. Binaries ship from mcp only."
               exit 1
             fi
-            # Serials must only ever climb: a reused or lowered one would
+            # Versions must only ever climb: a reused or lowered one would
             # publish a release that resolves as older than what is installed,
             # so an upgrade would silently decline to move.
-            highest=0
-            for existing in $(git tag --list 'orvex-v[0-9]*'); do
-              n="${existing#orvex-v}"
-              [[ "$n" =~ ^[0-9]+$ ]] || continue
-              [ "$n" = "$serial" ] && continue
-              [ "$n" -gt "$highest" ] && highest="$n"
-            done
-            if [ "$serial" -le "$highest" ]; then
-              echo "::error::orvex-v$serial does not exceed the highest existing serial (orvex-v$highest). Tag orvex-v$((highest + 1))."
+            # `|| highest=` because both greps exit non-zero when they match
+            # nothing — the first release, and a re-push of the newest tag,
+            # are exactly those cases, and pipefail would abort the guard.
+            highest="$(git tag --list 'orvex-v*' \
+              | sed 's/^orvex-v//' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | grep -vx "$version" \
+              | sort -V | tail -1)" || highest=""
+            if [ -n "$highest" ] \
+              && [ "$(printf '%s\n%s\n' "$version" "$highest" | sort -V | tail -1)" != "$version" ]; then
+              echo "::error::orvex-v$version does not exceed the highest existing release (orvex-v$highest)."
               exit 1
             fi
-            echo "tag $REF is reachable from mcp; serial $serial > $highest"
+            echo "tag $REF is reachable from mcp; version $version > ${highest:-none}"
             exit 0
           fi
           echo "::error::$REF is not mcp. Binaries ship from mcp only; re-run this workflow on mcp."
@@ -156,19 +165,18 @@ jobs:
           version: 11.15.1
           standalone: true
 
-      # Stamp the orvex release serial into the lockstep version before the
-      # build reads it. Deliberately not committed: pyproject's version is
+      # The tag names the release version; stamp it across the lockstep before
+      # the build reads it. Deliberately not committed: pyproject's version is
       # upstream's, so an in-tree edit would conflict on every rebase.
       - name: Stamp the orvex release version
         if: startsWith(github.ref, 'refs/tags/orvex-v')
         shell: bash
         run: |
           set -euo pipefail
-          serial="${GITHUB_REF#refs/tags/orvex-v}"
-          base="$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          version="${GITHUB_REF#refs/tags/orvex-v}"
           python -m pip install --quiet packaging
-          python scripts/update_versions.py pre-release --new-version "${base}+orvex.${serial}"
-          echo "stamped ${base}+orvex.${serial}"
+          python scripts/update_versions.py pre-release --new-version "$version"
+          echo "stamped $version (upstream base was $(git show HEAD:pyproject.toml | grep -m1 '^version'))"
 
       - name: Install omnigent + PyInstaller
         shell: bash
@@ -387,19 +395,18 @@ jobs:
           version: 11.15.1
           standalone: true
 
-      # Stamp the orvex release serial into the lockstep version before the
-      # build reads it. Deliberately not committed: pyproject's version is
+      # The tag names the release version; stamp it across the lockstep before
+      # the build reads it. Deliberately not committed: pyproject's version is
       # upstream's, so an in-tree edit would conflict on every rebase.
       - name: Stamp the orvex release version
         if: startsWith(github.ref, 'refs/tags/orvex-v')
         shell: bash
         run: |
           set -euo pipefail
-          serial="${GITHUB_REF#refs/tags/orvex-v}"
-          base="$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          version="${GITHUB_REF#refs/tags/orvex-v}"
           python -m pip install --quiet packaging
-          python scripts/update_versions.py pre-release --new-version "${base}+orvex.${serial}"
-          echo "stamped ${base}+orvex.${serial}"
+          python scripts/update_versions.py pre-release --new-version "$version"
+          echo "stamped $version (upstream base was $(git show HEAD:pyproject.toml | grep -m1 '^version'))"
 
       - name: Install omnigent + PyInstaller
         shell: bash
