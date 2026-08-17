@@ -253,6 +253,48 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+      # Wheels ride along with the binary so the installer can pin a released
+      # version instead of building from a moving branch. Built here rather
+      # than in their own job because this one already has Node + pnpm and has
+      # just built the SPA into the tree, so packaging is nearly free.
+      - name: Build wheels
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The two SDK siblings are pinned `==` as path deps, so they must be
+          # built alongside or the app wheel cannot resolve them at install.
+          python -m pip wheel --no-deps --wheel-dir wheels \
+            ./sdks/python-client ./sdks/ui .
+          ls -la wheels
+
+      # A wheel missing the SPA still installs and still exits 0, and the loss
+      # only shows as an API-only page on the user's first `omnigent server`.
+      - name: Assert the web UI shipped in the wheel
+        if: ${{ !(inputs.skip_web_ui) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob
+          import sys
+          import zipfile
+
+          matches = glob.glob("wheels/omnigent-*.whl")
+          if not matches:
+              sys.exit("no omnigent wheel was produced")
+          with zipfile.ZipFile(matches[0]) as wheel:
+              bundled = [n for n in wheel.namelist() if "server/static/web-ui/" in n]
+          if not bundled:
+              sys.exit(f"{matches[0]} contains no web-ui bundle")
+          print(f"{matches[0]}: {len(bundled)} web-ui entries")
+          PY
+
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: omnigent-wheels
+          path: wheels/*.whl
+          if-no-files-found: error
+
   build-other-platforms:
     # Platform-specific runners are intentionally opt-in because the default
     # org runner is Linux. These legs are independent from the Linux build.
@@ -443,6 +485,11 @@ jobs:
     permissions:
       contents: write # create the release + upload assets
     steps:
+      # setup-python reads .python-version from the workspace, so the checkout
+      # is load-bearing here, not incidental — without it this job fails before
+      # it can assemble anything.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
       - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version-file: .python-version
@@ -461,9 +508,12 @@ jobs:
 
           out = Path("out")
           out.mkdir()
+          # Wheels ship beside the platform archives: the installer resolves a
+          # pinned release from them rather than building from a branch.
           artifacts = sorted(
               path for path in Path("dl").rglob("*")
-              if path.is_file() and (path.name.endswith(".tar.gz") or path.suffix == ".zip")
+              if path.is_file()
+              and (path.name.endswith(".tar.gz") or path.suffix in {".zip", ".whl"})
           )
           for artifact in artifacts:
               shutil.move(str(artifact), out / artifact.name)
