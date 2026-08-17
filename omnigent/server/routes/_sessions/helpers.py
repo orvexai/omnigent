@@ -143,6 +143,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_UI_LABEL_KEY,
     _CLAUDE_NATIVE_UI_LABEL_VALUE,
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_HARNESS,
@@ -3266,6 +3267,20 @@ def _is_codex_native_subagent(conv: Conversation) -> bool:
         and conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
         == _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE
     )
+
+
+def _is_claude_native_subagent(conv: Conversation) -> bool:
+    """
+    Return whether a child conversation tracks a Claude-native sub-agent.
+
+    :param conv: Conversation row to inspect.
+    :returns: ``True`` when the row carries a Claude-native sub-agent
+        wrapper label.
+    """
+    return conv.kind == "sub_agent" and conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) in {
+        _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+        _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+    }
 
 
 def _background_task_delivery_status(
@@ -9482,6 +9497,7 @@ __all__ = [
     "_host_model_options_via_registry",
     "_if_none_match_matches",
     "_invalidate_runner_backed_snapshot_state",
+    "_is_claude_native_subagent",
     "_is_codex_native_subagent",
     "_is_kiro_native_session",
     "_last_task_error_from_labels",

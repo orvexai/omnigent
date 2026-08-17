@@ -3704,6 +3704,534 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
     ]
 
 
+async def test_claude_native_subagent_idle_without_assistant_text_is_deferred(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defer a claude-native child idle edge until its transcript is mirrored."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient:
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+        parent = await _create_session(client, agent["id"])
+        child_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "sub_agent_name": "worker",
+                "title": "worker:native",
+                "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+            },
+        )
+        assert child_resp.status_code == 201, child_resp.text
+        child = child_resp.json()
+
+        forwarded.clear()
+        status_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_resp.status_code == 409, status_resp.text
+    assert status_resp.json()["error"]["code"] == "conflict"
+    assert forwarded == []
+
+
+@pytest.fixture(autouse=True)
+def _reset_claude_native_subagent_idle_deferrals() -> Any:
+    """Keep process-global idle deferral counts isolated between tests."""
+    from omnigent.server.routes._sessions import common as common_module
+
+    common_module._claude_native_subagent_idle_deferrals.clear()
+    common_module._claude_native_subagent_idle_deferral_capacity_logged = False
+    yield
+    common_module._claude_native_subagent_idle_deferrals.clear()
+    common_module._claude_native_subagent_idle_deferral_capacity_logged = False
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _install_claude_native_idle_deferral_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _FakeClock,
+    *,
+    ttl: int,
+) -> Any:
+    import cachetools
+
+    import omnigent.server.routes._sessions.common as common_module
+    import omnigent.server.routes._sessions.orchestration as orchestration_module
+
+    test_cache = cachetools.TTLCache(maxsize=512, ttl=ttl, timer=clock)
+    monkeypatch.setattr(common_module, "_claude_native_subagent_idle_deferrals", test_cache)
+    monkeypatch.setattr(orchestration_module, "_claude_native_subagent_idle_deferrals", test_cache)
+    return test_cache
+
+
+async def _create_external_status_forwarding_context(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    wrapper: str,
+    top_level: bool = False,
+) -> tuple[httpx.AsyncClient, list[dict[str, Any]], dict[str, Any]]:
+    """Create a session and capture its external status runner forwards.
+
+    :param client: The test HTTP client.
+    :param monkeypatch: Test monkeypatch manager.
+    :param wrapper: Wrapper label to put on the session.
+    :param top_level: Whether to create a default session instead of a child.
+    :returns: Fake runner, captured request bodies, and the session JSON.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient:
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+    payload: dict[str, Any] = {
+        "agent_id": agent["id"],
+        "title": "worker:native",
+        "labels": {"omnigent.wrapper": wrapper},
+    }
+    if not top_level:
+        parent = await _create_session(client, agent["id"])
+        payload.update(
+            {
+                "parent_session_id": parent["id"],
+                "sub_agent_name": "worker",
+            }
+        )
+    child_resp = await client.post("/v1/sessions", json=payload)
+    assert child_resp.status_code == 201, child_resp.text
+    forwarded.clear()
+    return fake_runner, forwarded, child_resp.json()
+
+
+async def test_claude_native_subagent_idle_retries_after_assistant_item(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retried idle edge carries text mirrored after the first rejection."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui",
+    )
+    status_payload = {
+        "type": "external_session_status",
+        "data": {"status": "idle", "response_id": "resp_t2"},
+    }
+    try:
+        first_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json=status_payload,
+        )
+        assert first_resp.status_code == 409, first_resp.text
+
+        item_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "response_id": "resp_t2",
+                    "source_id": "src_t2",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": "claude-native-ui",
+                        "content": [{"type": "output_text", "text": "T2_OUTPUT"}],
+                    },
+                },
+            },
+        )
+        assert item_resp.status_code == 202, item_resp.text
+
+        second_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json=status_payload,
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert second_resp.status_code == 202, second_resp.text
+    assert forwarded[0]["data"] == {
+        "status": "idle",
+        "response_id": "resp_t2",
+        "output": "T2_OUTPUT",
+    }
+
+
+async def test_claude_native_subagent_idle_deferral_is_bounded(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty child eventually forwards after the deferral budget."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    status_payload = {
+        "type": "external_session_status",
+        "data": {"status": "idle", "response_id": "resp_t3"},
+    }
+    try:
+        responses = []
+        for _ in range(2):
+            response = await client.post(
+                f"/v1/sessions/{child['id']}/events",
+                json=status_payload,
+            )
+            responses.append(response)
+            assert response.status_code == 409, response.text
+            assert forwarded == []
+        final_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json=status_payload,
+        )
+        responses.append(final_response)
+        assert final_response.status_code == 202, final_response.text
+        assert len(forwarded) == 1
+    finally:
+        await fake_runner.aclose()
+
+    assert [response.status_code for response in responses] == [409, 409, 202]
+    assert forwarded[0]["data"] == {
+        "status": "idle",
+        "response_id": "resp_t3",
+    }
+
+
+async def test_claude_native_subagent_idle_capacity_pressure_fails_open(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A full deferral cache forwards without evicting live state and warns once."""
+    import logging
+
+    from omnigent.server.routes._sessions import common as common_module
+
+    caplog.set_level(logging.WARNING, logger="omnigent.server.routes.sessions")
+    _claude_native_subagent_idle_deferrals = common_module._claude_native_subagent_idle_deferrals
+
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    active_key = "active-session"
+    _claude_native_subagent_idle_deferrals[active_key] = 1
+    for index in range(_claude_native_subagent_idle_deferrals.maxsize - 1):
+        _claude_native_subagent_idle_deferrals[f"filler-session-{index}"] = 1
+
+    assert len(_claude_native_subagent_idle_deferrals) == (
+        _claude_native_subagent_idle_deferrals.maxsize
+    )
+    status_payload = {
+        "type": "external_session_status",
+        "data": {"status": "idle"},
+    }
+    try:
+        for _ in range(3):
+            status_resp = await client.post(
+                f"/v1/sessions/{child['id']}/events",
+                json=status_payload,
+            )
+            assert status_resp.status_code == 202, status_resp.text
+        warnings = [
+            record
+            for record in caplog.records
+            if record.name == "omnigent.server.routes.sessions"
+            and record.levelno == logging.WARNING
+            and "idle deferral is inactive" in record.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert child["id"] not in warnings[0].getMessage()
+
+        _claude_native_subagent_idle_deferrals.pop("filler-session-0")
+        rearm_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json=status_payload,
+        )
+        assert rearm_response.status_code == 409, rearm_response.text
+        assert common_module._claude_native_subagent_idle_deferral_capacity_logged is False
+        assert _claude_native_subagent_idle_deferrals[child["id"]] == 1
+
+        _claude_native_subagent_idle_deferrals.pop(child["id"])
+        _claude_native_subagent_idle_deferrals["replacement-session"] = 1
+        warning_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json=status_payload,
+        )
+        assert warning_response.status_code == 202, warning_response.text
+        warnings = [
+            record
+            for record in caplog.records
+            if record.name == "omnigent.server.routes.sessions"
+            and record.levelno == logging.WARNING
+            and "idle deferral is inactive" in record.getMessage()
+        ]
+        assert len(warnings) == 2
+        assert all(child["id"] not in record.getMessage() for record in warnings)
+    finally:
+        await fake_runner.aclose()
+
+    assert len(forwarded) == 4
+    assert all(body["data"] == {"status": "idle"} for body in forwarded)
+    assert _claude_native_subagent_idle_deferrals[active_key] == 1
+
+
+async def test_claude_native_subagent_idle_deferral_survives_supported_stall(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deferral budget survives the supported worst-case retry gap."""
+    from omnigent.server.routes._sessions.common import (
+        _CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRAL_TTL_S,
+        _claude_native_subagent_idle_deferrals,
+    )
+
+    # 660 s covers two 300 s stalls, 30 s retry backoff, and 30 s supervisor backoff.
+    assert _CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRAL_TTL_S > 660
+    assert (
+        _claude_native_subagent_idle_deferrals.ttl == _CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRAL_TTL_S
+    )
+    clock = _FakeClock()
+    _install_claude_native_idle_deferral_cache(
+        monkeypatch, clock, ttl=_CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRAL_TTL_S
+    )
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    status_payload = {
+        "type": "external_session_status",
+        "data": {"status": "idle", "response_id": "stall"},
+    }
+    try:
+        responses = []
+        for _ in range(2):
+            response = await client.post(
+                f"/v1/sessions/{child['id']}/events",
+                json=status_payload,
+            )
+            responses.append(response)
+            assert response.status_code == 409, response.text
+            assert forwarded == []
+        clock.advance(660)
+        final_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json=status_payload,
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert [response.status_code for response in responses] == [409, 409]
+    assert final_response.status_code == 202, final_response.text
+    assert len(forwarded) == 1
+
+
+async def test_claude_native_subagent_idle_deferral_restarts_after_ttl_expiry(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired budget restarts but still forwards after bounded retries."""
+    clock = _FakeClock()
+    _install_claude_native_idle_deferral_cache(monkeypatch, clock, ttl=10)
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    status_payload = {
+        "type": "external_session_status",
+        "data": {"status": "idle", "response_id": "expired"},
+    }
+    try:
+        responses = []
+        for _ in range(2):
+            response = await client.post(
+                f"/v1/sessions/{child['id']}/events",
+                json=status_payload,
+            )
+            responses.append(response)
+            assert response.status_code == 409, response.text
+            assert forwarded == []
+        clock.advance(11)
+        for _ in range(3):
+            response = await client.post(
+                f"/v1/sessions/{child['id']}/events",
+                json=status_payload,
+            )
+            responses.append(response)
+    finally:
+        await fake_runner.aclose()
+
+    assert [response.status_code for response in responses] == [409, 409, 409, 409, 202]
+    assert len(forwarded) == 1
+
+
+async def test_claude_native_subagent_idle_deferral_rearms_for_next_turn(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed empty turn gives the next empty turn its own budget."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    try:
+        responses = []
+        for response_id in ("turn-1", "turn-2"):
+            status_payload = {
+                "type": "external_session_status",
+                "data": {"status": "idle", "response_id": response_id},
+            }
+            for _ in range(2):
+                response = await client.post(
+                    f"/v1/sessions/{child['id']}/events",
+                    json=status_payload,
+                )
+                responses.append(response)
+                assert response.status_code == 409, response.text
+            final_response = await client.post(
+                f"/v1/sessions/{child['id']}/events",
+                json=status_payload,
+            )
+            responses.append(final_response)
+            assert final_response.status_code == 202, final_response.text
+    finally:
+        await fake_runner.aclose()
+
+    assert [response.status_code for response in responses] == [
+        409,
+        409,
+        202,
+        409,
+        409,
+        202,
+    ]
+    assert len(forwarded) == 2
+
+
+async def test_top_level_claude_native_idle_without_assistant_text_forwards(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Top-level Claude-native idle edges do not use sub-agent deferral."""
+    fake_runner, forwarded, session = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui",
+        top_level=True,
+    )
+    try:
+        status_resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_resp.status_code == 202, status_resp.text
+    assert forwarded[0]["data"] == {"status": "idle"}
+
+
+async def test_codex_native_subagent_idle_without_assistant_text_forwards(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex-native child idle edges remain immediate and empty when needed."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="codex-native-ui-subagent",
+    )
+    try:
+        status_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_resp.status_code == 202, status_resp.text
+    assert forwarded[0]["data"] == {"status": "idle"}
+
+
+async def test_claude_native_subagent_failed_status_is_not_deferred(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed Claude-native child edges remain immediate and empty when needed."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    try:
+        status_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "failed"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_resp.status_code == 202, status_resp.text
+    assert forwarded[0]["data"] == {"status": "failed"}
+
+
 async def test_post_external_session_status_propagates_runner_delivery_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
