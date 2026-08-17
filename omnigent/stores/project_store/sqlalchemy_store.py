@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import asc, select
+from sqlalchemy import asc, or_, select
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlProject, current_workspace_id
@@ -79,6 +79,7 @@ def _to_entity(row: SqlProject) -> Project:
         created_at=row.created_at,
         updated_at=row.updated_at,
         config=_decode_config(row.config),
+        shared=bool(row.shared),
     )
 
 
@@ -87,8 +88,14 @@ class SqlAlchemyProjectStore(ProjectStore):
     SQLAlchemy-backed implementation of :class:`ProjectStore`.
 
     Persists projects in a relational database via the SQLAlchemy ORM. Every
-    query is scoped by ``workspace_id`` (tenant partition) and ``user_id``
-    (projects are owner-private).
+    query is scoped by ``workspace_id`` (tenant partition). Writes are
+    additionally scoped by ``user_id`` (projects are owner-private); reads are
+    too, except that an Orvex ``shared`` row also resolves for a non-owner.
+
+    Note the ownership checks are not uniform: ``list`` filters in SQL, while
+    ``get`` / ``update`` / ``delete`` fetch by primary key and compare in
+    Python. The share flag is applied in whichever style each site already
+    uses, so the diff against upstream stays a one-line predicate per site.
     """
 
     def __init__(self, storage_location: str) -> None:
@@ -144,6 +151,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         name: str,
         user_id: str | None,
         config: dict[str, Any] | None = None,
+        shared: bool = False,
     ) -> Project:
         """Insert a new, empty project.
 
@@ -165,26 +173,48 @@ class SqlAlchemyProjectStore(ProjectStore):
                 created_at=now_epoch(),
                 updated_at=None,
                 config=_encode_config(config),
+                shared=shared,
             )
             session.add(row)
             session.flush()
             return _to_entity(row)
 
     def get(self, project_id: str, *, user_id: str | None) -> Project | None:
-        """Return an owned project by id, or ``None`` if not found."""
+        """Return a readable project by id, or ``None`` if not found.
+
+        Orvex: readable means owned **or** shared. Opening this one method is
+        what lets a non-owner file a session into a shared project
+        (``PATCH /v1/sessions/{id}``) and keeps a fork of a shared session
+        filed where it was — both of those validate through ``get`` rather
+        than carrying an ownership check of their own.
+        """
         with self._session("select_project_by_id") as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
-            if row is None or row.user_id != user_id:
+            if row is None or (row.user_id != user_id and not row.shared):
                 return None
             return _to_entity(row)
 
     def list(self, *, user_id: str | None) -> list[Project]:
-        """List the owner's projects ordered by ``created_at ASC, id ASC``."""
+        """List the projects readable by ``user_id`` (``created_at ASC, id ASC``).
+
+        Orvex: the caller's own rows **OR** any shared row. This is the site
+        whose omission is invisible under most testing — a service principal
+        that owns every orchestrator-created project still sees them all
+        through the owner half of this predicate, so sharing looks to work
+        while it is broken for every ordinary user. It also feeds the sidebar
+        folder list and the ``?project=<name>`` resolution, so reverting it
+        alone silently un-shares everything.
+        """
         with self._session("list_projects") as session:
             stmt = (
                 select(SqlProject)
                 .where(SqlProject.workspace_id == current_workspace_id())
-                .where(SqlProject.user_id == user_id)
+                .where(
+                    or_(
+                        SqlProject.user_id == user_id,
+                        SqlProject.shared.is_(True),
+                    )
+                )
                 .order_by(asc(SqlProject.created_at), asc(SqlProject.id))
             )
             rows = session.execute(stmt).scalars().all()
@@ -197,6 +227,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         user_id: str | None,
         name: str | None = None,
         config: dict[str, Any] | None = None,
+        shared: bool | None = None,
     ) -> Project | None:
         """Update mutable fields of an owned project.
 
@@ -207,6 +238,11 @@ class SqlAlchemyProjectStore(ProjectStore):
         A rename re-checks ``_name_taken``, which — as on ``create`` — is the
         only uniqueness guard, so concurrent renames to the same name can both
         land.
+
+        **Orvex: deliberately unchanged owner scoping.** The ownership check
+        below stays exactly as upstream wrote it — a shared project is
+        readable by non-owners but writable only by its owner, and that
+        includes flipping ``shared`` itself. Setting the flag is a write.
         """
         with self._session("update_project") as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
@@ -226,13 +262,21 @@ class SqlAlchemyProjectStore(ProjectStore):
                 if row.config != encoded:
                     row.config = encoded
                     changed = True
+            if shared is not None and bool(row.shared) != shared:
+                row.shared = shared
+                changed = True
             if changed:
                 row.updated_at = now_epoch()
             session.flush()
             return _to_entity(row)
 
     def delete(self, project_id: str, *, user_id: str | None) -> bool:
-        """Delete an owned project. Idempotent; returns ``False`` if not found."""
+        """Delete an owned project. Idempotent; returns ``False`` if not found.
+
+        **Orvex: deliberately unchanged owner scoping.** Sharing opens reads,
+        never writes — a reader of a shared project cannot delete it, and gets
+        the same ``False`` (404 at the route) upstream gives them.
+        """
         with self._session("delete_project") as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
             if row is None or row.user_id != user_id:

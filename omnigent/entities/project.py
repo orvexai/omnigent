@@ -32,6 +32,12 @@ class Project:
         empty dict when none are stored. The key vocabulary is owned by the
         client; the store persists and returns it whole. These are hints the
         new-chat dialog pre-fills, not enforced requirements.
+    :param shared: **Orvex divergence.** When ``True``, non-owners may read the
+        project — it appears in their sidebar and project list, ``get``
+        resolves for them, they may file a session into it, and the
+        per-project session query scopes by *access* instead of ownership.
+        Writes (rename/config/delete) stay owner-only regardless. ``False``
+        (the default) is upstream's owner-private project, byte for byte.
     """
 
     id: str
@@ -40,3 +46,4 @@ class Project:
     created_at: int
     updated_at: int | None = None
     config: dict[str, Any] = field(default_factory=dict)
+    shared: bool = False

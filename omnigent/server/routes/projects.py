@@ -7,9 +7,15 @@ projects, list them, rename them, and delete them. Session membership
 conversation store's ``project_id``.
 
 Because projects are owner-private and carry no ACL of their own, every handler
-scopes to the requesting user: a caller only ever sees and mutates their own
-projects. In single-user mode (no auth provider) the owner is ``None`` and all
-projects share that scope.
+scopes to the requesting user: a caller only ever mutates their own projects.
+In single-user mode (no auth provider) the owner is ``None`` and all projects
+share that scope.
+
+**Orvex divergence.** A project may be marked ``shared``, which widens the two
+*read* handlers (``GET /projects`` and ``GET /projects/{id}``) to non-owners.
+The store enforces that; nothing here changes. ``PATCH`` and ``DELETE`` remain
+owner-only, and ``shared`` is itself a PATCH-able field, so only the owner can
+share or un-share.
 """
 
 from __future__ import annotations
@@ -44,6 +50,7 @@ def _to_response(project: Project) -> dict[str, Any]:
         "created_at": project.created_at,
         "updated_at": project.updated_at,
         "config": project.config,
+        "shared": project.shared,
     }
 
 
@@ -80,12 +87,15 @@ def create_projects_router(
             body.name,
             user_id,
             body.config,
+            body.shared,
         )
         return _to_response(project)
 
     @router.get("/projects")
     async def list_projects(request: Request) -> dict[str, Any]:
-        """List the caller's projects.
+        """List the projects the caller can read.
+
+        Orvex: that is the caller's own projects plus every shared one.
 
         :param request: The incoming request, used to identify the user.
         :returns: ``{"object": "list", "data": [...]}``.
@@ -97,7 +107,7 @@ def create_projects_router(
 
     @router.get("/projects/{project_id}")
     async def get_project(request: Request, project_id: str) -> dict[str, Any]:
-        """Return one of the caller's projects.
+        """Return a project the caller can read (their own, or a shared one).
 
         :param request: The incoming request, used to identify the user.
         :param project_id: The project to fetch.
@@ -117,7 +127,11 @@ def create_projects_router(
         project_id: str,
         body: UpdateProjectRequest,
     ) -> dict[str, Any]:
-        """Update one of the caller's projects (e.g. rename).
+        """Update one of the caller's OWN projects (e.g. rename, or share it).
+
+        Owner-only including for a shared project: reading a shared project
+        never confers the right to rename, reconfigure or un-share it, and a
+        non-owner gets the same 404 upstream gives them.
 
         :param request: The incoming request, used to identify the user.
         :param project_id: The project to update.
@@ -134,6 +148,7 @@ def create_projects_router(
             user_id=user_id,
             name=body.name,
             config=body.config,
+            shared=body.shared,
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
@@ -141,7 +156,9 @@ def create_projects_router(
 
     @router.delete("/projects/{project_id}")
     async def delete_project(request: Request, project_id: str) -> dict[str, Any]:
-        """Delete one of the caller's projects.
+        """Delete one of the caller's OWN projects.
+
+        Owner-only including for a shared project.
 
         Member sessions are not deleted; they are left for the caller to
         unfile (clearing their ``project_id``).

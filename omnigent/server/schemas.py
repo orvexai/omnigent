@@ -4344,6 +4344,10 @@ class ProjectObject(BaseModel):
         when the project stores no defaults. The key vocabulary is owned by the
         client; the server persists and returns it whole. Values are hints the
         new-chat dialog pre-fills, not enforced requirements.
+    :param shared: **Orvex divergence.** When ``true``, users other than the
+        owner can see this project and open the sessions they already have
+        access to inside it. ``false`` (the default) is upstream's
+        owner-private project. Only the owner can change it.
     """
 
     id: str
@@ -4352,6 +4356,7 @@ class ProjectObject(BaseModel):
     created_at: int
     updated_at: int | None = None
     config: dict[str, Any] = Field(default_factory=dict)
+    shared: bool = False
 
 
 class ProjectList(BaseModel):
@@ -4388,12 +4393,17 @@ class CreateProjectRequest(BaseModel):
         at most 100 characters; unique among the caller's projects.
     :param config: Optional default session settings (opaque JSON object).
         Omitted / empty stores no defaults.
+    :param shared: **Orvex divergence.** Create the project already readable by
+        non-owners. Omitted defaults to ``false`` — upstream's owner-private
+        project — so an existing client that has never heard of the field
+        keeps creating private projects.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
     config: dict[str, Any] = Field(default_factory=dict)
+    shared: bool = False
 
     @field_validator("name")
     @classmethod
@@ -4422,12 +4432,17 @@ class UpdateProjectRequest(BaseModel):
         trimmed, non-empty, at most 100 characters.
     :param config: New config object to replace the stored one. ``None`` leaves
         it unchanged; an empty object ``{}`` clears the stored defaults.
+    :param shared: **Orvex divergence.** New value for the share flag; ``None``
+        leaves it unchanged. Owner-only, like every other field here — a
+        non-owner reading a shared project cannot un-share it or share it
+        further.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = None
     config: dict[str, Any] | None = None
+    shared: bool | None = None
 
     @field_validator("name")
     @classmethod
