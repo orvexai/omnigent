@@ -48,9 +48,53 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Binaries ship from `mcp` only. Without this, the rule would rest on the
+  # workflow file happening to live on one branch — merge it elsewhere and that
+  # branch silently gains the ability to cut a release.
+  guard:
+    if: github.repository == 'orvexai/omnigent'
+    name: release-ref
+    runs-on: public-runners
+    timeout-minutes: 5
+
+    steps:
+      # A pull_request run is the workflow's own CI test (paths-filtered to
+      # this file) and its publish job is gated off PR events, so it builds
+      # without ever releasing. Everything else must come from mcp.
+      - if: github.event_name != 'pull_request'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - if: github.event_name != 'pull_request'
+        name: Require the ref to be mcp
+        env:
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" = "refs/heads/mcp" ]; then
+            echo "ref is mcp"
+            exit 0
+          fi
+          # A tag is allowed only when the commit it names is on mcp, so a tag
+          # cut from another branch cannot smuggle a build through.
+          if [ "${REF#refs/tags/v}" != "$REF" ]; then
+            git fetch --quiet origin mcp
+            if git merge-base --is-ancestor "$SHA" origin/mcp; then
+              echo "tag $REF is reachable from mcp"
+              exit 0
+            fi
+            echo "::error::Tag $REF names $SHA, which is not on mcp. Binaries ship from mcp only."
+            exit 1
+          fi
+          echo "::error::$REF is not mcp. Binaries ship from mcp only; re-run this workflow on mcp."
+          exit 1
+
   build-linux:
     # Gated to this fork; inert upstream and in other mirrors.
     if: github.repository == 'orvexai/omnigent'
+    needs: guard
     name: linux-x86_64
     # This is the org's own self-hosted Linux pool; the repo's CI proves
     # that the public-runners label resolves to an online runner.
@@ -213,6 +257,7 @@ jobs:
     # Platform-specific runners are intentionally opt-in because the default
     # org runner is Linux. These legs are independent from the Linux build.
     if: github.repository == 'orvexai/omnigent' && inputs.build_other_platforms
+    needs: guard
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
