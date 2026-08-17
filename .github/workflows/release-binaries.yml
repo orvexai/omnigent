@@ -383,7 +383,7 @@ jobs:
       # omnigent/server/static/web-ui unless OMNIGENT_SKIP_WEB_UI=true.
       # setup-node BEFORE pnpm/action-setup: its self-installer needs a Node
       # binary. Same order the repo's other pnpm workflows use.
-      - uses: actions/setup-node@39370e3970a6d050c480ff0ed4d3fdee5af # v4.1.0
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         if: ${{ !inputs.skip_web_ui }}
         with:
           node-version: 22
