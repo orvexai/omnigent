@@ -1,0 +1,67 @@
+name: Sync upstream into orvex
+
+# Keeps our `orvex` branch (the branch omnigent-app-build builds from —
+# see tekton/) current with omnigent-ai/omnigent's `main`, without ever
+# clobbering our own patches on top of it. Also keeps `main` itself an
+# exact mirror of upstream/main (fast-forward only, no local commits are
+# ever expected there).
+#
+# Runs daily. Merges upstream/main into orvex and pushes ONLY when the
+# merge is clean (no conflicts) — a conflicting upstream change is left
+# for a human to resolve by hand; this workflow just fails loudly (visible
+# in the Actions tab) and leaves `orvex` untouched. A successful push
+# re-triggers the omnigent-app-build Tekton pipeline (org-wide webhook
+# listener), which builds and rolls out the new image automatically.
+#
+# main is fast-forwarded independently of the orvex merge outcome. Since
+# main should only ever be upstream/main, this push is never forced — if
+# main has diverged (e.g. someone committed to it directly), the plain
+# push fails loudly instead of silently overwriting anything.
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily, off the hour to avoid GitHub's cron thundering herd
+  workflow_dispatch: {} # manual trigger for testing/on-demand syncs
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: public-runners
+    steps:
+      - name: Checkout orvex
+        uses: actions/checkout@v4
+        with:
+          ref: orvex
+          fetch-depth: 0 # full history — a merge needs the real ancestry, not a shallow clone
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/omnigent-ai/omnigent.git
+          git fetch upstream main
+
+      - name: Merge upstream/main into orvex
+        id: merge
+        run: |
+          if git merge upstream/main --no-edit; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            git merge --abort
+            echo "::error::Merging upstream/main into orvex produced conflicts — left unmerged for manual resolution. orvex is untouched (merge was aborted)."
+            exit 1
+          fi
+
+      - name: Push orvex
+        if: steps.merge.outputs.clean == 'true'
+        run: git push origin orvex
+
+      - name: Fast-forward main to upstream
+        if: always()
+        run: git push origin upstream/main:main

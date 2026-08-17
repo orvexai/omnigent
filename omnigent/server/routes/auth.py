@@ -345,13 +345,23 @@ def create_auth_router(
             )
 
         # Ensure user exists in the permission store, then apply the
-        # file-backed admin list. Promotion is additive (never demotes)
-        # and is OIDC's only path to admin — the IdP doesn't tell us
-        # who is an operator. ensure_user must run first so the
-        # set_admin UPDATE inside promote_if_listed matches a row.
+        # file-backed admin list plus group-based admin (OMNIGENT_OIDC_
+        # ADMIN_GROUPS). Both are additive (never demote) and are OIDC's
+        # only paths to admin — the IdP doesn't otherwise tell us who is
+        # an operator. ensure_user must run first so the set_admin
+        # UPDATE matches a row.
         if permission_store is not None:
             permission_store.ensure_user(email)
-            promote_if_listed(admin_list, permission_store, email)
+            promoted = promote_if_listed(admin_list, permission_store, email)
+            if not promoted and config.admin_groups and not permission_store.is_admin(email):
+                user_groups = _resolve_oidc_groups(token_json, config)
+                if user_groups & config.admin_groups:
+                    permission_store.set_admin(email, True)
+                    _logger.info(
+                        "oidc_admin_groups: promoted %s to admin via group membership (%s)",
+                        email,
+                        sorted(user_groups & config.admin_groups),
+                    )
 
         # Mint session cookie.
         session_jwt = mint_session_cookie(
@@ -767,6 +777,37 @@ def _claim_is_verified_true(value: object) -> bool:
     return isinstance(value, str) and value.strip().lower() == "true"
 
 
+class _HttpxJWKClient(jwt.PyJWKClient):
+    """A ``PyJWKClient`` that fetches the JWKS over httpx.
+
+    ``PyJWKClient`` fetches with ``urllib.request``, whose TLS
+    fingerprint Cloudflare's bot protection rejects (403 / error 1010)
+    even though browser traffic and this codebase's own httpx calls to
+    the same host succeed. Overriding only the fetch keeps the rest of
+    the upstream key-selection logic.
+    """
+
+    def fetch_data(self) -> object:
+        resp = httpx.get(self.uri, timeout=10.0)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _fetch_jwks_signing_key(jwks_uri: str, id_token: str) -> jwt.PyJWK | None:
+    """Resolve the signing key for ``id_token`` from ``jwks_uri``.
+
+    :param jwks_uri: The IdP's JWKS endpoint URL.
+    :param id_token: The ``id_token`` JWT whose ``kid`` header names the
+        key to use.
+    :returns: The matching key, passable straight to :func:`jwt.decode`,
+        or ``None`` if the fetch fails or no key matches.
+    """
+    try:
+        return _HttpxJWKClient(jwks_uri).get_signing_key_from_jwt(id_token)
+    except (jwt.PyJWKClientError, jwt.InvalidTokenError, httpx.HTTPError):
+        return None
+
+
 def _resolve_oidc_email(
     token_json: dict[str, object],
     config: OIDCConfig,
@@ -812,12 +853,14 @@ def _resolve_oidc_email(
         _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
         return None
 
+    signing_key = _fetch_jwks_signing_key(config.jwks_uri, id_token)
+    if signing_key is None:
+        _logger.warning("Rejecting id_token: could not resolve a JWKS signing key")
+        return None
     try:
-        jwks_client = jwt.PyJWKClient(config.jwks_uri)
-        signing_key = jwks_client.get_signing_key_from_jwt(id_token)
         claims = jwt.decode(
             id_token,
-            signing_key.key,
+            signing_key,
             algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
@@ -882,6 +925,55 @@ def _resolve_oidc_email(
         return None
 
     return email
+
+
+def _resolve_oidc_groups(
+    token_json: dict[str, object],
+    config: OIDCConfig,
+) -> frozenset[str]:
+    """Extract the ``groups`` claim from the OIDC ``id_token``, lowercased.
+
+    Used only for :attr:`OIDCConfig.admin_groups` promotion — a
+    separate, best-effort read of the same token
+    :func:`_resolve_oidc_email` already validated. Decoded independently
+    (rather than threading claims through the return value) to keep
+    the well-exercised email path untouched.
+
+    :param token_json: The token endpoint response JSON containing
+        ``id_token``.
+    :param config: The OIDC configuration with JWKS URI and expected
+        issuer/audience.
+    :returns: Lowercased group names from the ``groups`` claim, or an
+        empty set if the token is missing/invalid, unsigned, or the
+        claim is absent. Never raises — group admin is an additive
+        bonus, not an auth gate, so a decode failure here must not
+        break login (the email path already validated the token once).
+    """
+    if not config.admin_groups:
+        return frozenset()
+
+    id_token = token_json.get("id_token")
+    if not isinstance(id_token, str) or not id_token or config.jwks_uri is None:
+        return frozenset()
+
+    signing_key = _fetch_jwks_signing_key(config.jwks_uri, id_token)
+    if signing_key is None:
+        return frozenset()
+    try:
+        claims = jwt.decode(
+            id_token,
+            signing_key,
+            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+            audience=config.client_id,
+            issuer=config.issuer,
+        )
+    except jwt.InvalidTokenError:
+        return frozenset()
+
+    groups = claims.get("groups")
+    if not isinstance(groups, list):
+        return frozenset()
+    return frozenset(g.strip().lower() for g in groups if isinstance(g, str) and g.strip())
 
 
 def _json_object(value: object) -> dict[str, object] | None:

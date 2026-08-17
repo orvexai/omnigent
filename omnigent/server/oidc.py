@@ -167,6 +167,15 @@ class OIDCConfig:
         the user's email identity, e.g. ``"preferred_username"`` for
         IdPs that omit ``email`` (Microsoft Entra ID). Defaults to
         ``"email"``. Only affects the generic-OIDC path.
+    :param admin_groups: Lowercased group names from
+        ``OMNIGENT_OIDC_ADMIN_GROUPS`` (comma-separated). A user whose
+        ``id_token`` ``groups`` claim intersects this set is promoted
+        to admin on login, same as the file-backed admin list —
+        additive only (see :mod:`omnigent.server.admin_list`), never a
+        source of demotion. Empty means no group grants admin. Only
+        affects the generic-OIDC path; the IdP must be configured to
+        include a ``groups`` claim in the ``id_token`` (e.g. a
+        Keycloak client default scope) or this has no effect.
     """
 
     issuer: str
@@ -186,6 +195,7 @@ class OIDCConfig:
     allow_invites: bool
     skip_email_verification: bool = False
     email_claim: str = "email"
+    admin_groups: frozenset[str] = frozenset()
 
     @property
     def base_url(self) -> str:
@@ -289,6 +299,16 @@ class OIDCConfig:
                 d.strip().lower() for d in raw_domains.split(",") if d.strip()
             )
 
+        # Group-based admin promotion (additive, like the file-backed admin
+        # list — see OIDCConfig.admin_groups). Requires the IdP to include a
+        # `groups` claim in the id_token.
+        raw_admin_groups = os.environ.get("OMNIGENT_OIDC_ADMIN_GROUPS", "").strip()
+        admin_groups: frozenset[str] = frozenset()
+        if raw_admin_groups:
+            admin_groups = frozenset(
+                g.strip().lower() for g in raw_admin_groups.split(",") if g.strip()
+            )
+
         # Opt-in individual invites (admin pre-authorizes an off-domain
         # email; see omnigent/server/oidc_access.py). Off by default.
         # Imported lazily to avoid a circular import (auth imports oidc).
@@ -353,6 +373,7 @@ class OIDCConfig:
                 userinfo_endpoint=_GITHUB_USERINFO_ENDPOINT,
                 allow_invites=allow_invites,
                 skip_email_verification=skip_email_verification,
+                admin_groups=admin_groups,
             )
 
         # Standard OIDC: fetch discovery document.
@@ -396,4 +417,5 @@ class OIDCConfig:
             allow_invites=allow_invites,
             skip_email_verification=skip_email_verification,
             email_claim=email_claim,
+            admin_groups=admin_groups,
         )
