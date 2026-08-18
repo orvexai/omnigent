@@ -5732,22 +5732,14 @@ async def _relay_runner_stream(
                 )
             else:
                 cached_status = _session_status_cache.get(session_id)
-                persisted_status = None
-                if cached_status is None and conversation_store is not None:
-                    try:
-                        conv = await asyncio.to_thread(
-                            conversation_store.get_conversation,
-                            session_id,
-                        )
-                    except Exception:  # noqa: BLE001 — unknown store failure must not fail the relay
-                        _logger.exception(
-                            "Failed to read session status after runner transport loss: %s",
-                            session_id,
-                        )
-                        return
-                    persisted_status = getattr(conv, "live_status", None)
-                live_status = cached_status if cached_status is not None else persisted_status
-                if live_status not in ("running", "waiting"):
+                if cached_status is None:
+                    _logger.info(
+                        "Relay: no local status observed for session=%s; "
+                        "declining disconnect verdict",
+                        session_id,
+                    )
+                    return
+                if cached_status not in ("running", "waiting"):
                     return
                 # Publish a failed status so the client's SSE stream sees a
                 # clean error event instead of silent truncation (#1114).
