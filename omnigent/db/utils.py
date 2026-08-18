@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import threading
 import time
@@ -61,10 +62,42 @@ _LAKEBASE_INSTANCE_ENV = "OMNIGENT_LAKEBASE_INSTANCE"
 _SERVER_POOL_RECYCLE_SECONDS = 1800
 _LAKEBASE_POOL_RECYCLE_SECONDS = 600
 
+_POOL_SIZE_ENV = "OMNIGENT_DB_POOL_SIZE"
+_MAX_OVERFLOW_ENV = "OMNIGENT_DB_MAX_OVERFLOW"
+_POOL_TIMEOUT_ENV = "OMNIGENT_DB_POOL_TIMEOUT_SECONDS"
+_DEFAULT_POOL_SIZE = 32
+_DEFAULT_MAX_OVERFLOW = 32
+_DEFAULT_POOL_TIMEOUT_SECONDS = 10
+
 # Process-wide override, primarily for tests and for callers that want to plug
 # in their own token source (e.g. a non-default Databricks auth flow) without
 # the env-var path. ``None`` means "not overridden".
 _lakebase_token_provider_override: LakebaseTokenProvider | None = None
+
+
+def _pool_setting(
+    env_name: str,
+    default: int | float,
+    *,
+    integer: bool,
+    minimum: float,
+    inclusive: bool = True,
+) -> int | float:
+    """Resolve and validate one non-SQLite pool setting from the environment."""
+    raw_value = os.environ.get(env_name)
+    if raw_value is None:
+        return default
+
+    try:
+        value: int | float = int(raw_value) if integer else float(raw_value)
+    except ValueError as exc:
+        kind = "an integer" if integer else "a number"
+        raise RuntimeError(f"{env_name} must be {kind}, got {raw_value!r}") from exc
+
+    if not math.isfinite(value) or value < minimum or (not inclusive and value == minimum):
+        comparison = f">= {int(minimum)}" if inclusive else f"> {minimum:g}"
+        raise RuntimeError(f"{env_name} must be {comparison}, got {raw_value!r}")
+    return value
 
 
 def set_lakebase_token_provider(provider: LakebaseTokenProvider | None) -> None:
@@ -265,6 +298,25 @@ def _create_engine(db_uri: str) -> Engine:
     pool_recycle = (
         _LAKEBASE_POOL_RECYCLE_SECONDS if token_provider else _SERVER_POOL_RECYCLE_SECONDS
     )
+    pool_size = _pool_setting(
+        _POOL_SIZE_ENV,
+        _DEFAULT_POOL_SIZE,
+        integer=True,
+        minimum=1.0,
+    )
+    max_overflow = _pool_setting(
+        _MAX_OVERFLOW_ENV,
+        _DEFAULT_MAX_OVERFLOW,
+        integer=True,
+        minimum=0.0,
+    )
+    pool_timeout = _pool_setting(
+        _POOL_TIMEOUT_ENV,
+        _DEFAULT_POOL_TIMEOUT_SECONDS,
+        integer=False,
+        minimum=0.0,
+        inclusive=False,
+    )
     connect_args = {"connect_timeout": 3} if db_uri.startswith("postgresql") else {}
     engine = create_engine(
         db_uri,
@@ -278,15 +330,23 @@ def _create_engine(db_uri: str) -> Engine:
         # connections; in Lakebase token mode the shorter window also keeps
         # each connection's OAuth token refreshed ahead of its ~1h expiry.
         pool_recycle=pool_recycle,
-        # Sized for ordinary application concurrency; readiness has its own
-        # executor and does not consume this pool's shared worker capacity.
-        # Lakebase per-instance cap: 1000.
-        pool_size=200,
-        max_overflow=20,
+        # Hold the thread ceiling in the pool; borrow overflow connections for
+        # bursts so transient demand does not become retained idle capacity.
+        pool_size=pool_size,
+        max_overflow=max_overflow,
         # Bound the wait when the pool is exhausted instead of
         # blocking indefinitely; surfaces real saturation as an
         # error rather than a hang.
-        pool_timeout=10,
+        pool_timeout=pool_timeout,
+    )
+    _logger.info(
+        "database engine configured dialect=%s pool_size=%s max_overflow=%s "
+        "pool_timeout=%s pool_recycle=%s",
+        engine.dialect.name,
+        pool_size,
+        max_overflow,
+        pool_timeout,
+        pool_recycle,
     )
     if token_provider:
         _install_lakebase_token_refresh(engine, token_provider)

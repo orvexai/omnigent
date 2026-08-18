@@ -338,6 +338,22 @@ readiness (initial delay 3s, period 2s, failure threshold 3).
 The application-side readiness deadline defaults to 2s and can be tuned with
 `OMNIGENT_READINESS_TIMEOUT_SECONDS`.
 
+### Database connections
+
+Non-SQLite engines default to `OMNIGENT_DB_POOL_SIZE=32`,
+`OMNIGENT_DB_MAX_OVERFLOW=32`, and `OMNIGENT_DB_POOL_TIMEOUT_SECONDS=10`.
+The ConfigMap sets these values explicitly. `pool_size` is retained capacity
+for the server's thread ceiling; `max_overflow` is transient capacity for
+bursts and is closed when returned. A Lakebase deployment can restore the
+previous retained pool with `OMNIGENT_DB_POOL_SIZE=200` without a code change.
+
+Budget a deployment using the number of engines per pod (`E`, normally 1):
+`(replicas + maxSurge) × E × (pool_size + max_overflow) + non-app backends`
+must remain below PostgreSQL `max_connections`. An idle connection count is a
+historical high-water mark and cannot tell whether concurrency was sustained
+or happened once at boot; use active backends sampled during a busy period to
+choose `pool_size`.
+
 The first boot runs database migrations before the server starts listening; the
 pod may restart once if the liveness probe fires during that window (see
 [Resource sizing](#resource-sizing)).
@@ -390,4 +406,6 @@ migrations and takes ~1 minute; bump the liveness `initialDelaySeconds` to
 
 The server uses an in-memory runner registry, so **only one replica is
 supported**. Do not increase `replicas` unless the architecture is changed to
-use a shared registry (e.g. Redis).
+use a shared registry (e.g. Redis). Connection capacity is a separate,
+necessary constraint: increasing replicas also multiplies each engine's
+`pool_size + max_overflow` budget, including rollout surge pods.
