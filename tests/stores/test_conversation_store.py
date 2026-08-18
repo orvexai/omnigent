@@ -28,6 +28,16 @@ from omnigent.stores.host_store import HostStore
 # ── CRUD ──────────────────────────────────────────────
 
 
+@pytest.mark.databricks
+def test_check_database_connectivity_uses_postgres_safe_timeout(db_uri: str) -> None:
+    """The real PostgreSQL lane executes the readiness query successfully."""
+    if not db_uri.startswith("postgresql"):
+        pytest.skip("requires OMNIGENT_TEST_DB_URI pointing at PostgreSQL")
+
+    store = SqlAlchemyConversationStore(db_uri)
+    store.check_database_connectivity(timeout_ms=2000)
+
+
 def test_fork_drops_import_provenance_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

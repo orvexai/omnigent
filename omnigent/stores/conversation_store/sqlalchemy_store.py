@@ -786,6 +786,30 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         ensure_fts_table(self._conv_engine)
 
+    def check_database_connectivity(self, *, timeout_ms: int = 2000) -> None:
+        """Run the cheap, write-capable database check used by readiness."""
+        databases = [(self._session, self._engine, "readiness_check_operational")]
+        if self._conv_engine is not self._engine:
+            databases.append(
+                (self._conv_session, self._conv_engine, "readiness_check_conversation")
+            )
+        for session_maker, engine, query_name in databases:
+            with session_maker(query_name) as session:
+                if engine.dialect.name == "postgresql":
+                    session.execute(
+                        text("SELECT set_config('statement_timeout', :timeout_ms, true)"),
+                        {"timeout_ms": str(timeout_ms)},
+                    )
+                    if (
+                        session.execute(
+                            text("SELECT 1 WHERE NOT pg_catalog.pg_is_in_recovery()")
+                        ).scalar()
+                        != 1
+                    ):
+                        raise RuntimeError("PostgreSQL server is in recovery")
+                else:
+                    session.execute(text("SELECT 1"))
+
     def _get_meta(
         self, _unused_session: Session, conversation_id: str
     ) -> SqlConversationMetadata | None:
