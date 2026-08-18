@@ -15,6 +15,7 @@ from omnigent.db.utils import (
     _LAKEBASE_POOL_RECYCLE_SECONDS,
     _SERVER_POOL_RECYCLE_SECONDS,
     _build_alembic_config,
+    _create_engine,
     _get_current_db_revision,
     _get_head_db_revision,
     _initialize_or_verify_schema,
@@ -82,6 +83,108 @@ def test_non_sqlite_engine_has_pool_settings(
     # the database server restarts or closes idle connections.
     # Failure means connections could persist indefinitely and break.
     assert captured_kwargs.get("pool_recycle") == 1800
+
+    assert captured_kwargs["pool_size"] == 32
+    assert captured_kwargs["max_overflow"] == 32
+    assert captured_kwargs["pool_timeout"] == 10
+
+
+def test_non_sqlite_pool_settings_are_environment_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+    mock_engine = MagicMock()
+
+    def _capturing_create_engine(uri: str, **kwargs: Any) -> MagicMock:
+        captured_kwargs.update(kwargs)
+        return mock_engine
+
+    monkeypatch.setattr("omnigent.db.utils.create_engine", _capturing_create_engine)
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", lambda engine, db_uri: None)
+    monkeypatch.setenv("OMNIGENT_DB_POOL_SIZE", "7")
+    monkeypatch.setenv("OMNIGENT_DB_MAX_OVERFLOW", "3")
+    monkeypatch.setenv("OMNIGENT_DB_POOL_TIMEOUT_SECONDS", "2.5")
+
+    get_or_create_engine("postgresql://user:pass@localhost/testdb")
+
+    assert captured_kwargs["pool_size"] == 7
+    assert captured_kwargs["max_overflow"] == 3
+    assert captured_kwargs["pool_timeout"] == 2.5
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value"),
+    [
+        ("OMNIGENT_DB_POOL_SIZE", "abc"),
+        ("OMNIGENT_DB_POOL_SIZE", "0"),
+        ("OMNIGENT_DB_POOL_SIZE", "-1"),
+        ("OMNIGENT_DB_MAX_OVERFLOW", "true"),
+        ("OMNIGENT_DB_POOL_TIMEOUT_SECONDS", "0"),
+    ],
+)
+def test_invalid_pool_setting_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(env_name, value)
+
+    with pytest.raises(RuntimeError, match=env_name):
+        _create_engine("postgresql://user:pass@localhost/testdb")
+
+
+def test_sqlite_pool_settings_are_not_read_or_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+    mock_engine = MagicMock()
+
+    def _capturing_create_engine(uri: str, **kwargs: Any) -> MagicMock:
+        captured_kwargs.update(kwargs)
+        return mock_engine
+
+    monkeypatch.setattr("omnigent.db.utils.create_engine", _capturing_create_engine)
+    monkeypatch.setattr(
+        "omnigent.db.utils.event.listens_for",
+        lambda *args, **kwargs: lambda function: function,
+    )
+    monkeypatch.setenv("OMNIGENT_DB_POOL_SIZE", "7")
+    monkeypatch.setenv("OMNIGENT_DB_MAX_OVERFLOW", "3")
+    monkeypatch.setenv("OMNIGENT_DB_POOL_TIMEOUT_SECONDS", "2.5")
+
+    _create_engine("sqlite:///test.db")
+
+    assert "pool_size" not in captured_kwargs
+    assert "max_overflow" not in captured_kwargs
+    assert "pool_timeout" not in captured_kwargs
+
+
+def test_engine_configuration_log_is_secret_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mock_engine = MagicMock()
+    mock_engine.dialect.name = "postgresql"
+    monkeypatch.setattr(
+        "omnigent.db.utils.create_engine",
+        lambda uri, **kwargs: mock_engine,
+    )
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", lambda engine, db_uri: None)
+
+    with caplog.at_level("INFO", logger="omnigent.db.utils"):
+        get_or_create_engine("postgresql://user:secret@localhost/testdb")
+
+    records = [
+        record for record in caplog.records if "database engine configured" in record.message
+    ]
+    assert len(records) == 1
+    assert "dialect=postgresql" in records[0].message
+    assert "pool_size=32" in records[0].message
+    assert "max_overflow=32" in records[0].message
+    assert "pool_timeout=10" in records[0].message
+    assert "pool_recycle=1800" in records[0].message
+    assert "@" not in records[0].message
+    assert "secret" not in records[0].message
 
 
 def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(

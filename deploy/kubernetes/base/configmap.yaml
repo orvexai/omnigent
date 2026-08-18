@@ -14,3 +14,7 @@ data:
   OMNIGENT_AUTH_ENABLED: "1"
   OMNIGENT_AUTH_PROVIDER: "accounts"
   OMNIGENT_ACCOUNTS_AUTO_OPEN: "0"
+  # Non-SQLite connection pool: retain the thread ceiling and borrow for bursts.
+  OMNIGENT_DB_POOL_SIZE: "32"
+  OMNIGENT_DB_MAX_OVERFLOW: "32"
+  OMNIGENT_DB_POOL_TIMEOUT_SECONDS: "10"

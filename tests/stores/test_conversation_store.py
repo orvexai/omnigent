@@ -28,7 +28,6 @@ from omnigent.stores.host_store import HostStore
 # ── CRUD ──────────────────────────────────────────────
 
 
-@pytest.mark.databricks
 def test_check_database_connectivity_uses_postgres_safe_timeout(db_uri: str) -> None:
     """The real PostgreSQL lane executes the readiness query successfully."""
     if not db_uri.startswith("postgresql"):
