@@ -81,7 +81,7 @@ env:
 
 jobs:
   triage:
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 10
     # Initial triage ignores bot-authored issues. Re-triage is an explicit call
     # from needs-info-response.yml after the issue author supplies more detail.
@@ -825,7 +825,7 @@ jobs:
       github.event.action == 'opened' &&
       vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true' &&
       !endsWith(github.event.issue.user.login, '[bot]')
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 10
     permissions:
       contents: read

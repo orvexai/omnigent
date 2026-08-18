@@ -79,7 +79,7 @@ jobs:
   # risk a false pass.
   detect:
     name: Detect render-affecting changes
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     outputs:
       ui: ${{ steps.changes.outputs.ui }}
     steps:
@@ -111,7 +111,7 @@ jobs:
     # Skipped (not failed) when no render input changed -> reports SUCCESS, so a
     # non-UI PR neither runs the render nor blocks a required check.
     if: ${{ needs.detect.outputs.ui == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: public-dind-runners
     # Render in the digest-pinned Playwright image (browsers + fonts baked in),
     # so the committed baseline and the PR comparison are byte-identical and a
     # locally regenerated baseline matches. Keep this digest in lockstep with

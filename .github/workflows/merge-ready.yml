@@ -92,7 +92,7 @@ jobs:
           github.event.comment.author_association == 'COLLABORATOR'
         )
       )
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 5
     steps:
       - name: Check out scripts

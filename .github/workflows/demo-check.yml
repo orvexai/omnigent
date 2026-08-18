@@ -29,7 +29,7 @@ permissions: {}
 jobs:
   demo-check:
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     permissions:
       # Job-level permissions REPLACE the workflow-level block (they don't
       # merge), so contents:read must be restated here for actions/checkout.

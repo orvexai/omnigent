@@ -69,7 +69,7 @@ jobs:
   setup:
     name: setup
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -101,7 +101,7 @@ jobs:
     name: build codex-parity sidecar
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}'
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -147,7 +147,7 @@ jobs:
     # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     # `ready_for_review` re-fires when a draft is converted.
     needs: [setup, build-sidecar]
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 20
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
@@ -286,7 +286,7 @@ jobs:
         run: |
           # Always exclude @visual: the UI diff snapshot runs in its own
           # pinned-runner gate (ui-snapshot.yml) so its baseline matches the
-          # comparison environment; on this unpinned ubuntu-latest it would
+          # comparison environment; on this public-runners pool it would
           # flake on font drift. Add the nightly exclusion for PR/push runs.
           MARKER="not visual"
           if [[ "$NIGHTLY_FULL" != "true" ]]; then

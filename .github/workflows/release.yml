@@ -64,7 +64,7 @@ jobs:
   # hand-kept list. `github.actor` on a dispatch is the dispatcher.
   authorize:
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 5
     steps:
       - name: Require admin/maintain role
@@ -86,7 +86,7 @@ jobs:
   # (pure API reads) and also serves as the whole dry run.
   plan:
     needs: authorize
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 10
     outputs:
       version: ${{ steps.derive.outputs.version }}
@@ -258,7 +258,7 @@ jobs:
     outputs:
       prev_tag: ${{ steps.prev.outputs.tag }}
       has_prev: ${{ steps.prev.outputs.found }}
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 20
     env:
       OMNIGENT_SKIP_WEB_UI: "true"
@@ -332,7 +332,7 @@ jobs:
   benchmark-baseline:
     needs: [benchmark-seed]
     if: ${{ needs.benchmark-seed.outputs.has_prev == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 30
     env:
       OMNIGENT_SKIP_WEB_UI: "true"
@@ -383,7 +383,7 @@ jobs:
   benchmark-candidate:
     needs: [authorize, plan, benchmark-seed]
     if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !inputs.skip_benchmark }}
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 30
     env:
       OMNIGENT_SKIP_WEB_UI: "true"
@@ -449,7 +449,7 @@ jobs:
     if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !inputs.skip_benchmark && needs.benchmark-seed.outputs.has_prev == 'true' }}
     outputs:
       regression: ${{ steps.compare.outputs.regression }}
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 10
     env:
       OMNIGENT_SKIP_WEB_UI: "true"
@@ -537,7 +537,7 @@ jobs:
       !inputs.skip_benchmark &&
       needs.benchmark.result == 'success' &&
       needs.benchmark.outputs.regression == 'true'
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 60
     environment: benchmark-regression-gate
     steps:
@@ -553,7 +553,7 @@ jobs:
     # is the real gate. `!cancelled` lets the optional compare/approve jobs be
     # skipped without blocking, while still failing the run if they actually fail.
     if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 15
     env:
       # Clean public resolution for `uv lock` — the committed lockfile must
@@ -670,7 +670,7 @@ jobs:
     # gate inherits that skip through `cut`, so this job silently vanished on
     # every cut but one. Depend on `cut` succeeding, not on the whole closure.
     if: ${{ !cancelled() && needs.cut.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: public-runners
     timeout-minutes: 5
     permissions:
       actions: write
