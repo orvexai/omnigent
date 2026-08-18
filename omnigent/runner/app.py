@@ -45,6 +45,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -1186,6 +1187,131 @@ _THREAD_MESSAGE_CAP = 32
 _THREADS_PER_PAIR_CAP = 16
 _OPEN_THREADS_PER_SESSION_CAP = 64
 _THREAD_SUBJECT_MAX_CHARS = 256
+_THREAD_LABEL_HEADROOM = 16
+
+# This runner-owned namespace is deliberately separate from
+# ``omnigent.codex_native.subagent_thread_id``: that label identifies a
+# harness-internal Codex thread, not an Omnigent message correlation thread.
+THREAD_LABEL_PREFIX = "omnigent.thread."
+
+
+def message_thread_label_key(thread_id: str) -> str:
+    """Return the durable label key for a runner-minted message thread."""
+    return f"{THREAD_LABEL_PREFIX}{thread_id}"
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    raw = value.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return value
+    raw = raw[:max_bytes]
+    while True:
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raw = raw[:-1]
+
+
+def serialize_message_thread_label(thread: _MessageThread) -> str:
+    """Serialize durable thread identity within the conversation-label budget.
+
+    Participant ids and the thread id's label key are never truncated. A long
+    subject is shortened by UTF-8 bytes; only presentation text is dropped.
+    """
+    subject = thread.subject
+    fixed = {
+        "o": thread.opener_session_id,
+        "t": thread.target_session_id,
+        "c": int(thread.created_at),
+    }
+    max_bytes = LABEL_VALUE_MAX_LEN - _THREAD_LABEL_HEADROOM
+    while True:
+        payload = dict(fixed)
+        if subject:
+            payload["s"] = subject
+        value = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(value.encode("utf-8")) <= max_bytes:
+            return value
+        if not subject:
+            raise ValueError("thread participant ids exceed the conversation-label budget")
+        subject = _truncate_utf8(subject, max(0, len(subject.encode("utf-8")) - 16))
+
+
+def rehydrate_message_thread(thread_id: str, labels: Mapping[str, str]) -> _MessageThread | None:
+    """Rebuild one open thread from its endpoint label, if valid and bounded."""
+    raw = labels.get(message_thread_label_key(thread_id))
+    if not isinstance(raw, str):
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    opener = payload.get("o")
+    target = payload.get("t")
+    created = payload.get("c")
+    subject = payload.get("s")
+    if (
+        not isinstance(opener, str)
+        or not opener
+        or not isinstance(target, str)
+        or not target
+        or not isinstance(created, (int, float))
+        or isinstance(created, bool)
+        or (subject is not None and not isinstance(subject, str))
+    ):
+        return None
+    if thread_id in _closed_thread_ids:
+        return None
+    existing = _threads_by_id.get(thread_id)
+    if existing is not None:
+        return existing
+    if (
+        sum(
+            thread.opener_session_id == opener and thread.state == "open"
+            for thread in _threads_by_id.values()
+        )
+        >= _OPEN_THREADS_PER_SESSION_CAP
+    ):
+        return None
+    pair = (opener, target)
+    if len(_open_threads_for_pair(*pair)) >= _THREADS_PER_PAIR_CAP:
+        return None
+    thread = _MessageThread(
+        thread_id=thread_id,
+        opener_session_id=opener,
+        target_session_id=target,
+        subject=subject,
+        created_at=float(created),
+        last_activity_at=float(created),
+    )
+    _threads_by_id[thread_id] = thread
+    _refresh_thread_pair_index(opener, target)
+    return thread
+
+
+def validate_message_thread_reference(
+    caller_session_id: str,
+    thread_id: str,
+    *,
+    persisted_labels: Mapping[str, str] | None = None,
+) -> _ThreadResolution:
+    """Validate an id before a named send creates or mutates a child."""
+    if thread_id in _closed_thread_ids:
+        return _ThreadResolution(None, error="thread_closed")
+    thread = _threads_by_id.get(thread_id)
+    if thread is None and persisted_labels is not None:
+        thread = rehydrate_message_thread(thread_id, persisted_labels)
+    if thread is None:
+        return _ThreadResolution(None, error="unknown_thread")
+    if caller_session_id not in (thread.opener_session_id, thread.target_session_id):
+        return _ThreadResolution(None, error="not_a_thread_participant")
+    if thread.state != "open":
+        return _ThreadResolution(None, error="thread_closed")
+    if thread.message_count >= _THREAD_MESSAGE_CAP:
+        return _ThreadResolution(None, error="thread_full")
+    return _ThreadResolution(thread)
 
 
 def _open_threads_for_pair(opener_session_id: str, target_session_id: str) -> list[_MessageThread]:
@@ -1215,6 +1341,7 @@ def resolve_message_thread(
     thread_id: str | None = None,
     thread_subject: str | None = None,
     outstanding_entry: _SubagentWorkEntry | None = None,
+    persisted_labels: Mapping[str, str] | None = None,
 ) -> _ThreadResolution:
     """Resolve or mint a directional two-session message thread.
 
@@ -1226,9 +1353,13 @@ def resolve_message_thread(
         if thread_id in _closed_thread_ids:
             return _ThreadResolution(None, error="thread_closed")
         thread = _threads_by_id.get(thread_id)
+        if thread is None and persisted_labels is not None:
+            thread = rehydrate_message_thread(thread_id, persisted_labels)
         if thread is None:
             return _ThreadResolution(None, error="unknown_thread")
         if caller_session_id not in (thread.opener_session_id, thread.target_session_id):
+            return _ThreadResolution(None, error="not_a_thread_participant")
+        if target_session_id not in (thread.opener_session_id, thread.target_session_id):
             return _ThreadResolution(None, error="not_a_thread_participant")
         if thread.state != "open":
             return _ThreadResolution(None, error="thread_closed")
