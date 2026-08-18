@@ -1,0 +1,8 @@
+self-hosted-runner:
+  labels:
+    - public-runners
+    - public-dind-runners
+
+config-variables: null
+
+paths:
