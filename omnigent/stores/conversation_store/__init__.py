@@ -610,6 +610,7 @@ class ConversationStore(ABC):
         owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        project_owner: str | None = None,
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
@@ -710,8 +711,17 @@ class ConversationStore(ABC):
             this name) OR carry the ``omni_project`` label with this value.
             ``""`` returns sessions with NEITHER (unfiled). ``None`` disables
             the filter. The name→id resolution is owner-scoped (projects are
-            owner-private), so pass ``owned_by`` alongside a specific name.
-            See ``designs/PROJECTS_PRD.md``.
+            owner-private), so pass ``owned_by`` alongside a specific name —
+            or ``project_owner``, below. See ``designs/PROJECTS_PRD.md``.
+        :param project_owner: **Orvex divergence.** Whose project the
+            ``project`` NAME resolves against, when that differs from
+            ``owned_by``. Upstream conflates the two, which is correct while
+            projects are owner-private but wrong for a shared project: the
+            caller wants the *owner's* folder resolved while seeing every
+            session in it they have access to — i.e. name resolution scoped to
+            the owner, session scoping left to ``accessible_by`` with
+            ``owned_by=None``. ``None`` (the default) falls back to
+            ``owned_by``, which is upstream's behaviour exactly.
         :param pinned: When ``True``, only return sessions ``pinned_owner`` has
             pinned (their per-user ``omnigent.pinned.<user>`` label — the
             sidebar's Pinned section). ``False`` (default) disables the filter.

@@ -356,3 +356,148 @@ def test_delete_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     deleted = store.delete(_uid("p1"), user_id="bob@example.com")
     assert deleted is False
     assert store.get(_uid("p1"), user_id="alice@example.com") is not None
+
+
+# ── Orvex: the ``shared`` flag ─────────────────────────────────────────────
+#
+# Store-level half of the story. The route-level half — and the AC5
+# "ordinary, non-admin user" test — lives in
+# ``tests/server/routes/test_projects_sharing.py``.
+
+ALICE = "alice@example.com"
+BOB = "bob@example.com"
+
+
+def test_create_defaults_to_private(store: SqlAlchemyProjectStore) -> None:
+    """A project created without naming ``shared`` is private.
+
+    The default is the entire safety property of this change: every caller
+    that predates the flag keeps creating owner-private projects.
+    """
+    project = store.create(_uid("p1"), "Private", ALICE)
+    assert project.shared is False
+    assert store.get(_uid("p1"), user_id=ALICE) is not None
+    assert store.get(_uid("p1"), user_id=ALICE).shared is False
+
+
+def test_create_can_mark_shared(store: SqlAlchemyProjectStore) -> None:
+    """``shared=True`` persists and reads back."""
+    project = store.create(_uid("p1"), "Fleet", ALICE, None, True)
+    assert project.shared is True
+    read_back = store.get(_uid("p1"), user_id=ALICE)
+    assert read_back is not None and read_back.shared is True
+
+
+def test_get_resolves_shared_project_for_non_owner(store: SqlAlchemyProjectStore) -> None:
+    """A non-owner can ``get`` a shared project — the change that unblocks
+    filing a session into it and keeping a fork of one filed."""
+    store.create(_uid("p1"), "Fleet", ALICE, None, True)
+    got = store.get(_uid("p1"), user_id=BOB)
+    assert got is not None
+    assert got.name == "Fleet"
+    assert got.user_id == ALICE, "the entity still reports its real owner"
+
+
+def test_list_returns_shared_projects_to_a_non_owner(store: SqlAlchemyProjectStore) -> None:
+    """``list`` is owned-OR-shared, not owner-only.
+
+    This is the store-level form of the trap: with an owner-scoped ``list``
+    the shared project below simply vanishes for Bob, and every surface built
+    on ``list`` (sidebar, project list, ``?project=`` resolution) goes with it.
+    """
+    store.create(_uid("p1"), "Fleet", ALICE, None, True)
+    store.create(_uid("p2"), "Alice Private", ALICE)
+    store.create(_uid("p3"), "Bob Own", BOB)
+
+    names = {p.name for p in store.list(user_id=BOB)}
+    assert names == {"Fleet", "Bob Own"}, (
+        f"Bob should see his own project and the shared one only; got {names}"
+    )
+
+
+def test_update_is_owner_only_even_when_shared(store: SqlAlchemyProjectStore) -> None:
+    """Reads open, writes stay closed: a non-owner cannot rename a shared project."""
+    store.create(_uid("p1"), "Fleet", ALICE, None, True)
+    assert store.update(_uid("p1"), user_id=BOB, name="Hijacked") is None
+    unchanged = store.get(_uid("p1"), user_id=ALICE)
+    assert unchanged is not None and unchanged.name == "Fleet"
+
+
+def test_delete_is_owner_only_even_when_shared(store: SqlAlchemyProjectStore) -> None:
+    """A non-owner cannot delete a shared project."""
+    store.create(_uid("p1"), "Fleet", ALICE, None, True)
+    assert store.delete(_uid("p1"), user_id=BOB) is False
+    assert store.get(_uid("p1"), user_id=ALICE) is not None
+
+
+def test_non_owner_cannot_flip_the_share_flag(store: SqlAlchemyProjectStore) -> None:
+    """Sharing and un-sharing are writes, so they are owner-only too."""
+    store.create(_uid("p1"), "Fleet", ALICE, None, True)
+    assert store.update(_uid("p1"), user_id=BOB, shared=False) is None
+    still_shared = store.get(_uid("p1"), user_id=ALICE)
+    assert still_shared is not None and still_shared.shared is True
+
+    store.create(_uid("p2"), "Alice Private", ALICE)
+    assert store.update(_uid("p2"), user_id=BOB, shared=True) is None
+    assert store.get(_uid("p2"), user_id=BOB) is None, "the private project stays invisible"
+
+
+def test_owner_can_share_and_unshare(store: SqlAlchemyProjectStore) -> None:
+    """The owner toggles the flag, and ``updated_at`` is stamped for it."""
+    store.create(_uid("p1"), "Fleet", ALICE)
+    shared = store.update(_uid("p1"), user_id=ALICE, shared=True)
+    assert shared is not None and shared.shared is True
+    assert shared.updated_at is not None, "flipping the flag is a change, so it stamps"
+    assert store.get(_uid("p1"), user_id=BOB) is not None
+
+    unshared = store.update(_uid("p1"), user_id=ALICE, shared=False)
+    assert unshared is not None and unshared.shared is False
+    assert store.get(_uid("p1"), user_id=BOB) is None, "un-sharing takes the access back"
+
+
+def test_update_leaves_shared_untouched_when_not_named(store: SqlAlchemyProjectStore) -> None:
+    """A rename must not silently un-share the project."""
+    store.create(_uid("p1"), "Fleet", ALICE, None, True)
+    renamed = store.update(_uid("p1"), user_id=ALICE, name="Fleet v2")
+    assert renamed is not None
+    assert renamed.name == "Fleet v2"
+    assert renamed.shared is True
+
+
+# ── Orvex: a private project is upstream, exactly (SEC-8 / AC6) ────────────
+#
+# Written for this case specifically, not as a by-product of the sharing tests
+# above. A bug that leaked the flag onto unshared rows would expose people's
+# personal sessions, so the whole private surface is asserted in one place.
+
+
+def test_private_project_is_untouched_by_the_shared_flag(store: SqlAlchemyProjectStore) -> None:
+    """Every store method behaves for a private project exactly as upstream.
+
+    Alice owns one private project. Bob is an unrelated user who owns a shared
+    project of his own — present deliberately, so the test also proves the
+    existence of *some* shared row in the table does not widen an unrelated
+    private one.
+    """
+    store.create(_uid("p1"), "Alice Private", ALICE)
+    store.create(_uid("p2"), "Bob Shared", BOB, None, True)
+
+    # get: not found for a non-owner.
+    assert store.get(_uid("p1"), user_id=BOB) is None
+    # list: absent for a non-owner (and Bob still sees only his own row).
+    assert [p.name for p in store.list(user_id=BOB)] == ["Bob Shared"]
+    # update: refused, and nothing changes.
+    assert store.update(_uid("p1"), user_id=BOB, name="Hijacked") is None
+    # delete: refused.
+    assert store.delete(_uid("p1"), user_id=BOB) is False
+
+    # The owner's own view of her private project is entirely unaffected.
+    owned = store.get(_uid("p1"), user_id=ALICE)
+    assert owned is not None
+    assert owned.name == "Alice Private"
+    assert owned.shared is False
+    alice_view = {p.name: p.shared for p in store.list(user_id=ALICE)}
+    assert alice_view["Alice Private"] is False
+    # Alice sees Bob's shared project too — sharing is symmetric, and that is
+    # the point. What must never happen is her own row acquiring the flag.
+    assert alice_view["Bob Shared"] is True

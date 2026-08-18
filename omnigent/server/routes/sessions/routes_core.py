@@ -190,6 +190,50 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 
 
+def _shared_project_owner_for(
+    project_store: ProjectStore | None,
+    project: str,
+    user_id: str | None,
+) -> str | None:
+    """Orvex — resolve a folder name to the owner of a *shared* project.
+
+    Returns the ``user_id`` of a project named ``project`` that ``user_id`` can
+    read but does not own, or ``None`` when no such project applies. ``None``
+    is the answer for every case upstream already handles, so the caller's
+    behaviour is unchanged unless a genuinely shared, genuinely foreign project
+    is in play.
+
+    Two rules matter here:
+
+    * **The caller's own project always wins.** If they own a project of this
+      name, the answer is ``None`` and the folder stays owner-scoped, even when
+      someone else has shared a project with the same name. Otherwise a
+      colleague could shadow one of their folders by naming a shared project
+      after it.
+    * **Only ``shared`` rows qualify.** ``project_store.list`` returns owned
+      rows plus shared ones; a foreign row that is not shared cannot appear
+      here, and if one somehow did the explicit flag check would still reject
+      it. A private project must resolve exactly as upstream resolves it.
+
+    :param project_store: The project store, or ``None`` on a server without
+        first-class projects (then there is nothing to resolve).
+    :param project: The non-empty folder NAME from ``?project=``.
+    :param user_id: The calling user.
+    :returns: The shared project's owner, or ``None``.
+    """
+    if project_store is None:
+        return None
+    shared_owner: str | None = None
+    for proj in project_store.list(user_id=user_id):
+        if proj.name != project:
+            continue
+        if proj.user_id == user_id:
+            return None
+        if proj.shared and shared_owner is None:
+            shared_owner = proj.user_id
+    return shared_owner
+
+
 def register_core_routes(
     router: APIRouter,
     *,
@@ -634,10 +678,18 @@ def register_core_routes(
           ``None`` until such a project is promoted to first-class.
 
         A name present in both sources collapses to one entry that keeps the
-        first-class ``id``. Filing is owner-only, so both halves are scoped to
-        the caller (label-projects to their owned sessions, first-class to
-        their owned rows) — a project shared to them but owned by another user
-        does not surface as one of their own folders.
+        first-class ``id``. The legacy label half stays scoped to the caller's
+        *owned* sessions — a session merely shared with them belongs on
+        "Shared with me", not in a folder of theirs.
+
+        **Orvex divergence.** The first-class half is whatever
+        ``project_store.list`` returns, which now includes projects owned by
+        someone else and marked ``shared`` — that is the entire mechanism by
+        which a shared folder reaches a non-owner's sidebar. Precedence is
+        explicit: when a shared project's name collides with one of the
+        caller's own, the caller's own wins, so a folder they already had can
+        never be shadowed (and re-pointed at another user's sessions) by
+        someone else sharing a like-named project.
 
         :returns: List of :class:`SessionProjectSummary` ordered by name.
         """
@@ -647,8 +699,17 @@ def register_core_routes(
             # First-class first so its id wins when a name exists in both.
             by_name: dict[str, SessionProjectSummary] = {}
             if project_store is not None:
+                # Orvex: two passes so the caller's own project always wins a
+                # name collision with a shared one, whatever the row order.
+                shared_by_name: dict[str, SessionProjectSummary] = {}
                 for proj in project_store.list(user_id=user_id):
-                    by_name[proj.name] = SessionProjectSummary(id=proj.id, name=proj.name)
+                    summary = SessionProjectSummary(id=proj.id, name=proj.name)
+                    if proj.user_id == user_id:
+                        by_name[proj.name] = summary
+                    else:
+                        shared_by_name.setdefault(proj.name, summary)
+                for shared_name, shared_summary in shared_by_name.items():
+                    by_name.setdefault(shared_name, shared_summary)
             # Legacy path: label-derived projects (id=None unless already first-class).
             for name in conversation_store.list_projects(owned_by=user_id):
                 by_name.setdefault(name, SessionProjectSummary(id=None, name=name))
@@ -898,7 +959,25 @@ def register_core_routes(
         # the store resolves the project NAME to the caller's own project id.
         # The flat list (project=None) and Unfiled (project="") stay unscoped so
         # shared sessions still surface for the "Shared with me" tab.
-        owned_by = user_id if project else None
+        #
+        # Orvex divergence. That reasoning holds for an owner-private project
+        # and is exactly what a shared project overrides — and ONLY a shared
+        # project. When the named folder resolves to someone else's shared
+        # project, the folder scopes by ACCESS instead of ownership: drop
+        # ``owned_by`` (so the caller sees every session in the folder they
+        # hold a grant on, not just their own) and resolve the NAME against
+        # the project's owner via ``project_owner``. Both halves are needed:
+        # ``owned_by`` does double duty upstream as the session-ownership
+        # prefetch AND the project name→id scope, so relaxing it without
+        # ``project_owner`` would resolve the name against ``user_id IS NULL``
+        # and return an empty folder, while relaxing neither returns an empty
+        # folder too — the silent success this whole change exists to avoid.
+        shared_project_owner = (
+            await asyncio.to_thread(_shared_project_owner_for, project_store, project, user_id)
+            if project
+            else None
+        )
+        owned_by = None if shared_project_owner is not None else (user_id if project else None)
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -918,6 +997,9 @@ def register_core_routes(
             search_query=normalized_query,
             include_archived=include_archived,
             project=project,
+            # Orvex: ``None`` for every project but a shared one, which keeps
+            # the resolution owner-scoped exactly as upstream.
+            project_owner=shared_project_owner,
             pinned=pinned,
             # Pins are per-user: filter to the caller's own pin key.
             pinned_owner=user_id,
@@ -1920,10 +2002,18 @@ def register_core_routes(
                     str(exc),
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
-        # File into a first-class project (owner-only, gated above). ``""``
-        # unfiles; a non-empty id must name a project the caller owns. Filing
-        # into another owner's (or a missing) project is rejected as NOT_FOUND
-        # — the same 404 the projects API returns, so we don't leak existence.
+        # File into a first-class project (owner-only on the SESSION, gated
+        # above). ``""`` unfiles; a non-empty id must name a project the
+        # caller can read. Filing into an unreadable (or missing) project is
+        # rejected as NOT_FOUND — the same 404 the projects API returns, so we
+        # don't leak existence.
+        #
+        # Orvex divergence, by inheritance rather than by edit: the check
+        # below is upstream's, unchanged. It reads "a project the caller can
+        # read" instead of "owns" purely because ``project_store.get`` now
+        # resolves a shared project for a non-owner. That is what lets someone
+        # file their own session into a colleague's shared folder, and it is
+        # why filing is not a site of its own.
         if set_project:
             # ``""`` unfiles; a non-empty id files. Explicit JSON ``null`` is
             # not a valid value here (omitting the field is how you leave
@@ -1948,10 +2038,10 @@ def register_core_routes(
                         "Filing a session into a project is not supported by this server",
                         code=ErrorCode.INVALID_INPUT,
                     )
-                owned = await asyncio.to_thread(
+                readable = await asyncio.to_thread(
                     project_store.get, target_project_id, user_id=user_id
                 )
-                if owned is None:
+                if readable is None:
                     raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
                 filed = await asyncio.to_thread(
                     conversation_store.set_conversation_project,
@@ -2139,13 +2229,21 @@ def register_core_routes(
         )
 
         # Keep the fork filed in the source's first-class project, but only
-        # when the forker owns that project — projects are owner-private, so
-        # a fork of a shared session filed in someone else's project stays
-        # unfiled (a foreign project id would show in no folder view).
+        # when the forker can read that project — otherwise a foreign project
+        # id would show in no folder view of theirs, so the fork stays unfiled.
+        #
+        # Orvex divergence, by inheritance rather than by edit: the probe below
+        # is upstream's, unchanged. Because ``project_store.get`` now resolves
+        # a shared project for a non-owner, a fork of a shared session that
+        # lives in a shared folder stays in that folder — which is the point,
+        # since the forker can see the folder. A fork of a session in someone
+        # else's PRIVATE project still lands unfiled, exactly as upstream.
         fork_project_id = None
         if source.project_id is not None and project_store is not None:
-            owned = await asyncio.to_thread(project_store.get, source.project_id, user_id=user_id)
-            if owned is not None:
+            readable = await asyncio.to_thread(
+                project_store.get, source.project_id, user_id=user_id
+            )
+            if readable is not None:
                 fork_project_id = source.project_id
 
         try:

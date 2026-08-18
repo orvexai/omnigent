@@ -1301,6 +1301,12 @@
             "description": "Human-readable project name. Trimmed; must be non-empty and at most 100 characters; unique among the caller's projects.",
             "title": "Name",
             "type": "string"
+          },
+          "shared": {
+            "default": false,
+            "description": "**Orvex divergence.** Create the project already readable by non-owners. Omitted defaults to `false` \u2014 upstream's owner-private project \u2014 so an existing client that has never heard of the field keeps creating private projects.",
+            "title": "Shared",
+            "type": "boolean"
           }
         },
         "required": [
@@ -6807,6 +6813,18 @@
             ],
             "description": "New project name. `None` leaves it unchanged; otherwise trimmed, non-empty, at most 100 characters.",
             "title": "Name"
+          },
+          "shared": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "**Orvex divergence.** New value for the share flag; `None` leaves it unchanged. Owner-only, like every other field here \u2014 a non-owner reading a shared project cannot un-share it or share it further.",
+            "title": "Shared"
           }
         },
         "title": "UpdateProjectRequest",
@@ -8599,7 +8617,7 @@
     },
     "/v1/projects": {
       "get": {
-        "description": "List the caller's projects.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
+        "description": "List the projects the caller can read.\n\nOrvex: that is the caller's own projects plus every shared one.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
         "operationId": "list_projects_v1_projects_get",
         "responses": {
           "200": {
@@ -8665,7 +8683,7 @@
     },
     "/v1/projects/{project_id}": {
       "delete": {
-        "description": "Delete one of the caller's projects.\n\nMember sessions are not deleted; they are left for the caller to\nunfile (clearing their `project_id`).\n\n**Returns:** `{\"id\": ..., \"object\": \"project.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
+        "description": "Delete one of the caller's OWN projects.\n\nOwner-only including for a shared project.\n\nMember sessions are not deleted; they are left for the caller to\nunfile (clearing their `project_id`).\n\n**Returns:** `{\"id\": ..., \"object\": \"project.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
         "operationId": "delete_project_v1_projects__project_id__delete",
         "parameters": [
           {
@@ -8709,7 +8727,7 @@
         ]
       },
       "get": {
-        "description": "Return one of the caller's projects.\n\n**Returns:** The project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
+        "description": "Return a project the caller can read (their own, or a shared one).\n\n**Returns:** The project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
         "operationId": "get_project_v1_projects__project_id__get",
         "parameters": [
           {
@@ -8753,7 +8771,7 @@
         ]
       },
       "patch": {
-        "description": "Update one of the caller's projects (e.g. rename).\n\n**Parameters**\n\n- `body` \u2014 Fields to change; `None` fields are left unchanged.\n\n**Returns:** The updated project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned, 409 if the new name collides with another of the caller's projects.",
+        "description": "Update one of the caller's OWN projects (e.g. rename, or share it).\n\nOwner-only including for a shared project: reading a shared project\nnever confers the right to rename, reconfigure or un-share it, and a\nnon-owner gets the same 404 upstream gives them.\n\n**Parameters**\n\n- `body` \u2014 Fields to change; `None` fields are left unchanged.\n\n**Returns:** The updated project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned, 409 if the new name collides with another of the caller's projects.",
         "operationId": "update_project_v1_projects__project_id__patch",
         "parameters": [
           {
@@ -9173,7 +9191,7 @@
     },
     "/v1/sessions/projects": {
       "get": {
-        "description": "Return the caller's projects as `{\"id\", \"name\"}` pairs, ordered\nalphabetically by name.\n\nDual-reads both project representations and unions them by name:\n- **First-class projects** (`project_store`) \u2014 carry an `id` and\n  appear even when empty (the whole point of the first-class entity).\n- **Legacy label-projects** (implicit `omni_project` label) \u2014 exist\n  while at least one owned session carries the label; `id` is\n  `None` until such a project is promoted to first-class.\n\nA name present in both sources collapses to one entry that keeps the\nfirst-class `id`. Filing is owner-only, so both halves are scoped to\nthe caller (label-projects to their owned sessions, first-class to\ntheir owned rows) \u2014 a project shared to them but owned by another user\ndoes not surface as one of their own folders.\n\n**Returns:** List of `SessionProjectSummary` ordered by name.",
+        "description": "Return the caller's projects as `{\"id\", \"name\"}` pairs, ordered\nalphabetically by name.\n\nDual-reads both project representations and unions them by name:\n- **First-class projects** (`project_store`) \u2014 carry an `id` and\n  appear even when empty (the whole point of the first-class entity).\n- **Legacy label-projects** (implicit `omni_project` label) \u2014 exist\n  while at least one owned session carries the label; `id` is\n  `None` until such a project is promoted to first-class.\n\nA name present in both sources collapses to one entry that keeps the\nfirst-class `id`. The legacy label half stays scoped to the caller's\n*owned* sessions \u2014 a session merely shared with them belongs on\n\"Shared with me\", not in a folder of theirs.\n\n**Orvex divergence.** The first-class half is whatever\n`project_store.list` returns, which now includes projects owned by\nsomeone else and marked `shared` \u2014 that is the entire mechanism by\nwhich a shared folder reaches a non-owner's sidebar. Precedence is\nexplicit: when a shared project's name collides with one of the\ncaller's own, the caller's own wins, so a folder they already had can\nnever be shadowed (and re-pointed at another user's sessions) by\nsomeone else sharing a like-named project.\n\n**Returns:** List of `SessionProjectSummary` ordered by name.",
         "operationId": "list_session_projects_v1_sessions_projects_get",
         "responses": {
           "200": {

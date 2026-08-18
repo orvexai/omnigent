@@ -676,7 +676,17 @@ class SqlProject(OmnigentBase):
 
     Ownership is stamped on the row via ``user_id`` (like ``scheduled_tasks``),
     not derived from a permission table the way session ownership is — projects
-    have no ACL of their own and are never shared.
+    carry no ACL of their own.
+
+    **Orvex divergence.** Upstream projects are unconditionally owner-private.
+    This fork adds a single ``shared`` boolean: when it is true the project is
+    *readable* by any authenticated user of the workspace (sidebar, project
+    list, ``get``, the per-project session query and filing), while writes
+    (``update`` / ``delete``) stay owner-only. ``shared`` defaults to false, so
+    a project that has not opted in behaves exactly as it does upstream. The
+    flag is deliberately not an ACL: which *sessions* inside a shared project a
+    reader may see is still decided by ``session_permissions`` — sharing only
+    widens which project rows are visible, never which sessions are.
 
     :param id: Uuid16 primary key (bare 32-char hex in Python).
     :param name: Human-readable project name; unique per owner, enforced in the
@@ -685,6 +695,8 @@ class SqlProject(OmnigentBase):
     :param user_id: Owning user, or ``None`` in single-user mode.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None``.
+    :param shared: Orvex — when true, non-owners may read this project and the
+        sessions they already have access to inside it. Defaults to false.
     """
 
     __tablename__ = "projects"
@@ -712,6 +724,16 @@ class SqlProject(OmnigentBase):
     # can always override. Opaque and never SQL-filtered — stored compressed
     # (CompressedText).
     config: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Orvex divergence. Opt-in read sharing: false (the default, and the value
+    # every pre-migration row carries) is upstream's owner-private project.
+    # NOT NULL with a server-side default so a row written by any older code
+    # path — or by the migration's backfill — lands private rather than NULL.
+    # Deliberately not in ix_projects_user_id: the projects table is small
+    # (tens of rows per workspace) and the shared-OR-mine predicate is a
+    # workspace-scoped scan, not a hot path.
+    shared: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
 
     __table_args__ = (
         # "list my projects" — prefix scan on (workspace_id, user_id) with

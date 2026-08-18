@@ -2213,6 +2213,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        project_owner: str | None = None,
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
@@ -2268,6 +2269,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None`` disables the filter. The name→id resolution is scoped to
             ``owned_by`` (projects are owner-private), so pass ``owned_by``
             alongside a specific name for the first-class half to resolve.
+        :param project_owner: **Orvex divergence.** Resolve the project NAME
+            against this owner instead of ``owned_by``. ``None`` (default)
+            means "same as ``owned_by``" — upstream's behaviour. It exists
+            because a shared project needs the two scopes pulled apart: the
+            name must resolve to the *owner's* row while the sessions returned
+            are scoped by access (``accessible_by``) rather than ownership.
+            Passing ``owned_by=None`` alone would resolve the name against
+            ``user_id IS NULL`` and silently match an unrelated single-user
+            project of the same name.
         :param pinned: When ``True``, restrict to sessions ``pinned_owner`` has
             pinned (their per-user ``omnigent.pinned.<user>`` label — the
             sidebar's Pinned section). ``False`` (default) disables the filter.
@@ -2479,7 +2489,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                         .where(
                             SqlConversationMetadata.workspace_id == current_workspace_id(),
                             SqlProject.workspace_id == current_workspace_id(),
-                            SqlProject.user_id == owned_by,
+                            # Orvex: ``project_owner`` when the caller is
+                            # reading someone else's shared folder, else
+                            # ``owned_by`` exactly as upstream.
+                            SqlProject.user_id
+                            == (project_owner if project_owner is not None else owned_by),
                             SqlProject.name == project,
                         )
                     )
