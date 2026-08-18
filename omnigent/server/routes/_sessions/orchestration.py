@@ -98,7 +98,6 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
-from omnigent.server import session_live_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -321,7 +320,6 @@ from omnigent.server.schemas import (
     SessionListItem,
     SessionModelEvent,
     SessionResponse,
-    SessionStatusEvent,
     SessionUsageEvent,
     SkillSummary,
 )
@@ -2542,15 +2540,7 @@ async def _publish_runner_recovered_status_impl(
             last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
         if last_error is None or last_error.get("code") != "runner_disconnected":
             return
-    _session_status_cache[session_id] = "idle"
-    session_live_state.persist_live_status(session_id, "idle")
-    event = SessionStatusEvent(
-        type="session.status",
-        conversation_id=session_id,
-        status="idle",
-        error=None,
-    )
-    session_stream.publish(session_id, event.model_dump())
+    _publish_status(session_id, "idle", origin="reconciliation")
     await _persist_session_status_error_labels(session_id, None, conversation_store)
 
 
@@ -9137,10 +9127,9 @@ async def _get_session_snapshot(
                 )
                 if resp.status_code == 200:
                     raw = resp.json().get("status", "idle")
-                    _session_status_cache[session_id] = raw
                     if raw in ("idle", "running", "waiting", "failed"):
-                        session_live_state.persist_live_status(session_id, raw)
-                    status = _session_status_from_cache(session_id)
+                        _publish_status(session_id, raw, origin="reconciliation")
+                        status = _session_status_from_cache(session_id)
             except (httpx.HTTPError, ConnectionError):
                 _logger.debug(
                     "Runner status query failed for %s",
