@@ -356,7 +356,9 @@ def induced_failure_tests(
     expected_version: str | None,
     skip_web_ui: bool,
 ) -> None:
-    with tempfile.TemporaryDirectory(prefix="macos-bundle-negative-") as temp:
+    # Alongside the bundle, not in /tmp: the negative tests hardlink the tree,
+    # and the runner mounts the workspace on a different filesystem.
+    with tempfile.TemporaryDirectory(prefix="macos-bundle-negative-", dir=bundle.parent) as temp:
         temp_root = Path(temp)
         elf = temp_root / "elf"
         shutil.copytree(bundle, elf, symlinks=True, copy_function=os.link)
