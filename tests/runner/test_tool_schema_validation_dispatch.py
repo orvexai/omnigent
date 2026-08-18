@@ -39,6 +39,35 @@ async def test_sys_session_create_args_is_rejected_before_proxy_dispatch() -> No
 
 
 @pytest.mark.asyncio
+async def test_dispatch_schema_manager_is_cached_per_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Schema validation must not rebuild the full manager for each call."""
+    construction_count = 0
+    real_manager = _tool_dispatch.ToolManager
+
+    class _CountingToolManager(real_manager):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            nonlocal construction_count
+            construction_count += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(_tool_dispatch, "ToolManager", _CountingToolManager)
+    _tool_dispatch._tool_schema_cache.clear()
+    spec = AgentSpec(spec_version=1, spawn=True)
+
+    for _ in range(2):
+        output = await _tool_dispatch.execute_tool(
+            tool_name="sys_session_create",
+            arguments='{"agent_id":"ag_worker","args":"brief"}',
+            agent_spec=spec,
+        )
+        assert "unknown parameter 'args'" in output
+
+    assert construction_count == 1
+
+
+@pytest.mark.asyncio
 async def test_direct_mcp_manager_rejects_unknown_parameter_before_server_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

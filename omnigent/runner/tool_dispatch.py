@@ -33,6 +33,7 @@ import re
 import tempfile
 import time as _time
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,7 +47,7 @@ if TYPE_CHECKING:
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.runner.resource_registry import SessionResourceRegistry
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
-    from omnigent.spec.types import AgentSpec, SkillSpec
+    from omnigent.spec.types import SkillSpec
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
@@ -79,6 +80,7 @@ from omnigent.session_lifecycle import (
     title_without_closed_marker,
     tombstoned_title,
 )
+from omnigent.spec.types import AgentSpec
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -123,6 +125,45 @@ from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
 from omnigent.tools.schema_validation import validate_tool_arguments
 
 _logger = logging.getLogger(__name__)
+
+_ToolSchema = dict[str, Any]
+_tool_schema_cache: dict[
+    int,
+    tuple[weakref.ReferenceType[AgentSpec], dict[str, _ToolSchema]],
+] = {}
+
+
+def _tool_schemas_for_dispatch(spec: AgentSpec) -> dict[str, _ToolSchema]:
+    """Return the parsed spec's tool schemas without rebuilding its manager.
+
+    The runner only needs schemas for validation; it does not need a live
+    manager for dispatch. Cache the schema snapshot by spec identity so the
+    manager's skill discovery and registration work happen once per session.
+    """
+    cache_key = id(spec)
+    cached = _tool_schema_cache.get(cache_key)
+    if cached is not None and cached[0]() is spec:
+        return cached[1]
+
+    manager = ToolManager(spec)
+    try:
+        schemas: dict[str, _ToolSchema] = {}
+        for schema in manager.get_tool_schemas():
+            function = schema.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if isinstance(name, str):
+                schemas[name] = schema
+    finally:
+        manager.shutdown()
+
+    def _discard(_ref: weakref.ReferenceType[AgentSpec], *, key: int = cache_key) -> None:
+        _tool_schema_cache.pop(key, None)
+
+    _tool_schema_cache[cache_key] = (weakref.ref(spec, _discard), schemas)
+    return schemas
+
 
 _EventPublisher = Callable[[str, _JsonObject], None]
 
@@ -1372,7 +1413,7 @@ async def _resolve_thread_for_send(
                 thread=resolution.thread,
                 server_client=server_client,
             )
-        except Exception:  # noqa: BLE001 - delivery remains backward compatible on old servers
+        except Exception:
             _logger.warning(
                 "Could not persist message thread %s; continuing with runner-local state",
                 resolution.thread.thread_id,
@@ -7337,7 +7378,7 @@ async def _collect_sub_agents(
                     # Exclude the caller itself from its own sibling list.
                     if entry["conversation_id"] != conversation_id:
                         result.append(entry)
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.debug(
                 "sys_session_list sibling enrichment failed for parent %s",
                 parent_id,
@@ -7782,7 +7823,7 @@ async def _session_close_via_rest(
                 thread=thread,
                 server_client=server_client,
             )
-        except Exception:  # noqa: BLE001 - session close remains successful
+        except Exception:
             _logger.warning(
                 "Could not delete labels for closed message thread %s",
                 thread.thread_id,
@@ -7910,16 +7951,14 @@ async def execute_tool(
     # Runner-owned builtins bypass ToolManager.invoke(), so apply the same
     # executable schema contract before choosing a dispatch branch. MCP-owned
     # tools are checked by their manager against the discovered MCP schema.
-    if agent_spec is not None:
-        registered_tool = ToolManager(agent_spec).get_tool(tool_name)
-        if registered_tool is not None:
-            schema = registered_tool.get_schema()
-            function = schema.get("function")
-            parameters = function.get("parameters") if isinstance(function, dict) else None
-            if isinstance(parameters, dict):
-                validation_error = validate_tool_arguments(tool_name, args, parameters)
-                if validation_error is not None:
-                    return f"Error: {validation_error}"
+    if isinstance(agent_spec, AgentSpec):
+        schema = _tool_schemas_for_dispatch(agent_spec).get(tool_name)
+        function = schema.get("function") if schema is not None else None
+        parameters = function.get("parameters") if isinstance(function, dict) else None
+        if isinstance(parameters, dict):
+            validation_error = validate_tool_arguments(tool_name, args, parameters)
+            if validation_error is not None:
+                return f"Error: {validation_error}"
 
     try:
         if mcp_manager is not None:
@@ -9653,7 +9692,7 @@ async def _evaluate_async_tool_call_policy(
             resp.status_code,
             evaluation_id,
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.warning(
             "async PHASE_TOOL_CALL policy evaluate failed for %s; denying",
             evaluation_id,
