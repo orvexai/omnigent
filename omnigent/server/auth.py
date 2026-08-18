@@ -55,7 +55,6 @@ _TRUTHY_STRINGS = ("1", "true", "yes")
 # its underlying identity is an admin. Delegated clients only need these.
 _DELEGATED_ALLOWED_PREFIXES = (
     "/health",
-    "/ready",
     "/v1/agents",
     "/v1/hosts",
     "/v1/sessions",

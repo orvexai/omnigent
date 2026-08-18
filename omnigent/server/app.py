@@ -193,9 +193,7 @@ _API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.ht
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
-_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "ready", "v1", ".well-known"})
-_READINESS_CACHE_TTL_SECONDS = 1.0
-_READINESS_CHECK_TIMEOUT_SECONDS = 0.5
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1", ".well-known"})
 
 # Envelope version of GET /.well-known/omnigent.json (see the route for the
 # full contract). Bump ONLY for a change a client cannot absorb by ignoring
@@ -1872,52 +1870,6 @@ def create_app(
             }
         return result
 
-    readiness_cache: tuple[float, bool] | None = None
-    readiness_lock = asyncio.Lock()
-
-    @app.get("/ready")
-    async def readiness() -> Response:
-        """Report whether the conversation database can serve requests.
-
-        This deliberately checks only the database: process liveness remains
-        the job of ``/health``, while optional services may be unavailable
-        without making every replica flap out of the load balancer.
-        """
-        nonlocal readiness_cache
-        now = time.monotonic()
-        if readiness_cache is not None and now - readiness_cache[0] < _READINESS_CACHE_TTL_SECONDS:
-            reachable = readiness_cache[1]
-        else:
-            async with readiness_lock:
-                now = time.monotonic()
-                if (
-                    readiness_cache is not None
-                    and now - readiness_cache[0] < _READINESS_CACHE_TTL_SECONDS
-                ):
-                    reachable = readiness_cache[1]
-                else:
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.to_thread(
-                                conversation_store.check_database_connectivity,
-                                timeout_ms=int(_READINESS_CHECK_TIMEOUT_SECONDS * 1000),
-                            ),
-                            timeout=_READINESS_CHECK_TIMEOUT_SECONDS,
-                        )
-                    except Exception as exc:  # noqa: BLE001 — readiness must fail closed
-                        _logger.warning("Readiness database check failed: %s", exc)
-                        reachable = False
-                    else:
-                        reachable = True
-                    readiness_cache = (time.monotonic(), reachable)
-
-        if not reachable:
-            return JSONResponse(
-                status_code=503,
-                content={"status": "unready", "dependency": "database"},
-            )
-        return JSONResponse(status_code=200, content={"status": "ok"})
-
     @app.get("/api/version")
     async def version() -> dict[str, str]:
         """
@@ -2923,7 +2875,7 @@ class _SPAStaticFiles(StaticFiles):
     ``/c/abc`` would 404.
 
     The fallback is gated by an API-prefix and extension check: unmatched
-    ``/v1`` / ``/api`` / ``/auth`` / ``/health`` / ``/ready`` paths return a JSON 404,
+    ``/v1`` / ``/api`` / ``/auth`` / ``/health`` paths return a JSON 404,
     and a path with a file extension (``.js``, ``.css``, ``.png``,
     ``.woff2``, …) returns the static 404 verbatim. Other extensionless
     paths fall back to ``index.html``.
