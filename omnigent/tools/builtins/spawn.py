@@ -271,7 +271,7 @@ def _build_sys_session_send_schema(
             "Targets ANY session you can access — your own children, and "
             "peer sessions on other machines (find them with "
             "sys_session_list). That is how you talk to an agent on "
-            "another host. Busy peers default to rejection; pass if_busy to "
+            "another host. A busy peer queues the message by default; pass if_busy to "
             "choose queue or interrupt. The text is delivered "
             "wrapped in a provenance envelope naming "
             "the sending session, and the receiver's reply returns through "
@@ -362,7 +362,7 @@ def _build_sys_session_send_schema(
                         "enum": ["reject", "queue", "interrupt"],
                         "description": (
                             "What to do when the target is busy. Omitted defaults to "
-                            "queue for a child and reject for a peer; interrupt is never implicit."
+                            "queue for a child and for a peer; interrupt is never implicit."
                         ),
                     },
                     "session_id": {
