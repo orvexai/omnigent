@@ -2589,10 +2589,9 @@ async def _mark_runner_sessions_offline_impl(
         # consumes the marker — so peek without discarding here.
         if conv.id in _intentional_stop_sessions:
             continue
-        # Cache first (this replica holds the runner's tunnel, so it saw the
-        # turn edges), falling back to the row for a session whose live state
-        # was published before a restart.
-        live = _session_status_cache.get(conv.id, conv.live_status)
+        # The cache is authoritative on the replica holding the runner
+        # tunnel. A miss means this process never observed a turn edge.
+        live = _session_status_cache.get(conv.id)
         interrupted = live in ("running", "waiting")
         dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
         if not interrupted and not dead_on_arrival:

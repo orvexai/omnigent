@@ -194,3 +194,187 @@ async def test_snapshot_drops_unvalidated_runner_status(
         assert snapshot.status == "idle"
         assert session_id not in two_pod_status_cache.cache
         assert two_pod_status_cache.cache == {}
+
+
+@pytest.mark.asyncio
+async def test_relay_cache_miss_declines_without_store_read(
+    two_pod_status_cache: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    class RaisingStore:
+        get_conversation_calls = 0
+        set_labels_calls = 0
+
+        def get_conversation(self, session_id: str) -> Any:
+            del session_id
+            self.get_conversation_calls += 1
+            raise AssertionError("disconnect verdict must not read the row")
+
+        def set_labels(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            self.set_labels_calls += 1
+
+    async def dropped_stream(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise orchestration._RelayTransportLost(intentional=False)
+
+    monkeypatch.setattr(orchestration, "_relay_runner_stream_once", dropped_stream)
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        orchestration.session_stream,
+        "publish",
+        lambda session_id, payload: events.append({"id": session_id, **payload}),
+    )
+    store = RaisingStore()
+    session_id = "relay-cache-miss"
+
+    with two_pod_status_cache.enter_pod("b"):
+        await orchestration._relay_runner_stream(
+            session_id,
+            SimpleNamespace(),
+            store,  # type: ignore[arg-type]
+        )
+        assert two_pod_status_cache.cache.get(session_id) is None
+        assert two_pod_status_cache.cache == {}
+
+    assert store.get_conversation_calls == 0
+    assert store.set_labels_calls == 0
+    assert events == []
+
+
+def _offline_conversation(session_id: str, row_status: str | None) -> Any:
+    return SimpleNamespace(
+        id=session_id,
+        kind="root",
+        live_status=row_status,
+        labels={},
+    )
+
+
+async def _run_offline_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+    conversation: Any,
+    *,
+    fail_idle_top_level: bool = False,
+) -> tuple[list[dict[str, Any]], list[Any]]:
+    from omnigent.server import session_live_state
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import ErrorDetail
+
+    events: list[dict[str, Any]] = []
+    persisted_errors: list[Any] = []
+    monkeypatch.setattr(
+        orchestration.session_stream,
+        "publish",
+        lambda session_id, payload: events.append({"id": session_id, **payload}),
+    )
+    monkeypatch.setattr(session_live_state, "persist_live_status", lambda *args: None)
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_scheduled_run_completion",
+        lambda *args, **kwargs: None,
+    )
+
+    async def persist_error(session_id: str, error: Any, store: Any) -> None:
+        persisted_errors.append((session_id, error, store))
+
+    monkeypatch.setattr(orchestration, "_persist_session_status_error_labels", persist_error)
+    await orchestration._mark_runner_sessions_offline_impl(
+        [conversation],
+        ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly."),
+        SimpleNamespace(),
+        fail_idle_top_level=fail_idle_top_level,
+    )
+    return events, persisted_errors
+
+
+@pytest.mark.asyncio
+async def test_offline_verdict_idle_cache_does_not_fail_row_running(
+    two_pod_status_cache: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "offline-idle-cache"
+    with two_pod_status_cache.enter_pod("a"):
+        two_pod_status_cache.cache[session_id] = "idle"
+        events, persisted = await _run_offline_reconciliation(
+            monkeypatch,
+            _offline_conversation(session_id, "running"),
+        )
+        assert orchestration._session_status_cache.get(session_id) == "idle"
+    assert events == []
+    assert persisted == []
+
+
+@pytest.mark.asyncio
+async def test_offline_verdict_running_cache_fails_row_idle_with_cause(
+    two_pod_status_cache: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "offline-running-cache"
+    with two_pod_status_cache.enter_pod("a"):
+        two_pod_status_cache.cache[session_id] = "running"
+        events, persisted = await _run_offline_reconciliation(
+            monkeypatch,
+            _offline_conversation(session_id, "idle"),
+        )
+        assert two_pod_status_cache.cache[session_id] == "failed"
+    assert events[0]["error"]["code"] == "runner_disconnected"
+    assert persisted[0][1].code == "runner_disconnected"
+
+
+@pytest.mark.asyncio
+async def test_tunnel_hook_cache_only_table_and_crash_path(
+    two_pod_status_cache: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "offline-tunnel-hook"
+    with two_pod_status_cache.enter_pod("b"):
+        events, persisted = await _run_offline_reconciliation(
+            monkeypatch,
+            _offline_conversation(session_id, "running"),
+        )
+        assert two_pod_status_cache.cache.get(session_id) is None
+        assert two_pod_status_cache.cache == {}
+    assert events == []
+    assert persisted == []
+
+    with two_pod_status_cache.enter_pod("a"):
+        two_pod_status_cache.cache[session_id] = "running"
+        events, persisted = await _run_offline_reconciliation(
+            monkeypatch,
+            _offline_conversation(session_id, None),
+        )
+    assert events[0]["error"]["code"] == "runner_disconnected"
+    assert persisted[0][1].code == "runner_disconnected"
+
+    crash_id = "offline-crash-top-level"
+    with two_pod_status_cache.enter_pod("b"):
+        events, persisted = await _run_offline_reconciliation(
+            monkeypatch,
+            _offline_conversation(crash_id, "idle"),
+            fail_idle_top_level=True,
+        )
+        assert two_pod_status_cache.cache[crash_id] == "failed"
+    assert events[0]["id"] == crash_id
+    assert persisted[0][1].code == "runner_disconnected"
+
+
+@pytest.mark.asyncio
+async def test_tunnel_hook_does_not_repeat_relay_failure(
+    two_pod_status_cache: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "offline-already-failed"
+    with two_pod_status_cache.enter_pod("a"):
+        two_pod_status_cache.cache[session_id] = "failed"
+        events, persisted = await _run_offline_reconciliation(
+            monkeypatch,
+            _offline_conversation(session_id, "running"),
+        )
+    assert events == []
+    assert persisted == []
