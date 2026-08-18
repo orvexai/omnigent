@@ -136,7 +136,11 @@ def resolve_host_launch(
         # offline → CONFLICT (409). Mirrors RunnerRouter._runner_absent_code
         # and hosts._host_absent_error.
         if host_is_live(host):
-            raise OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
+            raise OmnigentError(
+                "host is on another replica",
+                code=ErrorCode.WRONG_REPLICA,
+                owner_addr=host.owner_addr,
+            )
         raise OmnigentError("host is offline", code=ErrorCode.CONFLICT)
 
     conv = conversation_store.get_conversation(session_id)

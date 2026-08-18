@@ -39,6 +39,7 @@ from omnigent.server import session_live_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.stores.runner_tunnel_store import RunnerTunnelStore
 
 _logger = logging.getLogger(__name__)
 
@@ -161,6 +162,8 @@ def create_runner_tunnel_router(
     auth_provider: AuthProvider | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
+    runner_tunnel_store: RunnerTunnelStore | None = None,
+    pod_addr: str | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
 
@@ -466,6 +469,8 @@ def create_runner_tunnel_router(
             #    rejected) before ``accept()`` above, so runner-binding
             #    checks can enforce ownership.
             session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
+            if runner_tunnel_store is not None:
+                await asyncio.to_thread(runner_tunnel_store.claim, runner_id, pod_addr)
             _logger.info(
                 "Runner %s connected (version=%s, harnesses=%s)",
                 runner_id,
@@ -485,7 +490,14 @@ def create_runner_tunnel_router(
                 name=f"tunnel-sender:{runner_id}",
             )
             ping_task = asyncio.create_task(
-                _ping_loop(ws, session, runner_id, registry),
+                _ping_loop(
+                    ws,
+                    session,
+                    runner_id,
+                    registry,
+                    runner_tunnel_store,
+                    pod_addr,
+                ),
                 name=f"tunnel-ping:{runner_id}",
             )
             receive_task = asyncio.create_task(
@@ -568,6 +580,8 @@ def create_runner_tunnel_router(
                     return_exceptions=True,
                 )
                 registry.deregister(runner_id, session)
+                if runner_tunnel_store is not None:
+                    await asyncio.to_thread(runner_tunnel_store.release, runner_id, pod_addr)
                 if on_runner_disconnect is not None:
                     try:
                         await on_runner_disconnect(runner_id)
@@ -598,6 +612,8 @@ def create_runner_tunnel_router(
                 registry.deregister(runner_id, session)
             else:
                 registry.deregister(runner_id)
+            if runner_tunnel_store is not None:
+                await asyncio.to_thread(runner_tunnel_store.release, runner_id, pod_addr)
             if on_runner_disconnect is not None:
                 try:
                     await on_runner_disconnect(runner_id)
@@ -703,6 +719,8 @@ async def _ping_loop(
     session: RunnerSession,
     runner_id: str,
     registry: TunnelRegistry,
+    runner_tunnel_store: RunnerTunnelStore | None = None,
+    pod_addr: str | None = None,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
@@ -748,6 +766,8 @@ async def _ping_loop(
         # Best-effort and deduplicated inside the chokepoint; the enqueue
         # inherits this handler's workspace scope via copy_context.
         session_live_state.touch_runner_liveness([runner_id])
+        if runner_tunnel_store is not None:
+            await asyncio.to_thread(runner_tunnel_store.heartbeat, runner_id, pod_addr)
         try:
             await registry.send_text(
                 session,

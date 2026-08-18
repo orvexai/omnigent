@@ -101,6 +101,12 @@ def _host_absent_error(host: Host) -> OmnigentError:
         to the HTTP status and the ``{"error": {"code": ...}}`` body the
         client's re-address matches on.
     """
+    if host.owner_addr is not None:
+        return OmnigentError(
+            "host is on another replica",
+            code=ErrorCode.WRONG_REPLICA,
+            owner_addr=host.owner_addr,
+        )
     if host_is_live(host):
         return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
     return OmnigentError("host is offline", code=ErrorCode.CONFLICT)

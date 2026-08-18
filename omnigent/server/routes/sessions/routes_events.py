@@ -480,6 +480,10 @@ def register_events_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
+        if body.type.startswith("external_"):
+            # External harness posts are session-scoped. Detect a remote
+            # runner before any publish, tombstone, or persistence side effect.
+            await record_elicitation_resolution_if_off_owner(request, conv, runner_router)
         created_by = _attribution_user(user_id)
         body_created_by = _attribution_user(body.created_by)
         if body_created_by is not None:
@@ -992,7 +996,6 @@ def register_events_routes(
                     "external_elicitation_resolved requires string data.elicitation_id.",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            record_elicitation_resolution_if_off_owner(request, conv, runner_router)
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
@@ -1373,6 +1376,7 @@ def register_events_routes(
                     raise OmnigentError(
                         "session runner is on another replica; retry",
                         code=ErrorCode.WRONG_REPLICA,
+                        owner_addr=_wrong_pod_host.owner_addr,
                     )
         if runner_client is None and conv.kind == "sub_agent":
             # A sub-agent copies its parent's runner_id at creation and is
@@ -1824,6 +1828,7 @@ def register_events_routes(
                         raise OmnigentError(
                             "session stream is on another replica; retry",
                             code=ErrorCode.WRONG_REPLICA,
+                            owner_addr=host.owner_addr,
                         )
         await _ensure_runner_relay_ready(
             session_id,

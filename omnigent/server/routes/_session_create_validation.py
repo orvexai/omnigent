@@ -166,6 +166,7 @@ async def validate_existing_host_workspace(
             raise OmnigentError(
                 f"host {host_name or host_id!r} is on another replica; retry",
                 code=ErrorCode.WRONG_REPLICA,
+                owner_addr=host.owner_addr,
             )
 
     # Read the agent's os_env.cwd — None when the spec has no os_env block

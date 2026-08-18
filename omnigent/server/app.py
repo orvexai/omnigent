@@ -101,6 +101,7 @@ from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.stores.runner_tunnel_store import RunnerTunnelStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
@@ -1106,6 +1107,16 @@ def create_app(
 
     tunnel_registry = TunnelRegistry()
     host_registry = HostRegistry()
+    pod_addr = os.environ.get("OMNIGENT_POD_ADDR") or None
+    runner_tunnel_store: RunnerTunnelStore | None = (
+        getattr(host_store, "runner_tunnel_store", None) if host_store is not None else None
+    )
+    if runner_tunnel_store is None:
+        # Runner tunnels are independent of host support. In minimal server
+        # wiring, reuse the operational engine owned by the conversation store.
+        conversation_engine = getattr(conversation_store, "_engine", None)
+        if conversation_engine is not None:
+            runner_tunnel_store = RunnerTunnelStore(conversation_engine)
     runner_router = RunnerRouter(
         registry=tunnel_registry,
         conversation_store=conversation_store,
@@ -1116,6 +1127,8 @@ def create_app(
         # is the latter, not a false wrong-replica.
         host_registry=host_registry,
         host_store=host_store,
+        runner_tunnel_store=runner_tunnel_store,
+        pod_addr=pod_addr,
     )
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
@@ -1380,6 +1393,8 @@ def create_app(
     # diagnostics can verify that the production app wires the route
     # and WSTunnelTransport to the same session registry.
     app.state.tunnel_registry = tunnel_registry
+    app.state.pod_addr = pod_addr
+    app.state.runner_tunnel_store = runner_tunnel_store
     app.state.routing_stats = RoutingStats()
     app.state.runner_router = runner_router
     app.state.runner_session_initializer = runner_session_initializer
@@ -1567,6 +1582,8 @@ def create_app(
         :returns: A JSON response with the error code and message.
         """
         if exc.code == ErrorCode.WRONG_REPLICA:
+            if exc.owner_addr is not None:
+                request.state.omnigent_owner_addr = exc.owner_addr
             owner_resolvable = bool(getattr(request.state, "omnigent_owner_addr", None))
             forward_attempted = bool(getattr(request.state, "omnigent_forward_attempted", False))
             app.state.routing_stats.record_wrong_replica()
@@ -2770,6 +2787,8 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            runner_tunnel_store=runner_tunnel_store,
+            pod_addr=pod_addr,
         ),
         prefix="/v1",
         tags=["runners"],
@@ -2798,6 +2817,7 @@ def create_app(
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
+                pod_addr=pod_addr,
             ),
             prefix="/v1",
             tags=["hosts"],
