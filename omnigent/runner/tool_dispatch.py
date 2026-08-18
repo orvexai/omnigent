@@ -6745,11 +6745,11 @@ async def _collect_sub_agents(
     server_client: httpx.AsyncClient,
     *,
     agent_spec: AgentSpec | None = None,
-) -> list[dict[str, str | None]]:
+) -> list[_JsonObject]:
     """
     Collect the caller's named-sub-agent view via ``GET .../child_sessions``.
 
-    Returns ``[{"agent", "title", "conversation_id"}, ...]``, skipping
+    Returns legacy fields plus projected child state for each entry, skipping
     closed and titleless/colonless rows so they never re-surface to the
     LLM. Includes the caller's own children and, when the caller is
     itself a child (e.g. a user-added agent), its parent (surfaced as
@@ -6891,7 +6891,7 @@ async def _collect_global_sessions(
 def _child_rows_to_entries(
     rows: list[_JsonObject],
     agent_spec: AgentSpec | None = None,
-) -> list[dict[str, str | None]]:
+) -> list[_JsonObject]:
     """
     Map ``child_sessions`` rows to ``sys_session_list`` entries.
 
@@ -6903,44 +6903,65 @@ def _child_rows_to_entries(
     take a free-form title, so dropping them hid every MCP-created child from
     the caller's own sub-agent view.
 
-    ``agent`` is only reported when it is a name the caller can actually
-    dispatch to — the head of the title must be a sub-agent the parent's spec
-    declares, or the title must carry the Web UI's explicit ``"ui:"`` prefix.
+    ``agent`` is reported from the durable ``sub_agent_name`` binding, or
+    from the Web UI's explicit ``"ui:"`` prefix.
     A bare ``":"`` is NOT sufficient: a free-form title like
     ``"bug: login 500"`` would otherwise be reported as a child bound to an
     agent named ``"bug"``, and an orchestrator feeding that back into
     named-mode ``sys_session_send`` would spawn an unrelated child rather
     than reach this one. Unrecognized rows report ``agent: null`` with the
-    whole title as the label, which still identifies the child; its real
-    binding comes from ``sys_session_get_info``.
+    whole title as the label, which still identifies the child.
 
     :param rows: ``data`` rows from ``GET .../child_sessions``.
-    :param agent_spec: The calling agent's spec, used to decide whether a
-        title's head names a declared sub-agent. ``None`` reports every
-        non-``ui:`` row as ``agent: null``.
-    :returns: ``[{"agent", "title", "conversation_id"}, ...]``.
+    :param agent_spec: Retained for call-site compatibility; durable child
+        bindings no longer depend on the calling agent's spec.
+    :returns: Legacy fields plus projected child state and a human label.
     """
-    entries: list[dict[str, str | None]] = []
+    del agent_spec
+    entries: list[_JsonObject] = []
     for row in rows:
         title = _optional_string(row.get("title"))
-        labels = _string_mapping(row.get("labels"))
+        labels = _string_mapping(row.get("labels")) or {}
         if not title or is_session_closed(labels, title):
             continue
         display = title_without_closed_marker(title) or ""
         parsed_agent = _optional_string(row.get("tool"))
+        durable_agent = _optional_string(row.get("sub_agent_name"))
         if display.startswith(_UI_ADDED_TITLE_PREFIX) or (
-            parsed_agent is not None and _has_subagent(parsed_agent, agent_spec)
+            parsed_agent is not None and durable_agent is not None
         ):
             agent = parsed_agent
-            label = _optional_string(row.get("session_name"))
+            legacy_title = _optional_string(row.get("session_name"))
         else:
             agent = None
-            label = display
+            legacy_title = display
+        label_candidates = (
+            (
+                "omnigent.claude_native.description",
+                _optional_string(labels.get("omnigent.claude_native.description")),
+            ),
+            ("task_summary", _optional_string(row.get("task_summary"))),
+            ("session_name", _optional_string(row.get("session_name"))),
+            ("title", display),
+        )
+        label_source, label = next(
+            ((source, value) for source, value in label_candidates if value),
+            ("title", display),
+        )
         entries.append(
             {
                 "agent": agent,
-                "title": label,
+                "title": legacy_title,
                 "conversation_id": _optional_string(row.get("id")),
+                "label": label,
+                "label_source": label_source,
+                "busy": row.get("busy", False),
+                "current_task_status": row.get("current_task_status"),
+                "updated_at": row.get("updated_at"),
+                "last_task_error": row.get("last_task_error"),
+                "pending_elicitations_count": row.get("pending_elicitations_count", 0),
+                "labels": labels or {},
+                "task_summary": row.get("task_summary"),
             }
         )
     return entries

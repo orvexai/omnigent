@@ -5373,6 +5373,7 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                         "title": "researcher:auth",
                         "tool": "researcher",
                         "session_name": "auth",
+                        "sub_agent_name": "researcher",
                     },
                     {
                         "id": "c2",
@@ -5385,6 +5386,7 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                         "title": "researcher:done",
                         "tool": "researcher",
                         "session_name": "done",
+                        "sub_agent_name": "researcher",
                         "labels": {
                             CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE,
                             "attempt": 1,
@@ -5395,6 +5397,7 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                         "title": "researcher:legacy:closed:c5",
                         "tool": "researcher",
                         "session_name": "legacy",
+                        "sub_agent_name": "researcher",
                     },
                     {
                         "id": "c4",
@@ -5413,9 +5416,8 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                 "{}",
                 conversation_id="conv_parent",
                 server_client=client,
-                # A title's head names an agent only if the caller's spec
-                # declares it; without a spec every non-``ui:`` row is
-                # reported as agent: null.
+                # The durable child binding determines ``agent``; the
+                # caller's spec is retained only for API compatibility.
                 agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
             )
         )
@@ -5424,11 +5426,16 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
     # its bound agent + label; c4 (no colon) surfaces under its own title
     # with a null agent, so a free-form child stays reachable without
     # claiming an agent name that does not exist.
-    assert out["sub_agents"] == [
+    legacy = [
         {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
         {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2"},
         {"agent": None, "title": "legacy-untyped", "conversation_id": "c4"},
     ]
+    assert [
+        {key: entry[key] for key in ("agent", "title", "conversation_id")}
+        for entry in out["sub_agents"]
+    ] == legacy
+    assert all("current_task_status" in entry for entry in out["sub_agents"])
 
 
 @pytest.mark.asyncio
@@ -5467,6 +5474,7 @@ async def test_session_list_adds_main_and_siblings_for_child_caller() -> None:
                             "title": "researcher:auth",
                             "tool": "researcher",
                             "session_name": "auth",
+                            "sub_agent_name": "researcher",
                         },
                     ],
                 },
@@ -5485,10 +5493,14 @@ async def test_session_list_adds_main_and_siblings_for_child_caller() -> None:
         )
     # No own children; gains main (its parent) + the sibling, with itself
     # excluded from the sibling list.
-    assert out["sub_agents"] == [
+    assert [
+        {key: entry[key] for key in ("agent", "title", "conversation_id")}
+        for entry in out["sub_agents"]
+    ] == [
         {"agent": "main", "title": None, "conversation_id": "conv_main"},
         {"agent": "researcher", "title": "auth", "conversation_id": "conv_sib"},
     ]
+    assert "current_task_status" in out["sub_agents"][1]
 
 
 @pytest.mark.asyncio
@@ -7449,6 +7461,7 @@ def test_child_rows_surface_free_form_titled_children() -> None:
                 "title": "researcher:auth",
                 "tool": "researcher",
                 "session_name": "auth",
+                "sub_agent_name": "researcher",
                 "labels": {},
             },
             {
@@ -7470,7 +7483,7 @@ def test_child_rows_surface_free_form_titled_children() -> None:
                 "id": "conv_colon",
                 "title": "team:alpha",
                 "tool": "team",
-                "session_name": "alpha",
+                "session_name": None,
                 "labels": {},
             },
             {
@@ -7484,26 +7497,16 @@ def test_child_rows_surface_free_form_titled_children() -> None:
 
     by_id = {e["conversation_id"]: e for e in entries}
     assert set(by_id) == {"conv_named", "conv_ui", "conv_freeform", "conv_colon"}
-    assert by_id["conv_named"] == {
-        "agent": "researcher",
-        "title": "auth",
-        "conversation_id": "conv_named",
-    }
-    assert by_id["conv_ui"] == {
-        "agent": "claude-native-ui",
-        "title": "1",
-        "conversation_id": "conv_ui",
-    }
-    assert by_id["conv_freeform"] == {
-        "agent": None,
-        "title": "my-worker",
-        "conversation_id": "conv_freeform",
-    }
-    assert by_id["conv_colon"] == {
-        "agent": None,
-        "title": "team:alpha",
-        "conversation_id": "conv_colon",
-    }
+    assert [
+        {key: by_id[conversation_id][key] for key in ("agent", "title", "conversation_id")}
+        for conversation_id in ("conv_named", "conv_ui", "conv_freeform", "conv_colon")
+    ] == [
+        {"agent": "researcher", "title": "auth", "conversation_id": "conv_named"},
+        {"agent": "claude-native-ui", "title": "1", "conversation_id": "conv_ui"},
+        {"agent": None, "title": "my-worker", "conversation_id": "conv_freeform"},
+        {"agent": None, "title": "team:alpha", "conversation_id": "conv_colon"},
+    ]
+    assert by_id["conv_colon"]["label"] == "team:alpha"
 
 
 @pytest.mark.asyncio

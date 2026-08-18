@@ -8612,8 +8612,8 @@ def _child_session_summary_from_conversation(
     surfaced so debug views can investigate.
 
     ``busy`` is derived from the relay-fed ``_session_status_cache``
-    (the tasks table has been removed). ``agent_id`` and ``agent_name``
-    are read from the conversation row directly.
+    (the tasks table has been removed). ``agent_id`` and the durable
+    ``sub_agent_name`` binding are read from the conversation row directly.
 
     :param conv: A child :class:`Conversation` row
         (``kind="sub_agent"``) from
@@ -8687,10 +8687,11 @@ def _child_session_summary_from_conversation(
         session_name=session_name,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
-        # agent_id comes from the conversation row; agent_name and task_id
-        # are no longer available from the (removed) tasks table.
+        # These bindings come from the conversation row; task metadata is no
+        # longer available from the removed tasks table.
         agent_id=conv.agent_id,
-        agent_name=None,
+        agent_name=conv.sub_agent_name,
+        sub_agent_name=conv.sub_agent_name,
         current_task_id=None,
         current_task_status=current_task_status,
         busy=busy,
