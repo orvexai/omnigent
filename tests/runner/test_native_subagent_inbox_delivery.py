@@ -110,9 +110,10 @@ def _child_snapshot(
     sub_agent_name: str | None,
     parent_session_id: str | None,
     agent_name: str | None = "cursor-native-ui",
+    labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build a child ``SessionResponse``-shaped body."""
-    return {
+    body = {
         "id": CHILD_SESSION_ID,
         "agent_id": "ag_reviewer",
         "agent_name": agent_name,
@@ -121,6 +122,9 @@ def _child_snapshot(
         "created_at": 0,
         "workspace": None,
     }
+    if labels is not None:
+        body["labels"] = labels
+    return body
 
 
 async def _post_native_idle(
@@ -273,6 +277,29 @@ async def test_native_completion_recovers_reconnect_wiped_work_entry(
 
 
 @pytest.mark.asyncio
+async def test_native_in_band_completion_is_suppressed(
+    _clean_subagent_registry: None,
+) -> None:
+    """The real runner route suppresses the duplicate inbox delivery."""
+    http, items = await _post_native_idle(
+        child_body=_child_snapshot(
+            sub_agent_name="reviewer",
+            parent_session_id=PARENT_SESSION_ID,
+            labels={
+                "omnigent.wrapper": "claude-code-native-ui-subagent",
+                "omnigent.claude_native.subagent_id": "claude-id",
+            },
+        ),
+        seed_parent_inbox=True,
+        register_work=False,
+    )
+
+    assert http == 204
+    assert items == []
+    assert runner_app.get_subagent_work(CHILD_SESSION_ID) is None
+
+
+@pytest.mark.asyncio
 async def test_sys_session_create_child_without_sub_agent_name_delivers(
     _clean_subagent_registry: None,
 ) -> None:
@@ -340,6 +367,28 @@ async def test_undeliverable_native_completion_returns_503_not_silent_204(
         "an undeliverable native sub-agent completion was acked with "
         f"http={http}; expected 503 so the forwarder retries. Items={items!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_suppressed_candidate_without_parent_inbox_returns_503(
+    _clean_subagent_registry: None,
+) -> None:
+    """A suppression candidate still retries when delivery cannot be confirmed."""
+    http, items = await _post_native_idle(
+        child_body=_child_snapshot(
+            sub_agent_name="reviewer",
+            parent_session_id=PARENT_SESSION_ID,
+            labels={
+                "omnigent.wrapper": "claude-code-native-ui-subagent",
+                "omnigent.claude_native.subagent_id": "claude-id",
+            },
+        ),
+        seed_parent_inbox=False,
+        register_work=False,
+    )
+
+    assert http == 503
+    assert items == []
 
 
 @pytest.mark.asyncio

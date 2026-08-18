@@ -2647,6 +2647,7 @@ async def _execute_subagent_tool(
             agent=str(sub_agent_name),
             title=session_name,
             wrapper_label=child_wrapper_label,
+            dispatched_explicitly=True,
             created_by=dispatch_identity.actor,
             thread_id=thread.thread_id,
         )
@@ -2773,6 +2774,7 @@ async def _execute_subagent_tool(
                 agent=str(sub_agent_name),
                 title=session_name,
                 wrapper_label=child_wrapper_label,
+                dispatched_explicitly=True,
                 created_by=dispatch_identity.actor,
                 thread_id=thread.thread_id,
             )
@@ -3491,6 +3493,7 @@ async def _send_to_peer_session(
             agent=agent_label,
             title=peer_title or "",
             wrapper_label=_session_wrapper_label(snap_data),
+            dispatched_explicitly=True,
             created_by=sender_identity.actor,
             thread_id=thread.thread_id,
         )
@@ -3543,6 +3546,7 @@ async def _send_to_peer_session(
                 agent=agent_label,
                 title=peer_title or "",
                 wrapper_label=_session_wrapper_label(snap_data),
+                dispatched_explicitly=True,
                 created_by=sender_identity.actor,
                 thread_id=thread.thread_id,
             )
@@ -3613,6 +3617,7 @@ async def _activate_queued_peer_dispatch(item: _QueuedPeerDispatch) -> None:
         agent=item.agent_label,
         title=item.peer_title or "",
         wrapper_label=_session_wrapper_label(item.snap_data),
+        dispatched_explicitly=True,
         created_by=item.sender_identity.actor,
         thread_id=item.thread.thread_id,
         work_id=item.work_id,
@@ -3868,6 +3873,7 @@ async def _send_to_existing_session(
             agent=agent_label,
             title=child_label or "",
             wrapper_label=_session_wrapper_label(snap_data),
+            dispatched_explicitly=True,
             created_by=sender_identity.actor,
             thread_id=thread.thread_id,
         )
@@ -3945,6 +3951,7 @@ async def _send_to_existing_session(
                 agent=agent_label,
                 title=child_label or "",
                 wrapper_label=_session_wrapper_label(snap_data),
+                dispatched_explicitly=True,
                 created_by=sender_identity.actor,
                 thread_id=thread.thread_id,
             )
@@ -4238,6 +4245,7 @@ def _finalize_created_session(
             agent=agent_label,
             title=label,
             wrapper_label=_session_wrapper_label(data),
+            dispatched_explicitly=True,
             # Same actor attribution the send path carries. Without it the
             # parent's wake notice for create-started work is unattributed,
             # so a policy gate keyed on the human actor sees none.

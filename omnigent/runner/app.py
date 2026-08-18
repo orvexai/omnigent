@@ -25,6 +25,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
 
 if TYPE_CHECKING:
@@ -44,6 +45,10 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from omnigent._wrapper_labels import (
+    CLAUDE_NATIVE_SUBAGENT_WRAPPER_VALUE,
+    CODEX_NATIVE_SUBAGENT_WRAPPER_VALUE,
+)
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.entities.session_resources import (
@@ -356,6 +361,17 @@ _SUBAGENT_DELIVERY_ALREADY_DELIVERED = "already_delivered"
 _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
 _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY = "missing_work_entry"
 _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
+_SUBAGENT_DELIVERY_SUPPRESSED_INBAND = "suppressed_native_inband"
+_INBAND_SUBAGENT_WRAPPER_LABELS = frozenset(
+    {
+        CLAUDE_NATIVE_SUBAGENT_WRAPPER_VALUE,
+        CODEX_NATIVE_SUBAGENT_WRAPPER_VALUE,
+    }
+)
+_INBAND_SUBAGENT_ID_LABEL_KEYS = {
+    CLAUDE_NATIVE_SUBAGENT_WRAPPER_VALUE: "omnigent.claude_native.subagent_id",
+    CODEX_NATIVE_SUBAGENT_WRAPPER_VALUE: "omnigent.codex_native.subagent_thread_id",
+}
 # Read budget for runner→server POSTs that can PARK behind a human-approval
 # ASK gate: policy evaluation (``_evaluate_policy_via_omnigent``) and sub-agent
 # wake-notice delivery (``_deliver_subagent_wake_post``). Both are gated at the
@@ -676,6 +692,7 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+    labels: Mapping[str, str] = MappingProxyType({})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1116,6 +1133,8 @@ class _SubagentWorkEntry:
     agent: str
     title: str
     wrapper_label: str | None = None
+    subagent_id_label: str | None = None
+    dispatched_explicitly: bool = False
     created_by: str | None = None
     status: str = "launching"
     output: str | None = None
@@ -1492,6 +1511,8 @@ def register_subagent_work(
     agent: str,
     title: str,
     wrapper_label: str | None = None,
+    subagent_id_label: str | None = None,
+    dispatched_explicitly: bool = False,
     created_by: str | None = None,
     thread_id: str | None = None,
     work_id: str | None = None,
@@ -1535,6 +1556,8 @@ def register_subagent_work(
         agent=agent,
         title=title,
         wrapper_label=wrapper_label,
+        subagent_id_label=subagent_id_label,
+        dispatched_explicitly=dispatched_explicitly,
         created_by=created_by,
         thread_id=thread_id,
     )
@@ -1757,6 +1780,15 @@ def mark_subagent_work_terminal(
     return ack
 
 
+def _result_is_delivered_in_band(entry: _SubagentWorkEntry) -> bool:
+    """Return whether the child harness already owns this result in-band."""
+    return (
+        not entry.dispatched_explicitly
+        and entry.wrapper_label in _INBAND_SUBAGENT_WRAPPER_LABELS
+        and entry.subagent_id_label is not None
+    )
+
+
 def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDeliveryAck:
     """
     Push a terminal sub-agent payload into the parent session inbox.
@@ -1784,6 +1816,19 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
             delivered=False,
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_MISSING_PARENT_INBOX,
+        )
+    if _result_is_delivered_in_band(entry):
+        entry.delivered = True
+        unregister_subagent_work(
+            entry.child_session_id,
+            work_id=entry.work_id,
+            remember_drained_delivery=True,
+        )
+        return _SubagentDeliveryAck(
+            entry=entry,
+            delivered=True,
+            delivered_now=False,
+            reason=_SUBAGENT_DELIVERY_SUPPRESSED_INBAND,
         )
     output = entry.output
     if output is None:
@@ -3132,6 +3177,7 @@ def create_runner_app(
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
             agent_name: str | None = None
+            labels: Mapping[str, str] = MappingProxyType({})
             try:
                 resp = await server_client.get(f"/v1/sessions/{session_id}")
                 status_code = resp.status_code
@@ -3153,6 +3199,15 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
+                    raw_labels = body.get("labels")
+                    if isinstance(raw_labels, Mapping):
+                        labels = MappingProxyType(
+                            {
+                                key: value
+                                for key, value in raw_labels.items()
+                                if isinstance(key, str) and isinstance(value, str)
+                            }
+                        )
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -3164,6 +3219,7 @@ def create_runner_app(
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
+                labels=labels,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 _session_snapshot_cache[session_id] = snapshot
@@ -3209,6 +3265,7 @@ def create_runner_app(
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
+            labels=snapshot.labels,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
@@ -4632,11 +4689,19 @@ def create_runner_app(
         if not parent_id or parent_id == conv_id:
             return None
         agent = snapshot.sub_agent_name or snapshot.agent_name or "sub-agent"
+        wrapper_label = snapshot.labels.get("omnigent.wrapper")
+        id_label_key = (
+            _INBAND_SUBAGENT_ID_LABEL_KEYS.get(wrapper_label)
+            if wrapper_label is not None
+            else None
+        )
         return register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=conv_id,
             agent=agent,
             title=snapshot.sub_agent_name or "",
+            wrapper_label=wrapper_label,
+            subagent_id_label=snapshot.labels.get(id_label_key) if id_label_key else None,
         )
 
     def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
