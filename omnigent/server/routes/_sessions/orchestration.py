@@ -4562,7 +4562,8 @@ async def _forward_event_to_runner(
     has_mcp_servers: bool = False,
     created_by: str | None = None,
     host_store: HostStore | None = None,
-) -> str:
+    return_delivery: bool = False,
+) -> str | tuple[str, str | None]:
     """
     Persist a user event and forward it to the runner.
 
@@ -5003,6 +5004,7 @@ async def _forward_event_to_runner(
     if _effective_harness is not None and _effective_harness != "auto":
         runner_body["harness_override"] = _effective_harness
 
+    delivery: str | None = None
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
@@ -5022,6 +5024,18 @@ async def _forward_event_to_runner(
         # status rather than via ``raise_for_status`` so the runner-client fakes
         # that only expose ``status_code`` behave as they do in production.
         if _forward_resp.status_code >= 400:
+            try:
+                _runner_payload = _forward_resp.json()
+            except (ValueError, TypeError, AttributeError):
+                _runner_payload = None
+            if isinstance(_runner_payload, dict) and _runner_payload.get("error") == "queue_full":
+                _queue_detail = _runner_payload.get("detail")
+                raise OmnigentError(
+                    _queue_detail
+                    if isinstance(_queue_detail, str) and _queue_detail
+                    else "session message buffer is full",
+                    code=ErrorCode.QUEUE_FULL,
+                )
             # The live runner took nothing, so ``idle`` would read as a finished
             # turn that never ran. Persist the reason: the status edge is
             # SSE-only and would vanish on reload. Not strictly terminal — the
@@ -5045,6 +5059,12 @@ async def _forward_event_to_runner(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
+        try:
+            _runner_status = _forward_resp.json().get("status")
+        except (ValueError, TypeError, AttributeError):
+            _runner_status = None
+        if _runner_status in ("buffered", "accepted"):
+            delivery = _runner_status
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])
@@ -5147,7 +5167,8 @@ async def _forward_event_to_runner(
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from exc
 
-    return persisted_items[0].id
+    item_id = persisted_items[0].id
+    return (item_id, delivery) if return_delivery else item_id
 
 
 async def _stamp_routing_decision_label(
@@ -5530,7 +5551,7 @@ async def _dispatch_session_event_to_runner_impl(
                     decision_id=_native_decision_id,
                 )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
-    item_id = await _forward_event_to_runner(
+    item_id, delivery = await _forward_event_to_runner(
         session_id,
         conv,
         body,
@@ -5542,8 +5563,9 @@ async def _dispatch_session_event_to_runner_impl(
         has_mcp_servers=has_mcp_servers,
         created_by=created_by,
         host_store=host_store,
+        return_delivery=True,
     )
-    return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
+    return _SessionEventDispatchResult(item_id=item_id, pending_id=None, delivery=delivery)
 
 
 # Transient runner-tunnel drops (Apps ingress recycles, sleep-wake

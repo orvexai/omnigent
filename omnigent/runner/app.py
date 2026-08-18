@@ -1102,6 +1102,9 @@ class _SubagentWorkEntry:
         terminal status, or ``None`` while running.
     :param delivered: Whether the terminal payload has been pushed to
         the parent's inbox.
+    :param queued_sends: Number of coalesced messages sent during this dispatch.
+    :param last_sent_text: Exact text of the most recent dispatched message.
+    :param last_anchor_item_id: Transcript item preceding the most recent message.
     """
 
     parent_session_id: str
@@ -1116,6 +1119,9 @@ class _SubagentWorkEntry:
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
     delivered: bool = False
+    queued_sends: int = 0
+    last_sent_text: str | None = None
+    last_anchor_item_id: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1237,6 +1243,37 @@ def get_subagent_work(child_session_id: str) -> _SubagentWorkEntry | None:
     :returns: The work entry, or ``None`` if the child is not tracked.
     """
     return _subagent_work_by_child.get(child_session_id)
+
+
+def note_subagent_work_send(
+    child_session_id: str,
+    *,
+    work_id: str,
+    sent_text: str | None = None,
+    anchor_item_id: str | None = None,
+) -> _SubagentWorkEntry | None:
+    """Record a message on the live dispatch that owns a child session.
+
+    :param child_session_id: Child session receiving the message.
+    :param work_id: Dispatch id that must still own the child entry.
+    :param sent_text: Exact enveloped message text, when available.
+    :param anchor_item_id: Item preceding the message, when available.
+    :returns: The updated entry, or ``None`` when it is stale or gone.
+    """
+    entry = _subagent_work_by_child.get(child_session_id)
+    if (
+        entry is None
+        or entry.work_id != work_id
+        or entry.status in ("completed", "failed", "cancelled")
+        or entry.queued_sends >= _SUBAGENT_QUEUED_SEND_CAP
+    ):
+        return None
+    entry.queued_sends += 1
+    if sent_text is not None:
+        entry.last_sent_text = sent_text
+    if anchor_item_id is not None:
+        entry.last_anchor_item_id = anchor_item_id
+    return entry
 
 
 def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | None:
@@ -1893,6 +1930,8 @@ _session_inboxes_ref: dict[str, asyncio.Queue[_JsonObject]] = {}
 # alternative is a permanent ``launching`` entry that wedges the target.
 _REMOTE_DISPATCH_TIMEOUT_S = 1800.0
 _REMOTE_DISPATCH_POLL_INTERVAL_S = 3.0
+_SESSION_MESSAGE_BUFFER_CAP = 32
+_SUBAGENT_QUEUED_SEND_CAP = 8
 
 # In-flight cross-runner pollers, keyed by target session id, so session
 # teardown can cancel them instead of leaving a task polling a session the
@@ -3708,6 +3747,12 @@ def create_runner_app(
         _session_inboxes.pop(session_id, None)
         _subagent_wake_pending.discard(session_id)
         _session_sub_agent_names.pop(session_id, None)
+        if get_subagent_work(session_id) is not None:
+            _mark_subagent_terminal_and_wake(
+                session_id,
+                status="failed",
+                output="Error: target session was deleted before its queued work completed.",
+            )
         unregister_child_session(session_id)
         # Cancel any cross-runner poller this session started BEFORE dropping
         # its work entries: the poller is the only thing that clears a remote
@@ -5233,8 +5278,21 @@ def create_runner_app(
         # Transport-loss ending desyncs harness from runner; flag for clean rebind.
         if error is not None and error.get("code") == "connection_error":
             _desynced_sessions.add(conv_id)
-        has_buffered = bool(_session_message_buffers.get(conv_id))
         was_interrupted = conv_id in _interrupted_sessions
+        tracked_subagent = get_subagent_work(conv_id) is not None
+        discarded_buffered = 0
+        clean_turn_end = error is None or error.get("code") != "connection_error"
+        if (
+            tracked_subagent
+            and conv_id not in _desynced_sessions
+            and clean_turn_end
+            and (error is not None or was_interrupted)
+        ):
+            discarded_buffered = len(_session_message_buffers.pop(conv_id, []))
+        has_buffered = bool(_session_message_buffers.get(conv_id))
+        discard_notice = (
+            f" Buffered message(s) discarded: {discarded_buffered}." if discarded_buffered else ""
+        )
         # Suppress terminal only if desync recovery claimed the token for THIS generation's epoch.
         _suppress_status = _desync_terminalized.get(conv_id) == _turn_bind_epoch.get(conv_id, 0)
         if _suppress_status:
@@ -5266,19 +5324,25 @@ def create_runner_app(
                 _mark_subagent_terminal_and_wake(
                     conv_id,
                     status="failed",
-                    output="Error: sub-agent turn failed: runner turn-context desync.",
+                    output=(
+                        "Error: sub-agent turn failed: runner turn-context desync."
+                        f"{discard_notice}"
+                    ),
                 )
             else:
                 _mark_subagent_terminal_and_wake(
                     conv_id,
                     status="cancelled",
-                    output="[System: sub-agent interrupted]",
+                    output=f"[System: sub-agent interrupted]{discard_notice}",
                 )
         elif error is not None:
             _mark_subagent_terminal_and_wake(
                 conv_id,
                 status="failed",
-                output=f"Error: sub-agent turn failed: {error.get('message', 'unknown')}",
+                output=(
+                    f"Error: sub-agent turn failed: {error.get('message', 'unknown')}"
+                    f"{discard_notice}"
+                ),
             )
         elif (
             not _is_native_harness(conv_id)
@@ -5786,8 +5850,8 @@ def create_runner_app(
         *,
         child_session_id: str,
         work_id: str,
-        anchor_item_id: str | None,
-        sent_text: str,
+        anchor_item_id: str | None = None,
+        sent_text: str | None = None,
     ) -> None:
         """
         Await a dispatch to a session this runner does not own, then deliver it.
@@ -5819,18 +5883,31 @@ def create_runner_app(
         """
         deadline = time.monotonic() + _REMOTE_DISPATCH_TIMEOUT_S
         our_message_id: str | None = None
+        observed_anchor = anchor_item_id
+        observed_text = sent_text
         try:
             while True:
                 entry = get_subagent_work(child_session_id)
                 if entry is None or entry.work_id != work_id:
                     # Superseded or already drained; this poller is stale.
                     return
+                current_anchor = (
+                    entry.last_anchor_item_id
+                    if entry.last_anchor_item_id is not None
+                    else observed_anchor
+                )
+                current_text = entry.last_sent_text or observed_text
+                if current_anchor != observed_anchor or current_text != observed_text:
+                    observed_anchor = current_anchor
+                    observed_text = current_text
+                    our_message_id = None
+                    deadline = time.monotonic() + _REMOTE_DISPATCH_TIMEOUT_S
                 await asyncio.sleep(_REMOTE_DISPATCH_POLL_INTERVAL_S)
                 try:
                     items_resp = await server_client.get(
                         f"/v1/sessions/{child_session_id}/items",
                         params={
-                            **({"after": anchor_item_id} if anchor_item_id else {}),
+                            **({"after": observed_anchor} if observed_anchor else {}),
                             "order": "asc",
                             "limit": 200,
                         },
@@ -5849,11 +5926,24 @@ def create_runner_app(
                     if time.monotonic() >= deadline:
                         break
                     continue
+                latest_entry = get_subagent_work(child_session_id)
+                if latest_entry is None or latest_entry.work_id != work_id:
+                    return
+                latest_anchor = latest_entry.last_anchor_item_id
+                latest_text = latest_entry.last_sent_text
+                if latest_anchor != observed_anchor or latest_text != observed_text:
+                    observed_anchor = latest_anchor
+                    observed_text = latest_text
+                    our_message_id = None
+                    deadline = time.monotonic() + _REMOTE_DISPATCH_TIMEOUT_S
+                    continue
                 items = items_resp.json().get("data", [])
                 if not isinstance(items, list):
                     items = []
                 our_message_id, reply = resolve_remote_reply(
-                    items, sent_text=sent_text, our_message_id=our_message_id
+                    items,
+                    sent_text=observed_text or "",
+                    our_message_id=our_message_id,
                 )
                 status = _optional_str(snap_resp.json().get("status"))
                 if status == "failed":
@@ -7152,6 +7242,18 @@ def create_runner_app(
                     )
                     if _can_forward:
                         message_body["injection_id"] = f"inj_{uuid.uuid4().hex[:16]}"
+                    _buffer = _session_message_buffers.setdefault(conversation_id, [])
+                    if len(_buffer) >= _SESSION_MESSAGE_BUFFER_CAP:
+                        return JSONResponse(
+                            status_code=429,
+                            content={
+                                "error": "queue_full",
+                                "detail": (
+                                    "session message buffer is full; "
+                                    "wait for the active turn to drain"
+                                ),
+                            },
+                        )
                     _logger.info(
                         "post_session_events: buffering message for active turn conv=%s "
                         "native=%s awaiting_approval=%s",
@@ -7159,10 +7261,7 @@ def create_runner_app(
                         _native,
                         _awaiting_approval,
                     )
-                    _session_message_buffers.setdefault(
-                        conversation_id,
-                        [],
-                    ).append(message_body)
+                    _buffer.append(message_body)
                     if _can_forward and process_manager is not None:
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
@@ -7282,12 +7381,27 @@ def create_runner_app(
             if status in ("idle", "failed"):
                 recovered_entry = await _ensure_subagent_work_entry(conversation_id)
             if status == "idle":
-                delivery_ack = _mark_subagent_terminal_and_wake(
-                    conversation_id,
-                    status="completed",
-                    output=output if output is not None else "",
-                )
+                if _session_message_buffers.get(conversation_id):
+                    _logger.debug(
+                        "deferring native terminal delivery for buffered session=%s",
+                        conversation_id,
+                    )
+                    _cont = asyncio.create_task(_check_and_start_next_turn(conversation_id))
+                    _cont.add_done_callback(_background_tasks.discard)
+                    _background_tasks.add(_cont)
+                else:
+                    delivery_ack = _mark_subagent_terminal_and_wake(
+                        conversation_id,
+                        status="completed",
+                        output=output if output is not None else "",
+                    )
             elif status == "failed":
+                discarded_buffered = len(_session_message_buffers.pop(conversation_id, []))
+                if discarded_buffered:
+                    output = (
+                        f"{output or 'Error: native sub-agent turn failed'} "
+                        f"Buffered message(s) discarded: {discarded_buffered}."
+                    )
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
                     status="failed",
