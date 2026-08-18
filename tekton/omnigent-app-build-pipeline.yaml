@@ -6,7 +6,7 @@
 # endpoint (repos-direct.*) — the Deployment still pulls through the
 # Cloudflare proxy (repos.eu-central-1.myidp.cloud), same split docmost uses.
 #
-# Built from the "orvex" branch only — that branch carries our own patches on
+# Built from the "web" branch only — that branch carries our own patches on
 # top of upstream and is kept current by a daily merge-from-upstream workflow
 # (see .github/workflows/sync-upstream.yml). main tracks upstream unmodified.
 apiVersion: tekton.dev/v1
@@ -26,7 +26,7 @@ spec:
       default: https://github.com/orvexai/omnigent.git
     - name: revision
       type: string
-      default: orvex
+      default: web
     - name: image-registry
       type: string
       default: repos-direct.eu-central-1.myidp.cloud
@@ -38,7 +38,7 @@ spec:
       default: omnigent
     - name: image-tag
       type: string
-      default: orvex
+      default: web
   workspaces:
     - name: source
       description: Workspace for the cloned source tree
@@ -172,7 +172,7 @@ spec:
               kubectl delete --namespace omnigent "${JOB}" --ignore-not-found || true
               exit "$status"
   finally:
-    # The image is a MOVING tag (:orvex) pulled with imagePullPolicy: Always,
+    # The image is a MOVING tag (:web) pulled with imagePullPolicy: Always,
     # so a rollout restart (patches the pod-template restartedAt annotation)
     # is sufficient to pick up the freshly-pushed image — no manifest change
     # required. ArgoCD selfHeal does not revert this because it does not own
@@ -207,7 +207,7 @@ spec:
               set -eu
               TAG="$(params.image-tag)"
               case "$TAG" in
-                orvex) TARGETS="omnigent" ;;
+                web) TARGETS="omnigent" ;;
                 *)     echo "No rollout targets for tag '$TAG' — skipping"; exit 0 ;;
               esac
               rc=0

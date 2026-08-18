@@ -1,15 +1,15 @@
 ---
-# Auto-build the Omnigent server image on push to the "orvex" branch —
+# Auto-build the Omnigent server image on push to the "web" branch —
 # discovered by the platform's org-wide github-webhook-listener (no per-repo
 # webhook plumbing here).
 #
-# Flow: push to orvexai/omnigent (orvex branch) -> GitHub webhook -> platform
+# Flow: push to orvexai/omnigent (web branch) -> GitHub webhook -> platform
 #       listener -> this Trigger (filters repo + branch) -> PipelineRun
-#       -> build omnigent/omnigent:orvex -> rollout-restart consumers.
+#       -> build omnigent/omnigent:web -> rollout-restart consumers.
 #
 # No changed-path filter: the daily upstream-sync workflow pushes merge
 # commits whose file list can be large/truncated in the webhook payload, so
-# every push to orvex triggers a rebuild rather than risking a silent skip.
+# every push to web triggers a rebuild rather than risking a silent skip.
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerTemplate
 metadata:
@@ -27,7 +27,7 @@ spec:
     - name: image-tag
       description: |
         Image tag derived from the git ref:
-          refs/heads/orvex → orvex
+          refs/heads/web → web
   resourcetemplates:
     - apiVersion: tekton.dev/v1
       kind: PipelineRun
@@ -100,11 +100,11 @@ spec:
         name: cel
         kind: ClusterInterceptor
       params:
-        # Build only on pushes to the orvex branch of this repo.
+        # Build only on pushes to the web branch of this repo.
         - name: filter
           value: >-
             body.repository.name == 'omnigent' &&
-            body.ref == 'refs/heads/orvex'
+            body.ref == 'refs/heads/web'
         - name: overlays
           value:
             - key: image-tag

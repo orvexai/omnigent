@@ -3,12 +3,12 @@
 # tekton-pipelines.
 #
 # This repo's default branch (main) tracks upstream unmodified, and our own
-# changes + this tekton/ directory live only on the `orvex` branch — so the
+# changes + this tekton/ directory live only on the `web` branch — so the
 # platform's default-branch-only CI ApplicationSet (ci-appset in
 # my-idp-apps) can't auto-discover it (same situation as orvexai/teleport's
 # `dev` branch). Instead there's a dedicated Application,
 # my-idp-apps/applications/eu-central-1/omnigent-ci.yaml, pointed at this
-# path on targetRevision: orvex.
+# path on targetRevision: web.
 #
 # Deliberately NOT included (shared platform/CI infra already owned by other
 # Applications — re-declaring them would cause ArgoCD SharedResourceWarnings):
