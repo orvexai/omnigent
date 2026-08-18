@@ -13,7 +13,13 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
+from omnigent.entities import (
+    DEFAULT_ENVIRONMENT_ID,
+    Conversation,
+    ConversationItem,
+    MessageData,
+    PagedList,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import (
     _globals,
@@ -23,6 +29,7 @@ from omnigent.runtime import (
     set_runner_router,
 )
 from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
+from omnigent.server.routes._sessions.helpers import _latest_assistant_text_from_store
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 
@@ -5139,6 +5146,143 @@ class _SubagentTerminalStore:
             ),
         )
         return PagedList(data=[item], first_id=item.id, last_id=item.id, has_more=False)
+
+
+class _MultiItemSubagentTerminalStore:
+    """Store stub that returns chronological fixtures newest-first."""
+
+    def __init__(self, items: list[ConversationItem]) -> None:
+        """Store the configured page."""
+        self._items = items
+
+    def list_items(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+        order: str,
+        type: str,
+    ) -> PagedList[ConversationItem]:
+        """Return the configured page in the production call shape."""
+        del conversation_id, limit, order, type
+        items = list(reversed(self._items))
+        return PagedList(
+            data=items,
+            first_id=items[0].id if items else None,
+            last_id=items[-1].id if items else None,
+            has_more=False,
+        )
+
+
+def _make_terminal_message(
+    item_id: str,
+    *,
+    role: str,
+    text: str,
+    is_meta: bool = False,
+) -> ConversationItem:
+    """Build a message item for turn-boundary helper tests."""
+    return ConversationItem(
+        id=item_id,
+        type="message",
+        status="completed",
+        response_id=item_id,
+        created_at=1,
+        data=MessageData(
+            role=role,  # type: ignore[arg-type]
+            agent="test-agent" if role == "assistant" else None,
+            content=[
+                {
+                    "type": "output_text" if role == "assistant" else "input_text",
+                    "text": text,
+                }
+            ],
+            is_meta=is_meta,
+        ),
+    )
+
+
+def test_latest_assistant_text_treats_meta_user_as_turn_boundary() -> None:
+    """A meta user item starts a new turn and blocks older output."""
+    store = _MultiItemSubagentTerminalStore(
+        [
+            _make_terminal_message("user-1", role="user", text="prompt"),
+            _make_terminal_message("assistant-1", role="assistant", text="T1"),
+            _make_terminal_message("meta-user", role="user", text="context", is_meta=True),
+        ]
+    )
+
+    assert _latest_assistant_text_from_store(store, "conv_child") is None
+
+
+def test_latest_assistant_text_stops_at_user_boundary() -> None:
+    """A real user item blocks assistant text from the previous turn."""
+    store = _MultiItemSubagentTerminalStore(
+        [
+            _make_terminal_message("assistant-1", role="assistant", text="T1"),
+            _make_terminal_message("user-2", role="user", text="prompt"),
+        ]
+    )
+
+    assert _latest_assistant_text_from_store(store, "conv_child") is None
+
+
+def test_latest_assistant_text_gates_interrupt_exemption_on_harness() -> None:
+    """Only Claude-native callers may exempt the synthesized interrupt record."""
+    store = _MultiItemSubagentTerminalStore(
+        [
+            _make_terminal_message("user-2", role="user", text="prompt"),
+            _make_terminal_message("assistant-2", role="assistant", text="PARTIAL"),
+            _make_terminal_message(
+                "interrupt",
+                role="user",
+                text="[Request interrupted by user]",
+            ),
+        ]
+    )
+
+    assert (
+        _latest_assistant_text_from_store(
+            store,
+            "conv_child",
+            allow_native_interrupt_record=True,
+        )
+        == "PARTIAL"
+    )
+    assert _latest_assistant_text_from_store(store, "conv_child") is None
+
+
+def test_latest_assistant_text_supports_assistant_only_page() -> None:
+    """An assistant-only page retains the existing enrichment behavior."""
+    store = _MultiItemSubagentTerminalStore(
+        [_make_terminal_message("assistant", role="assistant", text="answer")]
+    )
+
+    assert _latest_assistant_text_from_store(store, "conv_child") == "answer"
+
+
+def test_latest_assistant_text_returns_none_for_empty_page() -> None:
+    """An empty page has no assistant text to enrich."""
+    store = _MultiItemSubagentTerminalStore([])
+
+    assert _latest_assistant_text_from_store(store, "conv_child") is None
+
+
+def test_latest_assistant_text_skips_meta_assistant() -> None:
+    """A meta assistant item is context, not terminal output."""
+    store = _MultiItemSubagentTerminalStore(
+        [
+            _make_terminal_message("assistant", role="assistant", text="answer"),
+            _make_terminal_message(
+                "meta-assistant",
+                role="assistant",
+                text="context",
+                is_meta=True,
+            ),
+        ]
+    )
+
+    assert _latest_assistant_text_from_store(store, "conv_child") == "answer"
 
 
 def _make_subagent_conv(child_id: str, *, wrapper: str, kind: str = "sub_agent") -> Conversation:

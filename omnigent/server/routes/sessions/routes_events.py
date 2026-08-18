@@ -1065,7 +1065,7 @@ def register_events_routes(
             )
             forward_body = body.model_dump()
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
-                forward_body["data"], status, session_id, conversation_store
+                forward_body["data"], status, session_id, conversation_store, conv
             )
             _defer_claude_native_subagent_idle_status(
                 forward_body["data"], status, conv, session_id

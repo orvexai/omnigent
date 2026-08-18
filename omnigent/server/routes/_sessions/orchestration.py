@@ -225,6 +225,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _handle_advise_models_mcp,
     _invalidate_runner_backed_snapshot_state,
+    _is_claude_native_session,
     _is_claude_native_subagent,
     _is_codex_native_subagent,
     _is_kiro_native_session,
@@ -2196,6 +2197,7 @@ async def _enrich_idle_status_with_subagent_output(
     status: str,
     session_id: str,
     conversation_store: ConversationStore,
+    conv: Conversation,
 ) -> dict[str, Any]:
     """
     Attach a native sub-agent's durable assistant text to an idle status edge.
@@ -2211,6 +2213,7 @@ async def _enrich_idle_status_with_subagent_output(
     :param status: Status edge; only ``"idle"`` is enriched.
     :param session_id: Sub-agent session id, e.g. ``"conv_child123"``.
     :param conversation_store: Store read for the child's assistant text.
+    :param conv: Conversation row used to gate Claude-native interrupt matching.
     :returns: ``data`` with ``"output"`` added when an idle edge has a
         persisted assistant message; otherwise unchanged.
     """
@@ -2220,6 +2223,7 @@ async def _enrich_idle_status_with_subagent_output(
         _latest_assistant_text_from_store,
         conversation_store,
         session_id,
+        allow_native_interrupt_record=_is_claude_native_session(conv),
     )
     if output is None:
         return data

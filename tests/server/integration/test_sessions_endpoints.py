@@ -4232,6 +4232,627 @@ async def test_claude_native_subagent_failed_status_is_not_deferred(
     assert forwarded[0]["data"] == {"status": "failed"}
 
 
+async def _post_mirrored_message(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    response_id: str,
+    source_id: str,
+    role: str,
+    text: str,
+    is_meta: bool = False,
+) -> None:
+    """Persist one native transcript message for a turn-scope test."""
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": response_id,
+                "source_id": source_id,
+                "item_data": {
+                    "role": role,
+                    "agent": "claude-native-ui",
+                    "is_meta": is_meta,
+                    "content": [
+                        {
+                            "type": "input_text" if role == "user" else "output_text",
+                            "text": text,
+                        }
+                    ],
+                },
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+
+
+async def test_subagent_idle_turn_scope_rejects_stale_output(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new user turn prevents delivery of the previous turn's text."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    try:
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="user-1",
+            role="user",
+            text="first prompt",
+        )
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="assistant-1",
+            role="assistant",
+            text="TURN_1_TEXT",
+        )
+        first_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert first_response.status_code == 202, first_response.text
+        assert forwarded[0]["data"]["output"] == "TURN_1_TEXT"
+
+        forwarded.clear()
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="user-2",
+            role="user",
+            text="second prompt",
+        )
+        second_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert second_response.status_code == 409, (
+        f"got {second_response.status_code}; forwarded={forwarded!r}"
+    )
+    assert second_response.json()["error"]["code"] == "conflict"
+    assert forwarded == []
+
+
+async def test_subagent_idle_turn_scope_delivers_current_turn_output(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later assistant item resolves the current turn's deferred idle edge."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    try:
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="user-1",
+            role="user",
+            text="first prompt",
+        )
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="assistant-1",
+            role="assistant",
+            text="TURN_1_TEXT",
+        )
+        first_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert first_response.status_code == 202, first_response.text
+        forwarded.clear()
+
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="user-2",
+            role="user",
+            text="second prompt",
+        )
+        deferred_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert deferred_response.status_code == 409, deferred_response.text
+        assert forwarded == []
+
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="assistant-2",
+            role="assistant",
+            text="TURN_2_TEXT",
+        )
+        resolved_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert resolved_response.status_code == 202, resolved_response.text
+    assert forwarded[0]["data"]["output"] == "TURN_2_TEXT"
+
+
+async def test_subagent_idle_turn_scope_gives_up_without_current_turn_text(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty current turn eventually forwards without an output field."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    try:
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="user-1",
+            role="user",
+            text="first prompt",
+        )
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="assistant-1",
+            role="assistant",
+            text="TURN_1_TEXT",
+        )
+        first_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert first_response.status_code == 202, first_response.text
+        forwarded.clear()
+
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="user-2",
+            role="user",
+            text="second prompt",
+        )
+        responses = []
+        for _ in range(3):
+            response = await client.post(
+                f"/v1/sessions/{child['id']}/events",
+                json={"type": "external_session_status", "data": {"status": "idle"}},
+            )
+            responses.append(response)
+    finally:
+        await fake_runner.aclose()
+
+    assert [response.status_code for response in responses] == [409, 409, 202]
+    assert forwarded[0]["data"] == {"status": "idle"}
+
+
+async def test_subagent_idle_turn_scope_ignores_interrupt_marker_boundary(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude's synthesized interrupt marker does not end the turn."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    try:
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="user-2",
+            role="user",
+            text="second prompt",
+        )
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="assistant-partial",
+            role="assistant",
+            text="PARTIAL",
+        )
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="interrupt",
+            role="user",
+            text="[Request interrupted by user]",
+        )
+        status_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_response.status_code == 202, status_response.text
+    assert forwarded[0]["data"]["output"] == "PARTIAL"
+
+
+async def test_top_level_claude_native_idle_turn_scope_uses_kind_free_interrupt_gate(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the kind-free Claude-native predicate for top-level sessions."""
+    fake_runner, forwarded, session = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui",
+        top_level=True,
+    )
+    try:
+        await _post_mirrored_message(
+            client,
+            session["id"],
+            response_id="turn-2",
+            source_id="user-2",
+            role="user",
+            text="second prompt",
+        )
+        await _post_mirrored_message(
+            client,
+            session["id"],
+            response_id="turn-2",
+            source_id="assistant-partial",
+            role="assistant",
+            text="PARTIAL",
+        )
+        await _post_mirrored_message(
+            client,
+            session["id"],
+            response_id="turn-2",
+            source_id="interrupt",
+            role="user",
+            text="[Request interrupted by user]",
+        )
+        status_response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_response.status_code == 202, status_response.text
+    assert forwarded[0]["data"]["output"] == "PARTIAL"
+
+
+async def test_subagent_idle_turn_scope_treats_meta_interrupt_as_boundary(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A meta interrupt-shaped user item is still a turn boundary."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    try:
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="user-2",
+            role="user",
+            text="second prompt",
+        )
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="assistant-partial",
+            role="assistant",
+            text="PARTIAL",
+        )
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="meta-interrupt",
+            role="user",
+            text="[Request interrupted by user]",
+            is_meta=True,
+        )
+        status_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_response.status_code == 409, status_response.text
+    assert forwarded == []
+
+
+async def test_codex_native_subagent_idle_turn_scope_drops_stale_output(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A codex child does not forward an earlier turn's text."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="codex-native-ui-subagent",
+    )
+    try:
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="user-1",
+            role="user",
+            text="first prompt",
+        )
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="assistant-1",
+            role="assistant",
+            text="TURN_1_TEXT",
+        )
+        first_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert first_response.status_code == 202, first_response.text
+        forwarded.clear()
+
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="user-2",
+            role="user",
+            text="second prompt",
+        )
+        status_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_response.status_code == 202, status_response.text
+    assert forwarded[0]["data"] == {"status": "idle"}
+
+
+async def test_top_level_claude_native_idle_turn_scope_drops_stale_output(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A top-level native session does not forward an earlier turn's text."""
+    fake_runner, forwarded, session = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui",
+        top_level=True,
+    )
+    try:
+        await _post_mirrored_message(
+            client,
+            session["id"],
+            response_id="turn-1",
+            source_id="user-1",
+            role="user",
+            text="first prompt",
+        )
+        await _post_mirrored_message(
+            client,
+            session["id"],
+            response_id="turn-1",
+            source_id="assistant-1",
+            role="assistant",
+            text="TURN_1_TEXT",
+        )
+        first_response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert first_response.status_code == 202, first_response.text
+        forwarded.clear()
+
+        await _post_mirrored_message(
+            client,
+            session["id"],
+            response_id="turn-2",
+            source_id="user-2",
+            role="user",
+            text="second prompt",
+        )
+        status_response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_response.status_code == 202, status_response.text
+    assert forwarded[0]["data"] == {"status": "idle"}
+
+
+async def test_claude_native_subagent_idle_turn_scope_rejects_meta_user_boundary(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A meta user turn start prevents stale output delivery."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    try:
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="user-1",
+            role="user",
+            text="first prompt",
+        )
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="assistant-1",
+            role="assistant",
+            text="TURN_1_TEXT",
+        )
+        first_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert first_response.status_code == 202, first_response.text
+        forwarded.clear()
+
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="meta-user-2",
+            role="user",
+            text="task notification",
+            is_meta=True,
+        )
+        status_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_response.status_code == 409, (
+        f"got {status_response.status_code}; forwarded={forwarded!r}"
+    )
+    assert status_response.json()["error"]["code"] == "conflict"
+    assert forwarded == []
+
+
+async def test_codex_native_subagent_idle_turn_scope_rejects_meta_user_boundary(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex meta user turn start does not forward stale output."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="codex-native-ui-subagent",
+    )
+    try:
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="user-1",
+            role="user",
+            text="first prompt",
+        )
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="assistant-1",
+            role="assistant",
+            text="TURN_1_TEXT",
+        )
+        first_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert first_response.status_code == 202, first_response.text
+        forwarded.clear()
+
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="meta-user-2",
+            role="user",
+            text="skill invocation",
+            is_meta=True,
+        )
+        status_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_response.status_code == 202, status_response.text
+    assert forwarded[0]["data"] == {"status": "idle"}
+
+
+async def test_codex_native_subagent_idle_turn_scope_treats_interrupt_text_as_boundary(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex user's interrupt-shaped message starts a new turn."""
+    fake_runner, forwarded, child = await _create_external_status_forwarding_context(
+        client,
+        monkeypatch,
+        wrapper="codex-native-ui-subagent",
+    )
+    try:
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="user-1",
+            role="user",
+            text="first prompt",
+        )
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-1",
+            source_id="assistant-1",
+            role="assistant",
+            text="TURN_1_TEXT",
+        )
+        await _post_mirrored_message(
+            client,
+            child["id"],
+            response_id="turn-2",
+            source_id="user-2",
+            role="user",
+            text="[Request interrupted by user]",
+        )
+        status_response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_response.status_code == 202, status_response.text
+    assert "output" not in forwarded[0]["data"]
+
+
 async def test_post_external_session_status_propagates_runner_delivery_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

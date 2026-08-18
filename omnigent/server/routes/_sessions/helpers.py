@@ -3283,6 +3283,19 @@ def _is_claude_native_subagent(conv: Conversation) -> bool:
     }
 
 
+def _is_claude_native_session(conv: Conversation) -> bool:
+    """
+    Return whether a conversation uses a Claude-native harness wrapper.
+
+    :param conv: Conversation row to inspect.
+    :returns: ``True`` when the row carries either Claude-native wrapper label.
+    """
+    return conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) in {
+        _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+        _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+    }
+
+
 def _background_task_delivery_status(
     status: str,
     background_task_count: int | None,
@@ -3545,9 +3558,11 @@ def _message_text(content: list[dict[str, Any]]) -> str | None:
 def _latest_assistant_text_from_store(
     conversation_store: ConversationStore,
     session_id: str,
+    *,
+    allow_native_interrupt_record: bool = False,
 ) -> str | None:
     """
-    Return the latest persisted assistant message text for a session.
+    Return the latest assistant text persisted in the current turn.
 
     Native harnesses mirror completed transcript items to the AP
     server, not necessarily to the runner's in-memory history. This
@@ -3557,8 +3572,11 @@ def _latest_assistant_text_from_store(
     :param conversation_store: Store used to read conversation items.
     :param session_id: Session/conversation id, e.g.
         ``"conv_child123"``.
-    :returns: Latest assistant text, or ``None`` when none is
-        persisted yet.
+    :param allow_native_interrupt_record: Whether Claude's synthesized
+        interrupt record may be exempted from the user-message boundary.
+    :returns: Current-turn assistant text, or ``None`` when no text is persisted
+        after the newest turn boundary. Every user message is a boundary except
+        Claude's own synthesized interrupt record on a claude-native session.
     """
     page = conversation_store.list_items(
         session_id,
@@ -3569,6 +3587,16 @@ def _latest_assistant_text_from_store(
     for item in page.data:
         if not isinstance(item.data, MessageData):
             continue
+        if item.data.role == "user":
+            if (
+                allow_native_interrupt_record
+                and not item.data.is_meta
+                and _is_native_interrupt_record(item.data)
+            ):
+                continue
+            # The newest user item starts the current turn.
+            # Older assistant items belong to a previous turn.
+            return None
         if item.data.role != "assistant" or item.data.is_meta:
             continue
         text = _message_text(item.data.content)
@@ -9497,6 +9525,7 @@ __all__ = [
     "_host_model_options_via_registry",
     "_if_none_match_matches",
     "_invalidate_runner_backed_snapshot_state",
+    "_is_claude_native_session",
     "_is_claude_native_subagent",
     "_is_codex_native_subagent",
     "_is_kiro_native_session",
