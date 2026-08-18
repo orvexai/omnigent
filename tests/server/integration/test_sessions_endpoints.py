@@ -613,6 +613,35 @@ async def test_list_sessions_reflects_relay_status_cache(
         sessions_module._session_status_cache.pop(session["id"], None)
 
 
+async def test_session_snapshot_uses_persisted_live_status_on_cache_miss(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cold snapshot cache still reports the durable failed status."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    class _UnexpectedRunnerClient:
+        async def get(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("a persisted failed status must skip runner probing")
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_session_live_status(session["id"], "failed")
+    sessions_module._session_status_cache.pop(session["id"], None)
+    monkeypatch.setattr(
+        "omnigent.runtime.get_runner_client",
+        lambda: _UnexpectedRunnerClient(),
+    )
+
+    try:
+        response = await client.get(f"/v1/sessions/{session['id']}")
+        assert response.status_code == 200
+        assert response.json()["status"] == "failed"
+    finally:
+        sessions_module._session_status_cache.pop(session["id"], None)
+
+
 async def test_list_sessions_rolls_up_busy_child_status(
     client: httpx.AsyncClient,
     db_uri: str,

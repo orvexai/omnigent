@@ -2480,6 +2480,7 @@ async def _publish_runner_recovered_status_impl(
     conversation_store: ConversationStore,
     *,
     require_disconnect_code: bool = False,
+    conversation: Conversation | None = None,
 ) -> None:
     """
     Clear a stale failed session status after runner recovery.
@@ -2517,9 +2518,17 @@ async def _publish_runner_recovered_status_impl(
         ``runner_disconnected``; when ``False`` (default, explicit
         rebind/handshake), clear any stale ``failed`` state. Labels are
         cleared in both cases.
+    :param conversation: An already-loaded conversation row, when available.
     :returns: None.
     """
-    if _session_status_cache.get(session_id) != "failed":
+    cached_status = _session_status_cache.get(session_id)
+    conv = conversation
+    if conv is None and cached_status != "failed":
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
+    durable_failed = conv is not None and getattr(conv, "live_status", None) == "failed"
+    disconnect_failure = last_error is not None and last_error.get("code") == "runner_disconnected"
+    if cached_status != "failed" and not durable_failed and not disconnect_failure:
         return
     # A passive reconnect must distinguish a benign runner disconnect
     # from a real task failure: both land the cache on "failed", but only
@@ -2528,8 +2537,9 @@ async def _publish_runner_recovered_status_impl(
     # disconnect failure but says nothing about a genuine task error —
     # leave that one alone. Explicit rebinds skip this guard.
     if require_disconnect_code:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
         if last_error is None or last_error.get("code") != "runner_disconnected":
             return
     _session_status_cache[session_id] = "idle"
@@ -5730,6 +5740,24 @@ async def _relay_runner_stream(
                     conversation_store,
                 )
             else:
+                cached_status = _session_status_cache.get(session_id)
+                persisted_status = None
+                if cached_status is None and conversation_store is not None:
+                    try:
+                        conv = await asyncio.to_thread(
+                            conversation_store.get_conversation,
+                            session_id,
+                        )
+                    except Exception:  # noqa: BLE001 — unknown store failure must not fail the relay
+                        _logger.exception(
+                            "Failed to read session status after runner transport loss: %s",
+                            session_id,
+                        )
+                        return
+                    persisted_status = getattr(conv, "live_status", None)
+                live_status = cached_status if cached_status is not None else persisted_status
+                if live_status not in ("running", "waiting"):
+                    return
                 # Publish a failed status so the client's SSE stream sees a
                 # clean error event instead of silent truncation (#1114).
                 disconnect_error = ErrorDetail(
@@ -9090,11 +9118,11 @@ async def _get_session_snapshot(
             ),
         )
 
-    status = _session_status_from_cache(session_id)
+    status = _session_status_from_cache(session_id, conv.live_status)
     if status == "idle":
-        # Cache miss (or truly idle): either the server restarted, or the
-        # relay has not yet published the first ``"running"`` event for a
-        # freshly bound session (the relay's GET /stream is still in its
+        # Probe only a cache miss with no persisted non-idle status, or a
+        # genuinely idle session whose relay has not published an edge yet.
+        # The relay's GET /stream may still be in its
         # tunnel handshake). Ask the runner for live status so we don't
         # synthesize a stale ``"idle"`` while a turn is actually in flight.
         # ``_session_status_from_cache`` already collapses the fine-grained
