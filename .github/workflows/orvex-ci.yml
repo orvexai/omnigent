@@ -90,7 +90,7 @@ jobs:
           # Historical name; stays in merge-ready's REQUIRED list.
           - group: server-rest
             paths: tests/server --ignore=tests/server/integration tests/onboarding
-            workers: "4"
+            workers: "3"
           - group: spec-llms
             paths: tests/spec tests/llms
           # Integration journey tests with mock LLM (no API key).
@@ -212,7 +212,7 @@ jobs:
           env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
             uv run pytest ${{ matrix.paths }} \
               -m "${{ matrix.markexpr || 'not databricks' }}" \
-              -n ${{ matrix.workers || '8' }} \
+              -n ${{ matrix.workers || '3' }} \
               --dist=${{ matrix.dist || 'loadfile' }} \
               --timeout=${{ matrix.timeout || '300' }} \
               --junitxml=artifacts/pytest-${{ matrix.group }}.xml \
