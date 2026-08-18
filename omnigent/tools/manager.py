@@ -6,6 +6,7 @@ MCP lifecycle lives on the runner — see designs/RUNNER_MCP.md.
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -51,6 +52,7 @@ from omnigent.tools.builtins import (
 )
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.local import load_local_python_tools
+from omnigent.tools.schema_validation import validate_tool_arguments
 
 # MCP lifecycle moved to runner; see designs/RUNNER_MCP.md.
 
@@ -967,6 +969,19 @@ class ToolManager:
         tool = self._tools.get(name)
         if tool is None:
             return f"Error: tool {name!r} not found. Registered tools: {list(self._tools.keys())}"
+        try:
+            parsed = json.loads(arguments) if arguments else {}
+        except json.JSONDecodeError as exc:
+            return f"Error: tool {name!r} got malformed JSON arguments: {exc}"
+        if not isinstance(parsed, dict):
+            return f"Error: tool {name!r} expects a JSON object for arguments"
+        schema = tool.get_schema()
+        function = schema.get("function")
+        parameters = function.get("parameters") if isinstance(function, dict) else None
+        if isinstance(parameters, dict):
+            validation_error = validate_tool_arguments(name, parsed, parameters)
+            if validation_error is not None:
+                return f"Error: {validation_error}"
         return tool.invoke(arguments, ctx)
 
     def get_client_tool_schemas(self) -> list[dict[str, Any]]:

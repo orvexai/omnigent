@@ -328,6 +328,43 @@ async def test_schemas_for_malformed_rpc_objects_return_failure(
 
 
 @pytest.mark.asyncio
+async def test_call_tool_rejects_schema_violation_before_proxy_request() -> None:
+    """A cached tools/list schema blocks an unknown argument before tools/call."""
+    transport = _StubTransport(
+        [
+            _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "github__create",
+                                "description": "create",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {"message": {"type": "string"}},
+                                    "additionalProperties": False,
+                                },
+                            }
+                        ]
+                    },
+                }
+            )
+        ]
+    )
+    manager = _make_manager(transport)
+    try:
+        await manager.schemas_for(_make_spec("github"))
+        with pytest.raises(ValueError, match=r"unknown parameter 'args'.*message"):
+            await manager.call_tool(_make_spec("github"), "github__create", {"args": "brief"})
+    finally:
+        await manager._omnigent_client.aclose()
+
+    assert len(transport.calls) == 1, "invalid arguments must not reach the proxy tools/call"
+
+
+@pytest.mark.asyncio
 async def test_call_tool_happy_path_returns_text() -> None:
     """``call_tool`` must extract and return text content from a successful result.
 
