@@ -649,6 +649,11 @@ _AGENT_CONFIG_SUBDIR = ".omnigent/agent-configs"
 # the full launchable surface in one call, not a 20-row default page.
 _AGENT_LIST_PAGE_LIMIT = 1000
 
+# Child rows are bounded independently from the global session listing. A
+# page of compact rows stays inline while cursor fields support larger trees.
+_SUBAGENT_LIST_DEFAULT_LIMIT = 100
+_SUBAGENT_LIST_MAX_LIMIT = 100
+
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
     _OS_ENV_TOOLS
@@ -5728,6 +5733,8 @@ async def _execute_session_query_tool(
             conversation_id,
             server_client,
             args.get("agent_name"),
+            sub_agents_limit=args.get("sub_agents_limit"),
+            sub_agents_after=args.get("sub_agents_after"),
             agent_spec=agent_spec,
         )
     if tool_name == "sys_session_get_history":
@@ -5889,6 +5896,13 @@ _PLACEMENT_ANCESTOR_HOPS = 5
 # explicit marker, so unlike a bare colon it cannot be produced by a
 # free-form sys_session_create title and is safe to parse an agent out of.
 _UI_ADDED_TITLE_PREFIX = "ui:"
+
+_AGENT_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+
+
+def _is_plausible_agent_token(value: str | None) -> bool:
+    """Return whether *value* can safely be a title-derived agent token."""
+    return bool(value and value == value.strip() and _AGENT_TOKEN_RE.fullmatch(value))
 
 
 @dataclass
@@ -6672,6 +6686,8 @@ async def _session_list_via_rest(
     server_client: httpx.AsyncClient,
     agent_name: object = None,
     *,
+    sub_agents_limit: object = None,
+    sub_agents_after: object = None,
     agent_spec: AgentSpec | None = None,
 ) -> str:
     """
@@ -6692,9 +6708,29 @@ async def _session_list_via_rest(
         ``sessions`` view; ignored for ``sub_agents``.
     :returns: JSON ``{"sub_agents": [...], "sessions": [...]}``.
     """
-    sub_agents = await _collect_sub_agents(conversation_id, server_client, agent_spec=agent_spec)
+    limit = (
+        sub_agents_limit
+        if isinstance(sub_agents_limit, int) and not isinstance(sub_agents_limit, bool)
+        else _SUBAGENT_LIST_DEFAULT_LIMIT
+    )
+    limit = max(1, min(limit, _SUBAGENT_LIST_MAX_LIMIT))
+    after = sub_agents_after if isinstance(sub_agents_after, str) and sub_agents_after else None
+    sub_agents, page = await _collect_sub_agents(
+        conversation_id,
+        server_client,
+        limit=limit,
+        after=after,
+        agent_spec=agent_spec,
+    )
     sessions = await _collect_global_sessions(server_client, agent_name)
-    return json.dumps({"sub_agents": sub_agents, "sessions": sessions})
+    return json.dumps(
+        {
+            "sub_agents": sub_agents,
+            "sub_agents_has_more": page["has_more"],
+            "sub_agents_next_after": page["next_after"],
+            "sessions": sessions,
+        }
+    )
 
 
 async def _rename_current_session_via_rest(
@@ -6744,8 +6780,10 @@ async def _collect_sub_agents(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     *,
+    limit: int = _SUBAGENT_LIST_DEFAULT_LIMIT,
+    after: str | None = None,
     agent_spec: AgentSpec | None = None,
-) -> list[_JsonObject]:
+) -> tuple[list[_JsonObject], dict[str, bool | str | None]]:
     """
     Collect the caller's named-sub-agent view via ``GET .../child_sessions``.
 
@@ -6759,32 +6797,39 @@ async def _collect_sub_agents(
 
     :param conversation_id: The caller session id.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: The sub-agent entries.
+    :returns: ``(entries, page)`` where ``page`` carries ``has_more`` and the
+        ``last_id`` cursor as ``next_after``.
     """
     try:
         resp = await server_client.get(
             f"/v1/sessions/{conversation_id}/child_sessions",
-            params={"limit": 100},
+            params={"limit": limit, **({"after": after} if after else {})},
             timeout=30.0,
         )
     except Exception:  # noqa: BLE001
-        return []
+        return [], {"has_more": False, "next_after": None}
     if resp.status_code != 200:
-        return []
-    result = _child_rows_to_entries(resp.json().get("data", []), agent_spec)
+        return [], {"has_more": False, "next_after": None}
+    body = _string_object_dict(resp.json()) or {}
+    result = _child_rows_to_entries(_json_object_list(body.get("data")), agent_spec)
+    has_more = body.get("has_more") is True
+    last_id = _optional_string(body.get("last_id")) if has_more else None
 
     # If the caller is itself a child, surface main + siblings too.
-    parent_id = await _session_parent_id(conversation_id, server_client)
+    parent_id = await _session_parent_id(conversation_id, server_client) if after is None else None
     if parent_id is not None:
         result.append({"agent": "main", "title": None, "conversation_id": parent_id})
         try:
             sib_resp = await server_client.get(
                 f"/v1/sessions/{parent_id}/child_sessions",
-                params={"limit": 100},
+                params={"limit": limit},
                 timeout=30.0,
             )
             if sib_resp.status_code == 200:
-                for entry in _child_rows_to_entries(sib_resp.json().get("data", []), agent_spec):
+                sib_body = _string_object_dict(sib_resp.json()) or {}
+                for entry in _child_rows_to_entries(
+                    _json_object_list(sib_body.get("data")), agent_spec
+                ):
                     # Exclude the caller itself from its own sibling list.
                     if entry["conversation_id"] != conversation_id:
                         result.append(entry)
@@ -6794,7 +6839,7 @@ async def _collect_sub_agents(
                 parent_id,
                 exc_info=True,
             )
-    return result
+    return result, {"has_more": has_more, "next_after": last_id}
 
 
 async def _resolve_runner_online_map(
@@ -6924,24 +6969,42 @@ def _child_rows_to_entries(
         labels = _string_mapping(row.get("labels")) or {}
         if not title or is_session_closed(labels, title):
             continue
-        display = title_without_closed_marker(title) or ""
+        display = (title_without_closed_marker(title) or "").strip()
         parsed_agent = _optional_string(row.get("tool"))
         durable_agent = _optional_string(row.get("sub_agent_name"))
-        if display.startswith(_UI_ADDED_TITLE_PREFIX) or (
-            parsed_agent is not None and durable_agent is not None
-        ):
+        is_ui_title = display.startswith(_UI_ADDED_TITLE_PREFIX)
+        has_canonical_prefix = (
+            durable_agent is not None
+            and parsed_agent == durable_agent
+            and _is_plausible_agent_token(parsed_agent)
+        )
+        if is_ui_title:
             agent = parsed_agent
-            legacy_title = _optional_string(row.get("session_name"))
+            legacy_title = (_optional_string(row.get("session_name")) or "").strip()
+        elif durable_agent is not None:
+            # The durable binding is authoritative. A prose title may still
+            # contain a colon, so only expose its suffix when the parsed
+            # prefix agrees with a plausible binding token.
+            agent = durable_agent
+            legacy_title = (
+                (_optional_string(row.get("session_name")) or "").strip()
+                if has_canonical_prefix
+                else display
+            )
         else:
             agent = None
             legacy_title = display
+        session_label = (_optional_string(row.get("session_name")) or "").strip()
+        if not (is_ui_title or has_canonical_prefix):
+            session_label = None
         label_candidates = (
             (
                 "omnigent.claude_native.description",
-                _optional_string(labels.get("omnigent.claude_native.description")),
+                (_optional_string(labels.get("omnigent.claude_native.description")) or "").strip()
+                or None,
             ),
-            ("task_summary", _optional_string(row.get("task_summary"))),
-            ("session_name", _optional_string(row.get("session_name"))),
+            ("task_summary", (_optional_string(row.get("task_summary")) or "").strip() or None),
+            ("session_name", session_label),
             ("title", display),
         )
         label_source, label = next(
@@ -6960,7 +7023,6 @@ def _child_rows_to_entries(
                 "updated_at": row.get("updated_at"),
                 "last_task_error": row.get("last_task_error"),
                 "pending_elicitations_count": row.get("pending_elicitations_count", 0),
-                "labels": labels or {},
                 "task_summary": row.get("task_summary"),
             }
         )
