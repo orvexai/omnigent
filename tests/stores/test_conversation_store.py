@@ -5322,6 +5322,33 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     conversation_store.touch_runner_liveness([], now=1)
 
 
+def test_live_status_update_deduplicates_at_sql_boundary(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A repeated status edge is rejected by the SQL ``IS DISTINCT FROM`` guard."""
+    from sqlalchemy import event
+
+    conv = conversation_store.create_conversation(title="sql-dedupe")
+    statements: list[str] = []
+
+    def capture_rowcount(conn, cursor, statement, parameters, context, executemany) -> None:
+        if statement.lstrip().upper().startswith("UPDATE") and "live_status" in statement:
+            statements.append(statement)
+
+    event.listen(conversation_store._engine, "after_cursor_execute", capture_rowcount)
+    try:
+        conversation_store.set_session_live_status(conv.id, "running")
+        conversation_store.set_session_live_status(conv.id, "running")
+    finally:
+        event.remove(conversation_store._engine, "after_cursor_execute", capture_rowcount)
+
+    assert len(statements) == 2
+    # SQLite renders SQLAlchemy's ``IS DISTINCT FROM`` as ``IS NOT``;
+    # either spelling proves the predicate reached the executed statement.
+    assert " IS NOT " in statements[0].upper() or " IS DISTINCT FROM " in statements[0].upper()
+    assert conversation_store.get_conversation(conv.id).live_status == "running"
+
+
 def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

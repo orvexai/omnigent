@@ -502,6 +502,26 @@ class _RecordingLabelStore:
     def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
         self.labels.setdefault(conversation_id, {}).update(updates)
 
+    def set_session_live_status_if_busy(self, conversation_id: str, status: str) -> bool:
+        if self.live_status.get(conversation_id, "running") not in ("running", "waiting"):
+            return False
+        self.live_status[conversation_id] = status
+        return True
+
+    def clear_disconnect_error_labels_if_current(self, conversation_id: str) -> bool:
+        labels = self.labels.get(conversation_id, {})
+        if labels.get("omnigent.last_task_error_code") != "runner_disconnected":
+            return False
+        for key in (
+            "omnigent.last_task_error_code",
+            "omnigent.last_task_error_message",
+            "omnigent.last_task_error_title",
+            "omnigent.last_task_error_cause",
+            "omnigent.last_task_error_remediation",
+        ):
+            labels[key] = ""
+        return True
+
     def get_conversation(self, conversation_id: str) -> Any:
         """Return a conversation-shaped object exposing ``.labels``.
 
@@ -643,6 +663,7 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels(
 
         # Recovery: a successful runner rebind / session-init flips the
         # durable failed state back to idle and must drop the labels.
+        recovery_reads_before = store.get_conversation_calls
         await sessions_module._publish_runner_recovered_status(
             session_id,
             store,  # type: ignore[arg-type]
@@ -650,7 +671,7 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels(
         )
 
         assert sessions_module._session_status_cache.get(session_id) == "idle"
-        assert store.get_conversation_calls == 1
+        assert store.get_conversation_calls - recovery_reads_before == 1
         cleared = store.labels.get(session_id)
         assert cleared is not None
         # Both label values are emptied, so the projection collapses back
