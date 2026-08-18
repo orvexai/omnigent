@@ -441,6 +441,8 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 
 _session_status_cache: dict[str, str] = {}
+# On the relaying pod this cache is the authoritative verdict input; absence
+# means the session was never observed here, not that it is idle.
 
 
 _session_active_response_cache: dict[str, str] = {}
