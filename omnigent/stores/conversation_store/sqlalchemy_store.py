@@ -294,6 +294,7 @@ def _new_session_metadata_row(
     runner_id: str | None = None,
     workspace: str | None = None,
     terminal_launch_args: list[str] | None = None,
+    sub_agent_name: str | None = None,
 ) -> SqlConversationMetadata:
     """
     Build the Omnigent metadata row paired with a new session conversation.
@@ -307,11 +308,15 @@ def _new_session_metadata_row(
     :param terminal_launch_args: Optional pass-through CLI args for a
         native terminal wrapper. ``None`` leaves it NULL; a list
         (including ``[]``) is JSON-encoded.
+    :param sub_agent_name: Durable binding for a parented child. Bundle
+        creates derive this from the uploaded agent name; ``None`` is used
+        for top-level sessions.
     :returns: Unsaved :class:`SqlConversationMetadata` row.
     """
     return SqlConversationMetadata(
         id=conversation_id,
         kind=encode_conversation_kind("sub_agent" if parent_conversation_id else "default"),
+        sub_agent_name=sub_agent_name,
         runner_id=runner_id,
         workspace=workspace,
         terminal_launch_args=(
@@ -3383,6 +3388,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         meta_row = _new_session_metadata_row(
             conversation_id,
             parent_conversation_id=parent_conversation_id,
+            sub_agent_name=agent_name if parent_conversation_id else None,
             runner_id=runner_id,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,

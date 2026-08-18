@@ -7924,6 +7924,14 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    # A parented JSON create without an explicit binding is the MCP
+    # ``sys_session_create`` path.  The selected agent row is authoritative
+    # there; persist its name so child discovery does not depend on title
+    # parsing.  Explicit native mirror bindings remain untouched.
+    persisted_sub_agent_name = body.sub_agent_name
+    if persisted_sub_agent_name is None and body.parent_session_id is not None:
+        persisted_sub_agent_name = agent.name
+
     try:
         conv = conversation_store.create_conversation(
             agent_id=agent.id,
@@ -7931,7 +7939,7 @@ async def _create_session_from_existing_agent(
             parent_conversation_id=body.parent_session_id,
             runner_id=inherited_runner_id,
             kind="sub_agent" if body.parent_session_id else "default",
-            sub_agent_name=body.sub_agent_name,
+            sub_agent_name=persisted_sub_agent_name,
             host_id=body.host_id,
             workspace=canonical_workspace,
             git_branch=git_branch,

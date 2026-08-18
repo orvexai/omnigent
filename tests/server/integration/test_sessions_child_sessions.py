@@ -154,6 +154,31 @@ async def test_child_sessions_empty_when_no_children(
     assert body["has_more"] is False
 
 
+async def test_mcp_parented_create_stamps_the_launched_agent_binding(
+    client: httpx.AsyncClient,
+) -> None:
+    """A parented MCP-style create must not leave ``sub_agent_name`` null."""
+    parent = await _create_parent_session(client, agent_name="mcp-child-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent["agent_id"],
+            "parent_session_id": parent["id"],
+            "title": "U8-THREADS implement: stage 1",
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    child = resp.json()
+    assert child["sub_agent_name"] == "mcp-child-agent"
+
+    listing = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    assert listing.status_code == 200, listing.text
+    listed = next(row for row in listing.json()["data"] if row["id"] == child["id"])
+    assert listed["sub_agent_name"] == "mcp-child-agent"
+
+
 # ── Full response shape ──────────────────────────────────
 
 
@@ -1653,6 +1678,7 @@ async def test_multipart_create_with_parent_links_child(
     # Parent linkage + agent binding traversed metadata → store → row.
     assert snap.json()["parent_session_id"] == parent["id"]
     assert snap.json()["agent_id"] == body["agent_id"]
+    assert snap.json()["sub_agent_name"] == "bundle-child"
 
     listing = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
     assert listing.status_code == 200, listing.text

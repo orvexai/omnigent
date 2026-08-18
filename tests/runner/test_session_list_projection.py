@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 from omnigent.runner.tool_dispatch import _child_rows_to_entries
@@ -105,6 +106,56 @@ def test_free_form_colon_title_does_not_invent_agent() -> None:
     assert entry["title"] == "bug: login 500"
     assert entry["label"] == "bug: login 500"
     assert entry["label_source"] == "title"
+
+
+def test_prose_colon_title_label_falls_back_to_whole_title() -> None:
+    """A prose colon is not an agent/session delimiter for the label."""
+    [entry] = _entries(
+        [
+            _row(
+                "conv_u8",
+                "U8-THREADS implement: stage 1",
+                tool="U8-THREADS implement",
+                session_name=" stage 1",
+                sub_agent_name="worker",
+            )
+        ]
+    )
+
+    assert entry["label"] == "U8-THREADS implement: stage 1"
+    assert entry["label"] != " stage 1"
+    assert entry["label_source"] == "title"
+    assert entry["agent"] == "worker"
+
+
+def test_child_projection_is_compact_and_drops_raw_labels() -> None:
+    """The list result keeps projections, not the bulky source label map."""
+    rows = [
+        _row(
+            f"conv_{index}",
+            f"worker:task-{index}",
+            tool="worker",
+            session_name=f"task-{index}",
+            sub_agent_name="worker",
+            labels={
+                "omnigent.last_context_tokens": "196529",
+                "omnigent.last_task_error_cause": "",
+                "omnigent.last_task_error_remediation": "",
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "codex-native-ui",
+                "omnigent.last_task_error_code": "",
+                "omnigent.last_task_error_message": "",
+                "omnigent.last_task_error_title": "",
+            },
+        )
+        for index in range(75)
+    ]
+
+    entries = _entries(rows)
+    rendered = json.dumps({"sub_agents": entries}, separators=(",", ":"))
+
+    assert len(rendered) < 40_000
+    assert all("labels" not in entry for entry in entries)
 
 
 def test_ui_title_keeps_explicit_agent_and_label() -> None:

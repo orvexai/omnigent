@@ -9,6 +9,7 @@ sub-agent. See designs/STEERABLE_SUBAGENTS.md for the full design.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,6 +48,10 @@ _ACTIVITY_MAX_CHARS = 2000
 # letting the LLM request a substantial slice for triage.
 _HISTORY_DEFAULT_TAIL = 10
 _HISTORY_MAX_TAIL = 50
+
+_SESSION_LIST_DEFAULT_LIMIT = 100
+_SESSION_LIST_MAX_LIMIT = 100
+_AGENT_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 
 class SysSessionSendTool(Tool):
@@ -532,6 +537,10 @@ class SysSessionListTool(Tool):
       (``sys_agent_get`` / ``sys_session_get_info``) or drive
       (``sys_session_send`` by ``session_id``).
 
+    The child view is bounded to 100 rows by default. When
+    ``sub_agents_has_more`` is true, pass its ``sub_agents_next_after`` value
+    back as ``sub_agents_after`` to fetch the next page.
+
     The global ``sessions`` view is populated only on the runner
     (REST) path, where the server enforces permissions; the in-process
     path returns ``sub_agents`` with an empty ``sessions`` list.
@@ -585,6 +594,21 @@ class SysSessionListTool(Tool):
                                 "affect the 'sub_agents' view."
                             ),
                         },
+                        "sub_agents_limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": _SESSION_LIST_MAX_LIMIT,
+                            "description": (
+                                "Maximum number of child rows to return; defaults "
+                                f"to {_SESSION_LIST_DEFAULT_LIMIT}."
+                            ),
+                        },
+                        "sub_agents_after": {
+                            "type": "string",
+                            "description": (
+                                "Cursor from sub_agents_next_after to fetch the next child page."
+                            ),
+                        },
                     },
                     "required": [],
                     "additionalProperties": False,
@@ -606,10 +630,23 @@ class SysSessionListTool(Tool):
             ``agent_name`` filter only applies to the REST ``sessions``
             view).
         :param ctx: Server-side execution context.
-        :returns: JSON ``{"sub_agents": [{"agent": ..., "title": ...,
-            "conversation_id": ...}, ...], "sessions": []}``.
+        :returns: JSON with ``sub_agents`` plus page fields
+            ``sub_agents_has_more`` and ``sub_agents_next_after``; the
+            in-process path leaves ``sessions`` empty.
         """
-        del arguments
+        try:
+            args = json.loads(arguments) if arguments.strip() else {}
+        except json.JSONDecodeError:
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        limit = args.get("sub_agents_limit", _SESSION_LIST_DEFAULT_LIMIT)
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            limit = _SESSION_LIST_DEFAULT_LIMIT
+        limit = max(1, min(limit, _SESSION_LIST_MAX_LIMIT))
+        after = args.get("sub_agents_after")
+        if not isinstance(after, str) or not after:
+            after = None
         from omnigent.runtime import get_conversation_store
 
         parent_conversation_id = _resolve_parent_conversation_id(ctx)
@@ -617,10 +654,8 @@ class SysSessionListTool(Tool):
         children = conv_store.list_conversations(
             kind="sub_agent",
             parent_conversation_id=parent_conversation_id,
-            # 100 is a safe ceiling — agents that need more named
-            # sub-agents than this are an antipattern; the LLM
-            # would lose track regardless.
-            limit=100,
+            limit=limit,
+            after=after,
         )
         # ``agent`` is None for a free-form-titled child, which has no
         # "<agent>:" prefix to recover a name from.
@@ -648,7 +683,14 @@ class SysSessionListTool(Tool):
         # ``sessions`` (the global, permission-bounded view) is empty on
         # the in-process path — it has no caller identity to scope by.
         # The runner (REST) path populates it via GET /v1/sessions.
-        return json.dumps({"sub_agents": result, "sessions": []})
+        return json.dumps(
+            {
+                "sub_agents": result,
+                "sub_agents_has_more": children.has_more,
+                "sub_agents_next_after": children.last_id if children.has_more else None,
+                "sessions": [],
+            }
+        )
 
 
 class SysSessionGetInfoTool(Tool):
@@ -1253,6 +1295,8 @@ def _agent_title_from_conversation(child: Conversation) -> _AgentTitle:
     if child.sub_agent_name is None or ":" not in stripped:
         return _AgentTitle(agent=None, title=stripped)
     sa_agent, _, sa_title = stripped.partition(":")
+    if sa_agent != child.sub_agent_name or not _AGENT_TOKEN_RE.fullmatch(sa_agent):
+        return _AgentTitle(agent=child.sub_agent_name, title=stripped)
     return _AgentTitle(agent=sa_agent, title=sa_title)
 
 
