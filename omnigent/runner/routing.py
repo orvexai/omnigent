@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from omnigent.server.host_registry import HostRegistry
     from omnigent.stores import ConversationStore
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.runner_tunnel_store import RunnerTunnelStore
 
 
 _EXECUTOR_TYPE_TO_HARNESS: dict[str, str] = {"claude_sdk": "claude-sdk"}
@@ -76,18 +77,14 @@ class RunnerRouter:
         ``WS /v1/runners/{runner_id}/tunnel``.
     :param conversation_store: Store used to read
         ``conversations.runner_id`` affinity.
-    :param host_registry: Per-replica host-tunnel registry. Tells a
-        wrong-replica miss (host not on this replica → ``WRONG_REPLICA``,
-        re-addressable without the key) from a genuinely offline runner
-        (``RUNNER_UNAVAILABLE``). See :meth:`_runner_absent_code`. ``None``
-        (single-replica / host support not wired) keeps every miss
-        ``RUNNER_UNAVAILABLE``.
-    :param host_store: Cross-replica host liveness. Paired with
-        ``host_registry``: a miss is ``WRONG_REPLICA`` only when the host
-        is absent here but live somewhere (``is_online``). Without it, a host
-        that just disconnected (reaped from the local registry, dead
-        everywhere) would be mislabeled re-addressable instead of
-        ``RUNNER_UNAVAILABLE``. ``None`` falls back to the registry-only check.
+    :param host_registry: Per-replica host-tunnel registry used by the
+        legacy fallback classifier when durable runner ownership is inert.
+    :param host_store: Cross-replica host liveness used by that same
+        backwards-compatible fallback. Once pod identity and the durable
+        runner table are wired, the runner row is authoritative instead.
+    :param runner_tunnel_store: Durable runner-to-pod ownership records.
+    :param pod_addr: This pod's dialable address; ``None`` keeps the new
+        classification inert.
     """
 
     def __init__(
@@ -97,11 +94,15 @@ class RunnerRouter:
         conversation_store: ConversationStore,
         host_registry: HostRegistry | None = None,
         host_store: HostStore | None = None,
+        runner_tunnel_store: RunnerTunnelStore | None = None,
+        pod_addr: str | None = None,
     ) -> None:
         self._registry = registry
         self._conversation_store = conversation_store
         self._host_registry = host_registry
         self._host_store = host_store
+        self._runner_tunnel_store = runner_tunnel_store
+        self._pod_addr = pod_addr
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._lock = threading.RLock()
 
@@ -172,7 +173,8 @@ class RunnerRouter:
             if session is None:
                 raise OmnigentError(
                     f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
-                    code=self._runner_absent_code(conv.host_id),
+                    code=self._runner_absent_code(conv.host_id, conv.runner_id),
+                    owner_addr=self.runner_owner_addr(conv.runner_id),
                 )
             return RoutedRunner(
                 runner_id=conv.runner_id,
@@ -208,7 +210,8 @@ class RunnerRouter:
         if session is None:
             raise OmnigentError(
                 f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
-                code=self._runner_absent_code(conv.host_id),
+                code=self._runner_absent_code(conv.host_id, conv.runner_id),
+                owner_addr=self.runner_owner_addr(conv.runner_id),
             )
         return RoutedRunner(
             runner_id=conv.runner_id,
@@ -270,7 +273,8 @@ class RunnerRouter:
         if session is None:
             raise OmnigentError(
                 f"runner {runner_id!r} is offline; resume the session to bind a registered runner",
-                code=self._runner_absent_code(host_id),
+                code=self._runner_absent_code(host_id, runner_id),
+                owner_addr=self.runner_owner_addr(runner_id),
             )
         if not _runner_supports_harness(session, harness):
             raise OmnigentError(
@@ -279,34 +283,42 @@ class RunnerRouter:
             )
         return RoutedRunner(runner_id=runner_id, client=self._client_for_runner(runner_id))
 
-    def _runner_absent_code(self, host_id: str | None) -> str:
+    def runner_owner_addr(self, runner_id: str) -> str | None:
+        """Return durable runner ownership when Stage 1 is active."""
+        if self._runner_tunnel_store is None or self._pod_addr is None:
+            return None
+        return self._runner_tunnel_store.owner(runner_id)
+
+    def _runner_absent_code(
+        self, host_id: str | None, runner_id: str | None = None
+    ) -> str:
         """
         Classify a "bound runner, but its tunnel isn't on this replica" miss.
 
-        A runner registers its tunnel on the same replica as its host, so
-        when a bound runner's tunnel is absent here, the host tells the two
-        failure modes apart:
+        With durable ownership wired, the runner table tells the two failure
+        modes apart:
 
-        - host set, absent from this replica's ``HostRegistry``, and still
-          live elsewhere (``host_store.is_online``) → wrong replica. Return
-          :data:`~ErrorCode.WRONG_REPLICA` so the client re-addresses without
-          the key and reaches the host via the default route.
-        - otherwise (no host, no registry/store wired, host is on this
-          replica, or host not live anywhere) → genuinely offline. Return
-          :data:`~ErrorCode.RUNNER_UNAVAILABLE`.
+        - row present with a different owner address → ``WRONG_REPLICA``;
+        - row absent, or owned by this pod but missing locally →
+          ``RUNNER_UNAVAILABLE``.
 
-        Both signals are needed: the local registry answers "is the host on
-        THIS replica"; the store answers "is it alive at all". Without the
-        liveness check, a host that just disconnected (reaped locally, dead
-        everywhere) would be mislabeled ``WRONG_REPLICA`` and trigger a
-        pointless re-address. This mirrors the HTTP wrong-replica guards
-        (send / stream / create). With no store wired, fall back to the
-        registry-only check — single-replica setups never misroute.
+        When the durable store is not wired, retain the existing host
+        liveness fallback so single-replica and mixed-version deployments
+        remain compatible.
 
         :param host_id: The session's bound host id, or ``None`` (hostless
             local runner — always genuinely offline when its tunnel drops).
         :returns: The error code string to raise.
         """
+        if self._runner_tunnel_store is not None and self._pod_addr is not None and runner_id:
+            owner_addr = self.runner_owner_addr(runner_id)
+            if owner_addr is not None:
+                return (
+                    ErrorCode.WRONG_REPLICA
+                    if owner_addr != self._pod_addr
+                    else ErrorCode.RUNNER_UNAVAILABLE
+                )
+            return ErrorCode.RUNNER_UNAVAILABLE
         if (
             host_id
             and self._host_registry is not None

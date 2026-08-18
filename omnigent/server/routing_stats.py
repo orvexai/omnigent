@@ -10,6 +10,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+from omnigent.errors import ErrorCode, OmnigentError
+
 
 @dataclass
 class RoutingStats:
@@ -46,7 +48,7 @@ def stats_for_request(request: Any) -> RoutingStats | None:
     return getattr(getattr(app, "state", None), "routing_stats", None)
 
 
-def record_elicitation_resolution_if_off_owner(
+async def record_elicitation_resolution_if_off_owner(
     request: Any,
     conversation: Any,
     runner_router: Any,
@@ -57,6 +59,22 @@ def record_elicitation_resolution_if_off_owner(
     if stats is not None and runner_id and runner_router is not None:
         if not runner_router.runner_is_online(runner_id):
             stats.record_elicitation_resolve_off_owner()
+            owner = (
+                await asyncio.to_thread(_owner_for_request, request, runner_router, runner_id)
+                if _stage2_active(request, runner_router)
+                else None
+            )
+            if owner is not None:
+                raise OmnigentError(
+                    "session elicitation is on another replica; retry",
+                    code=ErrorCode.WRONG_REPLICA,
+                    owner_addr=owner,
+                )
+            if _stage2_active(request, runner_router):
+                raise OmnigentError(
+                    "session elicitation runner is unavailable; retry",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
 
 
 async def record_hook_park_if_off_owner(
@@ -84,3 +102,33 @@ async def record_hook_park_if_off_owner(
     runner_id = getattr(conversation, "runner_id", None)
     if runner_id and not runner_router.runner_is_online(runner_id):
         stats.record_hook_park_off_owner()
+        owner = _owner_for_request(request, runner_router, runner_id)
+        if owner is not None:
+            raise OmnigentError(
+                "session hook is on another replica; retry",
+                code=ErrorCode.WRONG_REPLICA,
+                owner_addr=owner,
+            )
+        if _stage2_active(request, runner_router):
+            raise OmnigentError(
+                "session hook runner is unavailable; retry",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+
+
+def _owner_for_request(request: Any, runner_router: Any, runner_id: str) -> str | None:
+    """Return a remote durable owner, or ``None`` while Stage 1 is inert."""
+    app = getattr(request, "app", None)
+    pod_addr = getattr(getattr(app, "state", None), "pod_addr", None)
+    owner_lookup = getattr(runner_router, "runner_owner_addr", None)
+    if pod_addr is None or owner_lookup is None:
+        return None
+    owner = owner_lookup(runner_id)
+    return owner if owner is not None and owner != pod_addr else None
+
+
+def _stage2_active(request: Any, runner_router: Any) -> bool:
+    """Return whether durable ownership classification is wired."""
+    app = getattr(request, "app", None)
+    pod_addr = getattr(getattr(app, "state", None), "pod_addr", None)
+    return pod_addr is not None and callable(getattr(runner_router, "runner_owner_addr", None))

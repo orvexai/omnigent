@@ -3024,6 +3024,7 @@ async def _maybe_relaunch_managed_sandbox(
             f"host {conv.host_id} is live on another replica after its managed "
             "launch; retry without the routing key",
             code=ErrorCode.WRONG_REPLICA,
+            owner_addr=host.owner_addr,
         )
     return True
 

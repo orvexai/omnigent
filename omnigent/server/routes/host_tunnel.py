@@ -79,6 +79,7 @@ def create_host_tunnel_router(
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
+    pod_addr: str | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
 
@@ -254,6 +255,7 @@ def create_host_tunnel_router(
                 user_id=tunnel_owner,
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,
+                owner_addr=pod_addr,
             )
 
             conn = host_registry.register(
@@ -279,7 +281,7 @@ def create_host_tunnel_router(
                 name=f"host-sender:{host_id}",
             )
             ping_task = asyncio.create_task(
-                _ping_loop(ws, conn, host_id, host_store),
+                _ping_loop(ws, conn, host_id, host_store, pod_addr),
                 name=f"host-ping:{host_id}",
             )
             receive_task = asyncio.create_task(
@@ -334,7 +336,11 @@ def create_host_tunnel_router(
                 # If the host already reconnected, this handler's connection
                 # was replaced; only the current one may mark it offline.
                 if host_registry.deregister(host_id, conn=conn):
-                    await asyncio.to_thread(host_store.set_offline, host_id)
+                    await asyncio.to_thread(
+                        host_store.set_offline,
+                        host_id,
+                        owner_addr=pod_addr,
+                    )
                 if on_host_disconnect is not None:
                     try:
                         await on_host_disconnect(host_id, tunnel_owner)
@@ -353,7 +359,11 @@ def create_host_tunnel_router(
             # or flip that owner's host offline (cross-user DoS).
             if conn is not None:
                 if host_registry.deregister(host_id, conn=conn):
-                    await asyncio.to_thread(host_store.set_offline, host_id)
+                    await asyncio.to_thread(
+                        host_store.set_offline,
+                        host_id,
+                        owner_addr=pod_addr,
+                    )
                 if on_host_disconnect is not None:
                     try:
                         await on_host_disconnect(host_id, tunnel_owner)
@@ -367,7 +377,11 @@ def create_host_tunnel_router(
             # Same guard as above: don't touch a host we never registered.
             if conn is not None:
                 if host_registry.deregister(host_id, conn=conn):
-                    await asyncio.to_thread(host_store.set_offline, host_id)
+                    await asyncio.to_thread(
+                        host_store.set_offline,
+                        host_id,
+                        owner_addr=pod_addr,
+                    )
 
     return router
 
@@ -702,6 +716,7 @@ async def _ping_loop(
     conn: HostConnection,
     host_id: str,
     host_store: HostStore,
+    pod_addr: str | None = None,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
@@ -733,7 +748,7 @@ async def _ping_loop(
             return
         # The host is still within the liveness window — refresh its
         # last-seen so the freshness gate keeps it in the online set.
-        await asyncio.to_thread(host_store.heartbeat, host_id)
+        await asyncio.to_thread(host_store.heartbeat, host_id, owner_addr=pod_addr)
         try:
             ping_text = encode_frame(PingFrame(ts=int(time.time() * 1000)))
             conn.outbound_queue.put_nowait(ping_text)

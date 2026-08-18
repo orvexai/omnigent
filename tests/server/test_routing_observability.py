@@ -9,6 +9,7 @@ import pytest
 from starlette.requests import Request
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server import _elicitation_registry
 from omnigent.server.routing_stats import (
     RoutingStats,
     record_elicitation_resolution_if_off_owner,
@@ -29,6 +30,11 @@ class _Router:
         return runner_id in self.online
 
 
+class _DurableOwnerRouter(_Router):
+    def runner_owner_addr(self, runner_id: str) -> str | None:
+        return "pod-b:8000" if runner_id == "runner-remote" else None
+
+
 def _request(stats: RoutingStats) -> SimpleNamespace:
     return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(routing_stats=stats)))
 
@@ -45,13 +51,34 @@ def test_routing_stats_counter_only_counts_wrong_replica() -> None:
 
 
 @pytest.mark.asyncio
+async def test_off_owner_elicitation_resolution_is_loud_and_does_not_tombstone() -> None:
+    """Stage 2 rejects a remote resolution before local tombstone insertion."""
+    stats = RoutingStats()
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(routing_stats=stats, pod_addr="pod-a:8000"))
+    )
+    conversation = _Conversation("runner-remote")
+    router = _DurableOwnerRouter(set())
+    elicitation_id = "stage2-remote-elicitation"
+
+    _elicitation_registry._harness_pre_resolved_elicitations.pop(elicitation_id, None)
+    with pytest.raises(OmnigentError) as exc_info:
+        await record_elicitation_resolution_if_off_owner(request, conversation, router)
+
+    assert exc_info.value.code == ErrorCode.WRONG_REPLICA
+    assert exc_info.value.owner_addr == "pod-b:8000"
+    assert elicitation_id not in _elicitation_registry._harness_pre_resolved_elicitations
+    assert stats.snapshot()["elicitation_resolve_off_owner_total"] == 1
+
+
+@pytest.mark.asyncio
 async def test_silent_site_counters_distinguish_local_and_absent_tunnels() -> None:
     stats = RoutingStats()
     request = _request(stats)
     local = _Conversation("runner-local")
     router = _Router({"runner-local"})
 
-    record_elicitation_resolution_if_off_owner(request, local, router)
+    await record_elicitation_resolution_if_off_owner(request, local, router)
     await record_hook_park_if_off_owner(
         request,
         session_id="conv-local",
@@ -64,7 +91,7 @@ async def test_silent_site_counters_distinguish_local_and_absent_tunnels() -> No
 
     absent = _Conversation("runner-remote")
     router = _Router(set())
-    record_elicitation_resolution_if_off_owner(request, absent, router)
+    await record_elicitation_resolution_if_off_owner(request, absent, router)
     await record_hook_park_if_off_owner(
         request,
         session_id="conv-remote",

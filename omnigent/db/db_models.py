@@ -1318,6 +1318,9 @@ class SqlHost(OmnigentBase):
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Pod address that currently owns the host WebSocket tunnel. Nullable so
+    # old binaries and single-replica deployments remain schema-compatible.
+    owner_addr: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -1331,6 +1334,23 @@ class SqlHost(OmnigentBase):
             "workspace_id", "user_id", "name", name="uq_hosts_workspace_user_id_name"
         ),
     )
+
+
+class SqlRunnerTunnel(OmnigentBase):
+    """Durable owner of a runner WebSocket tunnel."""
+
+    __tablename__ = "runner_tunnels"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    runner_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_addr: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class SqlUserDailyCost(OmnigentBase):

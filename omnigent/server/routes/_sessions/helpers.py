@@ -4261,7 +4261,15 @@ async def _get_runner_client_impl(
                     conversation=conversation,
                 )
             return routed.client
-        except (LookupError, httpx.HTTPError, OmnigentError):
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.WRONG_REPLICA:
+                raise
+            _logger.debug(
+                "No runner bound for session=%s",
+                session_id,
+            )
+            return None
+        except (LookupError, httpx.HTTPError):
             _logger.debug(
                 "No runner bound for session=%s",
                 session_id,

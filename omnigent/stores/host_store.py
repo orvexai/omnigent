@@ -34,6 +34,7 @@ from omnigent.db.utils import (
     now_epoch,
 )
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.stores.runner_tunnel_store import RunnerTunnelStore
 
 # A host is considered live only if its row was touched (connect or
 # heartbeat) within this window. The host tunnel's ping loop writes a
@@ -86,6 +87,7 @@ class Host:
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    owner_addr: str | None = None
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -154,6 +156,7 @@ def _row_to_host(row: SqlHost) -> Host:
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        owner_addr=row.owner_addr,
     )
 
 
@@ -193,6 +196,7 @@ class HostStore:
             self._engine,
             query_name_prefix="omnigent.host_store",
         )
+        self.runner_tunnel_store = RunnerTunnelStore(self._engine)
 
     def upsert_on_connect(
         self,
@@ -202,6 +206,7 @@ class HostStore:
         *,
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
+        owner_addr: str | None = None,
     ) -> Host:
         """
         Register or update a host on WebSocket connect.
@@ -267,6 +272,8 @@ class HostStore:
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
+                if owner_addr is not None:
+                    row.owner_addr = owner_addr
                 return _row_to_host(row)
 
             # host_id is new — check whether (workspace_id, user_id, name)
@@ -281,6 +288,7 @@ class HostStore:
                     name=name,
                     user_id=user_id,
                     configured_harnesses_json=harnesses_json,
+                    owner_addr=owner_addr,
                 )
                 if reowned is not None:
                     return reowned
@@ -303,6 +311,7 @@ class HostStore:
                     host_id,
                     now,
                     harnesses_json,
+                    owner_addr,
                 )
                 return _row_to_host(row)
 
@@ -315,6 +324,7 @@ class HostStore:
                 created_at=now,
                 updated_at=now,
                 configured_harnesses=harnesses_json,
+                owner_addr=owner_addr,
             )
             session.add(row)
             return _row_to_host(row)
@@ -326,6 +336,7 @@ class HostStore:
         new_host_id: str,
         now: int,
         harnesses_json: str | None,
+        owner_addr: str | None,
     ) -> SqlHost:
         """Replace a host row's host_id while repointing its conversations.
 
@@ -399,6 +410,7 @@ class HostStore:
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
             configured_harnesses=harnesses_json,
+            owner_addr=owner_addr,
         )
         session.add(new_row)
         session.flush()
@@ -424,6 +436,7 @@ class HostStore:
         name: str,
         user_id: str,
         configured_harnesses_json: str | None = None,
+        owner_addr: str | None = None,
     ) -> Host | None:
         """Re-own an existing host_id row under a new ``(user_id, name)``.
 
@@ -472,6 +485,7 @@ class HostStore:
                 status=encode_host_status("online"),
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
+                **({"owner_addr": owner_addr} if owner_addr is not None else {}),
             )
         )
         return Host(
@@ -484,9 +498,10 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
+            owner_addr=owner_addr if owner_addr is not None else existing.owner_addr,
         )
 
-    def set_offline(self, host_id: str) -> None:
+    def set_offline(self, host_id: str, *, owner_addr: str | None = None) -> None:
         """
         Mark a host as offline when its WebSocket disconnects.
 
@@ -497,14 +512,19 @@ class HostStore:
             ``"host_a1b2c3d4..."``.
         """
         with self._session("set_host_offline") as session:
-            row = session.execute(
-                select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
-                )
-            ).scalar_one_or_none()
-            if row is not None:
-                row.status = encode_host_status("offline")
-                row.updated_at = now_epoch()
+            predicates = [
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == host_id,
+            ]
+            if owner_addr is not None:
+                predicates.append(SqlHost.owner_addr == owner_addr)
+            values: dict[str, object] = {
+                "status": encode_host_status("offline"),
+                "updated_at": now_epoch(),
+            }
+            if owner_addr is not None:
+                values["owner_addr"] = None
+            session.execute(update(SqlHost).where(*predicates).values(**values))
 
     def update_harness_readiness(
         self,
@@ -529,7 +549,7 @@ class HostStore:
                 )
             )
 
-    def heartbeat(self, host_id: str) -> None:
+    def heartbeat(self, host_id: str, *, owner_addr: str | None = None) -> None:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
 
@@ -548,14 +568,17 @@ class HostStore:
         # ping interval for every connected host, so the extra read is
         # pure overhead. A missing host simply matches no rows (a no-op).
         with self._session("update_host_heartbeat") as session:
-            session.execute(
-                update(SqlHost)
-                .where(
-                    SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.host_id == host_id,
+            predicates = [
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == host_id,
+            ]
+            values: dict[str, object] = {"updated_at": now_epoch()}
+            if owner_addr is not None:
+                predicates.append(
+                    (SqlHost.owner_addr == owner_addr) | (SqlHost.owner_addr.is_(None))
                 )
-                .values(updated_at=now_epoch())
-            )
+                values["owner_addr"] = owner_addr
+            session.execute(update(SqlHost).where(*predicates).values(**values))
 
     def is_online(self, host_id: str) -> bool:
         """
