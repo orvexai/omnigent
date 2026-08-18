@@ -10,7 +10,7 @@ import pytest
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
-from omnigent.stores.artifact_store.s3 import S3ArtifactStore, _make_client
+from omnigent.stores.artifact_store.s3 import S3ArtifactStore, _make_client, _parse_s3_uri
 
 _BUCKET = "omnigent-test-artifacts"
 
@@ -126,6 +126,11 @@ def test_make_client_uses_r2_endpoint(monkeypatch):
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
     client = _make_client()
     assert client.meta.endpoint_url == "https://acct.r2.cloudflarestorage.com"
+
+
+def test_query_string_is_part_of_bucket_name():
+    """S3 URIs must keep endpoint and region out of the bucket component."""
+    assert _parse_s3_uri("s3://bucket?endpoint=x") == ("bucket?endpoint=x", "")
 
 
 def test_non_notfound_error_propagates(s3_store, monkeypatch):
