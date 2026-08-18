@@ -542,7 +542,9 @@ async def test_relay_persists_disconnect_error_labels_on_tunnel_close(
     fake_runner = _TunnelCloseRunnerClient(gate)
     store = _RecordingLabelStore()
     session_id = "82fe36b7ca1bfb567bfbcce4eaa487a1"
-    store.live_status[session_id] = "running"
+    # The disconnect verdict reads the relay's local cache, not the row.
+    sessions_module._session_status_cache[session_id] = "running"
+    store.live_status[session_id] = "idle"
 
     try:
         handle = await sessions_module._ensure_runner_relay_ready(
@@ -1085,12 +1087,12 @@ def _bound_conv(
     """
     Build a conversation-shaped row for the offline-reconciliation helper.
 
-    ``_mark_runner_sessions_offline`` reads only ``id``, ``kind`` and
-    ``live_status`` off each row, so a namespace is enough.
+    ``_mark_runner_sessions_offline`` reads ``id`` and ``kind`` off each row;
+    ``live_status`` makes row-versus-cache cases explicit in the tests.
 
     :param session_id: Conversation identifier.
     :param kind: ``"default"`` (top-level) or ``"sub_agent"``.
-    :param live_status: Persisted live status, read only on a cache miss.
+    :param live_status: Persisted live status, ignored by the verdict.
     :returns: A conversation-shaped namespace.
     """
     return SimpleNamespace(id=session_id, kind=kind, live_status=live_status)
@@ -1109,10 +1111,13 @@ def _bound_conv(
         # whole Agents-rail-goes-red bug).
         ("sub_agent", "idle", None, False, False, False),
         ("default", "idle", None, False, False, False),
-        # Cache miss falls back to the persisted row value.
-        ("default", None, "running", False, False, True),
+        # A cache miss is undecidable even when the persisted row says running.
+        ("default", None, "running", False, False, False),
         ("default", None, "idle", False, False, False),
         ("default", None, None, False, False, False),
+        # The disconnect verdict reads the cache, so a cached edge still fails
+        # even when the row is idle.
+        ("default", "running", "idle", False, False, True),
         # Stop / archive drop the tunnel on purpose; the relay owns that path.
         ("default", "running", None, True, False, False),
         # A crash report also covers the runner that died before it could run
