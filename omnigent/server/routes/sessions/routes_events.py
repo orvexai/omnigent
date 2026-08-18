@@ -191,6 +191,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _wait_for_host_bound_runner_client,
     ensure_runner_connected,
 )
+from omnigent.server.routing_stats import record_elicitation_resolution_if_off_owner
 from omnigent.server.schemas import (
     ConversationDeleted,
     ElicitationRequestEvent,
@@ -990,6 +991,7 @@ def register_events_routes(
                     "external_elicitation_resolved requires string data.elicitation_id.",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            record_elicitation_resolution_if_off_owner(request, conv, runner_router)
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_STATUS_TYPE:

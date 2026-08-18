@@ -84,6 +84,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _spawn_gateway_backed,
     _spawn_native_blocked_notice_forward,
 )
+from omnigent.server.routing_stats import record_hook_park_if_off_owner
 from omnigent.server.schemas import (
     ElicitationRequestParams,
 )
@@ -188,7 +189,7 @@ def register_hooks_routes(
         from omnigent.server.routes import sessions as _sf
 
         user_id = _get_user_id(request, auth_provider)
-        await _require_access(
+        access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
         try:
@@ -303,6 +304,13 @@ def register_hooks_routes(
         # binary-card fallback.
         if tool_name == "ExitPlanMode" and isinstance(tool_input, dict) and tool_input:
             extras["exit_plan_mode"] = tool_input
+        await record_hook_park_if_off_owner(
+            request,
+            session_id=session_id,
+            conversation_store=conversation_store,
+            runner_router=getattr(request.app.state, "runner_router", None),
+            conversation=access.conversation,
+        )
         params = ElicitationRequestParams(
             mode="form",
             message=f"Claude wants to call **{tool_name}**",
@@ -974,7 +982,7 @@ def register_hooks_routes(
             400 if the request envelope is malformed or unsupported.
         """
         user_id = _get_user_id(request, auth_provider)
-        await _require_access(
+        access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
         try:
@@ -992,6 +1000,13 @@ def register_hooks_routes(
         codex_request = parse_codex_elicitation_request(payload)
         from omnigent.server.routes import sessions as _sf
 
+        await record_hook_park_if_off_owner(
+            request,
+            session_id=session_id,
+            conversation_store=conversation_store,
+            runner_router=getattr(request.app.state, "runner_router", None),
+            conversation=access.conversation,
+        )
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,
@@ -1065,7 +1080,7 @@ def register_hooks_routes(
             the request body is malformed.
         """
         user_id = _get_user_id(request, auth_provider)
-        await _require_access(
+        access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
         try:
@@ -1102,6 +1117,13 @@ def register_hooks_routes(
             ) from exc
         from omnigent.server.routes import sessions as _sf
 
+        await record_hook_park_if_off_owner(
+            request,
+            session_id=session_id,
+            conversation_store=conversation_store,
+            runner_router=getattr(request.app.state, "runner_router", None),
+            conversation=access.conversation,
+        )
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,
@@ -1164,7 +1186,7 @@ def register_hooks_routes(
             body is malformed.
         """
         user_id = _get_user_id(request, auth_provider)
-        await _require_access(
+        access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
         try:
@@ -1218,6 +1240,13 @@ def register_hooks_routes(
         )
         from omnigent.server.routes import sessions as _sf
 
+        await record_hook_park_if_off_owner(
+            request,
+            session_id=session_id,
+            conversation_store=conversation_store,
+            runner_router=getattr(request.app.state, "runner_router", None),
+            conversation=access.conversation,
+        )
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,
@@ -1281,7 +1310,7 @@ def register_hooks_routes(
             body is malformed.
         """
         user_id = _get_user_id(request, auth_provider)
-        await _require_access(
+        access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
         try:
@@ -1328,6 +1357,13 @@ def register_hooks_routes(
         )
         from omnigent.server.routes import sessions as _sf
 
+        await record_hook_park_if_off_owner(
+            request,
+            session_id=session_id,
+            conversation_store=conversation_store,
+            runner_router=getattr(request.app.state, "runner_router", None),
+            conversation=access.conversation,
+        )
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,

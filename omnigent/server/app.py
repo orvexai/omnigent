@@ -85,6 +85,7 @@ from omnigent.server.routes.sessions import (
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
+from omnigent.server.routing_stats import RoutingStats
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
@@ -1379,6 +1380,7 @@ def create_app(
     # diagnostics can verify that the production app wires the route
     # and WSTunnelTransport to the same session registry.
     app.state.tunnel_registry = tunnel_registry
+    app.state.routing_stats = RoutingStats()
     app.state.runner_router = runner_router
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
@@ -1564,6 +1566,22 @@ def create_app(
         :param exc: The application error.
         :returns: A JSON response with the error code and message.
         """
+        if exc.code == ErrorCode.WRONG_REPLICA:
+            owner_resolvable = bool(getattr(request.state, "omnigent_owner_addr", None))
+            forward_attempted = bool(getattr(request.state, "omnigent_forward_attempted", False))
+            app.state.routing_stats.record_wrong_replica()
+            _logger.warning(
+                "wrong_replica routing failure",
+                extra={
+                    "routing": {
+                        "path": request.url.path,
+                        "session_id": request.path_params.get("session_id"),
+                        "host_id": request.path_params.get("host_id"),
+                        "owner_resolvable": owner_resolvable,
+                        "forward_attempted": forward_attempted,
+                    }
+                },
+            )
         if exc.http_status >= 500:
             _logger.error("Internal error: %s", exc.message, exc_info=exc)
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
@@ -1574,6 +1592,11 @@ def create_app(
             status_code=exc.http_status,
             content={"error": {"code": exc.code, "message": exc.message}},
         )
+
+    @app.get("/v1/internal/routing-stats", include_in_schema=False)
+    async def routing_stats() -> dict[str, int]:
+        """Return aggregate routing counters without any request identifiers."""
+        return app.state.routing_stats.snapshot()
 
     @app.exception_handler(StatementError)
     async def _handle_statement_error(
