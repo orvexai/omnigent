@@ -3702,6 +3702,8 @@ def _publish_status(
     response_id: str | None = None,
     background_task_count: int | None = None,
     blocked_on: str | None = None,
+    *,
+    origin: Literal["edge", "reconciliation"] = "edge",
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -3742,7 +3744,7 @@ def _publish_status(
     # in-process flow performs a legitimate ``failed`` → ``idle``
     # transition (compaction failure publishes ``running`` → ``idle``, not
     # ``failed``), so this is a safe, harness-agnostic invariant.
-    if status == "idle" and _session_status_cache.get(session_id) == "failed":
+    if origin == "edge" and status == "idle" and _session_status_cache.get(session_id) == "failed":
         # Session stays ``failed`` (terminal); the turn is over, so drop any
         # tracked in-flight response id rather than leaving it for the
         # snapshot to reopen a streaming bubble.
@@ -3763,9 +3765,9 @@ def _publish_status(
     # the common case: interactive (non-scheduled) conversations have no
     # running run, and the reverse lookup cheaply returns None. running/waiting
     # edges are skipped entirely so the hot path pays nothing mid-turn.
-    if status == "idle":
+    if origin == "edge" and status == "idle":
         session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
-    elif status == "failed":
+    elif origin == "edge" and status == "failed":
         session_live_state.persist_scheduled_run_completion(
             session_id,
             "failed",
