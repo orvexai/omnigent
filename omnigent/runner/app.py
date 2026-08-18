@@ -1930,6 +1930,7 @@ _session_inboxes_ref: dict[str, asyncio.Queue[_JsonObject]] = {}
 # alternative is a permanent ``launching`` entry that wedges the target.
 _REMOTE_DISPATCH_TIMEOUT_S = 1800.0
 _REMOTE_DISPATCH_POLL_INTERVAL_S = 3.0
+_REMOTE_DISPATCH_MAX_PAGES_PER_POLL = 4
 _SESSION_MESSAGE_BUFFER_CAP = 32
 _SUBAGENT_QUEUED_SEND_CAP = 8
 
@@ -5853,38 +5854,19 @@ def create_runner_app(
         anchor_item_id: str | None = None,
         sent_text: str | None = None,
     ) -> None:
-        """
-        Await a dispatch to a session this runner does not own, then deliver it.
+        """Poll a remote session and deliver its causally anchored result.
 
-        Sub-agent completion normally arrives as a runtime event on the runner
-        that OWNS the child. When the target is served by a different runner,
-        no such event ever reaches this process — its inbox, work registry and
-        wake notice are all process-local — so the result would never come
-        back. This poller is the missing edge: it watches the target through
-        the server's read API (which is global) and hands the outcome to the
-        SAME delivery path a local completion would take, so ``work_id``
-        correlation, dedupe and the parent wake are identical either way.
-
-        Completion is anchored POSITIONALLY, never on status alone: a shared
-        session's status flips for turns that have nothing to do with this
-        dispatch, so a status-only rule would attribute a stranger's output to
-        this ``work_id``. The turn is only considered done once the message we
-        sent is visible in the transcript AND assistant text follows it.
-
-        :param child_session_id: Target session id, e.g. ``"conv_abc123"``.
-        :param work_id: This dispatch's id, echoed on the delivered result.
-        :param anchor_item_id: Newest item id observed BEFORE posting, or
-            ``None`` for an empty transcript. Everything after it is new.
-        :param sent_text: The exact text posted, used to find our own message
-            among items that may include another caller's.
-        :returns: None. Always terminalizes the entry — on success, on
-            failure, or on timeout — so the registry never keeps a
-            ``launching`` entry that would wedge the target as busy forever.
+        Completion is positional: a shared session can go idle for an
+        unrelated turn, so only assistant text strictly after our message is
+        attributable to this dispatch. Cursor state advances over bounded
+        pages per poll, allowing turns of any length without an unbounded burst.
         """
         deadline = time.monotonic() + _REMOTE_DISPATCH_TIMEOUT_S
         our_message_id: str | None = None
-        observed_anchor = anchor_item_id
+        dispatch_anchor = anchor_item_id
+        page_anchor = anchor_item_id
         observed_text = sent_text
+        reply = ""
         try:
             while True:
                 entry = get_subagent_work(child_session_id)
@@ -5894,25 +5876,68 @@ def create_runner_app(
                 current_anchor = (
                     entry.last_anchor_item_id
                     if entry.last_anchor_item_id is not None
-                    else observed_anchor
+                    else dispatch_anchor
                 )
                 current_text = entry.last_sent_text or observed_text
-                if current_anchor != observed_anchor or current_text != observed_text:
-                    observed_anchor = current_anchor
+                if current_anchor != dispatch_anchor or current_text != observed_text:
+                    dispatch_anchor = current_anchor
+                    page_anchor = current_anchor
                     observed_text = current_text
                     our_message_id = None
+                    reply = ""
                     deadline = time.monotonic() + _REMOTE_DISPATCH_TIMEOUT_S
                 await asyncio.sleep(_REMOTE_DISPATCH_POLL_INTERVAL_S)
+                fully_scanned = False
+                scan_ok = True
                 try:
-                    items_resp = await server_client.get(
-                        f"/v1/sessions/{child_session_id}/items",
-                        params={
-                            **({"after": observed_anchor} if observed_anchor else {}),
-                            "order": "asc",
-                            "limit": 200,
-                        },
-                        timeout=30.0,
-                    )
+                    for _ in range(_REMOTE_DISPATCH_MAX_PAGES_PER_POLL):
+                        items_resp = await server_client.get(
+                            f"/v1/sessions/{child_session_id}/items",
+                            params={
+                                **({"after": page_anchor} if page_anchor else {}),
+                                "order": "asc",
+                                "limit": 200,
+                            },
+                            timeout=30.0,
+                        )
+                        if items_resp.status_code != 200:
+                            scan_ok = False
+                            break
+                        payload = items_resp.json()
+                        raw_page_items = payload.get("data", [])
+                        if not isinstance(raw_page_items, list) or not all(
+                            isinstance(item, dict) for item in raw_page_items
+                        ):
+                            scan_ok = False
+                            break
+                        page_items = cast(list[_JsonObject], raw_page_items)
+                        resolution_items: list[_JsonObject] = page_items
+                        if our_message_id is not None:
+                            # The page is strictly after the cursor that
+                            # followed our message. Include that known marker
+                            # so resolve_remote_reply retains its positional
+                            # guarantee without retaining prior pages.
+                            marker: _JsonObject = {"id": our_message_id}
+                            resolution_items = [marker, *page_items]
+                        our_message_id, page_reply = resolve_remote_reply(
+                            resolution_items,
+                            sent_text=observed_text or "",
+                            our_message_id=our_message_id,
+                        )
+                        if page_reply:
+                            reply = page_reply
+                        last_id = payload.get("last_id")
+                        if not isinstance(last_id, str) and page_items:
+                            candidate_id = page_items[-1].get("id")
+                            last_id = candidate_id if isinstance(candidate_id, str) else None
+                        has_more = bool(payload.get("has_more", False))
+                        if not has_more:
+                            fully_scanned = True
+                            break
+                        if not last_id or last_id == page_anchor:
+                            scan_ok = False
+                            break
+                        page_anchor = last_id
                     snap_resp = await server_client.get(
                         f"/v1/sessions/{child_session_id}",
                         params={"include_items": "false", "include_liveness": "false"},
@@ -5922,29 +5947,27 @@ def create_runner_app(
                     if time.monotonic() >= deadline:
                         break
                     continue
-                if items_resp.status_code != 200 or snap_resp.status_code != 200:
+                if not scan_ok or snap_resp.status_code != 200:
                     if time.monotonic() >= deadline:
                         break
                     continue
                 latest_entry = get_subagent_work(child_session_id)
                 if latest_entry is None or latest_entry.work_id != work_id:
                     return
-                latest_anchor = latest_entry.last_anchor_item_id
-                latest_text = latest_entry.last_sent_text
-                if latest_anchor != observed_anchor or latest_text != observed_text:
-                    observed_anchor = latest_anchor
+                latest_anchor = (
+                    latest_entry.last_anchor_item_id
+                    if latest_entry.last_anchor_item_id is not None
+                    else dispatch_anchor
+                )
+                latest_text = latest_entry.last_sent_text or observed_text
+                if latest_anchor != dispatch_anchor or latest_text != observed_text:
+                    dispatch_anchor = latest_anchor
+                    page_anchor = latest_anchor
                     observed_text = latest_text
                     our_message_id = None
+                    reply = ""
                     deadline = time.monotonic() + _REMOTE_DISPATCH_TIMEOUT_S
                     continue
-                items = items_resp.json().get("data", [])
-                if not isinstance(items, list):
-                    items = []
-                our_message_id, reply = resolve_remote_reply(
-                    items,
-                    sent_text=observed_text or "",
-                    our_message_id=our_message_id,
-                )
                 status = _optional_str(snap_resp.json().get("status"))
                 if status == "failed":
                     _mark_subagent_terminal_and_wake(
@@ -5953,12 +5976,21 @@ def create_runner_app(
                         output=reply or "Error: remote session turn failed",
                     )
                     return
-                # ``idle`` alone is not enough: the target may have been idle
-                # before our message was even ingested.
-                if status == "idle" and our_message_id is not None and reply:
-                    _mark_subagent_terminal_and_wake(
-                        child_session_id, status="completed", output=reply
-                    )
+                if status == "idle" and our_message_id is not None and fully_scanned:
+                    if reply:
+                        _mark_subagent_terminal_and_wake(
+                            child_session_id, status="completed", output=reply
+                        )
+                    else:
+                        _mark_subagent_terminal_and_wake(
+                            child_session_id,
+                            status="failed",
+                            output=(
+                                "Error: remote session went idle after ingesting "
+                                "your message but produced no assistant text; "
+                                "read it with sys_session_get_history"
+                            ),
+                        )
                     return
                 if time.monotonic() >= deadline:
                     break
