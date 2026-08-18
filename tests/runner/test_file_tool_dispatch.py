@@ -385,7 +385,9 @@ async def test_send_with_file_ids_copies_then_attaches_input_file(
     # The child message: input_text first, then the file block on the
     # mapped id (NOT the original parent id).
     content = events[0]["data"]["content"]
-    assert content[0] == {"type": "input_text", "text": "use this"}
+    assert content[0]["type"] == "input_text"
+    assert ' thread="th_' in content[0]["text"]
+    assert content[0]["text"].endswith("Message:\nuse this\n</omnigent-agent-message>")
     assert content[1] == {"type": "input_file", "file_id": "file_child"}
     # The enriched copy response carried the content type, so the dispatch
     # path never fetched per-file metadata.
@@ -466,8 +468,10 @@ async def test_send_multiple_file_ids_preserve_order(
 
     assert json.loads(output)["status"] == "launching"
     content = events[0]["data"]["content"]
-    assert content == [
-        {"type": "input_text", "text": "three"},
+    assert content[0]["type"] == "input_text"
+    assert ' thread="th_' in content[0]["text"]
+    assert content[0]["text"].endswith("Message:\nthree\n</omnigent-agent-message>")
+    assert content[1:] == [
         {"type": "input_file", "file_id": "c_a"},
         {"type": "input_image", "file_id": "c_b"},
         {"type": "input_file", "file_id": "c_c"},
@@ -498,7 +502,11 @@ async def test_send_without_file_ids_is_unchanged_and_skips_copy(
 
     assert json.loads(output)["status"] == "launching"
     assert copies == [], "text-only send must not call the copy endpoint"
-    assert events[0]["data"]["content"] == [{"type": "input_text", "text": "just text"}]
+    content = events[0]["data"]["content"]
+    assert len(content) == 1
+    assert content[0]["type"] == "input_text"
+    assert ' thread="th_' in content[0]["text"]
+    assert content[0]["text"].endswith("Message:\njust text\n</omnigent-agent-message>")
 
 
 @pytest.mark.asyncio

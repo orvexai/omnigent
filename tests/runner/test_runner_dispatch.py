@@ -120,8 +120,10 @@ def _assert_agent_message_envelope(
     """Assert the compact provenance frame while preserving the body check."""
     assert text.startswith(
         f'<omnigent-agent-message from="{sender}" agent="{agent}" '
-        f'title="{title}" relation="{relation}">'
+        f'title="{title}" relation="{relation}"'
     )
+    if ' thread="' in text:
+        assert ' thread="th_' in text
     assert f"Message:\n{body}\n" in text
     assert text.endswith("</omnigent-agent-message>")
 
@@ -5098,9 +5100,9 @@ async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
     }
     # The dispatch id is minted per send, so match its shape rather than a
     # literal — it is what lets the parent tell one dispatch from the next.
-    assert re.fullmatch(
+    assert re.search(
         r"\[System: sub-agent task conv_child_cancel cancelled "
-        r"\(dispatch subagent_[0-9a-f]+\) — runner:phase-c\]",
+        r"\(dispatch subagent_[0-9a-f]+\) \(thread th_[0-9a-f]+\) — runner:phase-c\]",
         inbox_output,
     ), f"Cancelled sub-agent work must produce exactly one cancelled inbox item: {inbox_output!r}"
 

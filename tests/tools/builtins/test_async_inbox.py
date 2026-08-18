@@ -128,9 +128,9 @@ def read_tool() -> SysReadInboxTool:
     return SysReadInboxTool()
 
 
-def test_read_inbox_schema_takes_no_arguments(read_tool: SysReadInboxTool) -> None:
+def test_read_inbox_schema_accepts_optional_thread_filter(read_tool: SysReadInboxTool) -> None:
     """
-    The schema declares zero properties and rejects extras.
+    The schema declares only the optional thread filter and rejects extras.
 
     A regression that added a parameter would let the LLM pass
     arguments the dispatcher silently ignores; a regression that
@@ -139,7 +139,12 @@ def test_read_inbox_schema_takes_no_arguments(read_tool: SysReadInboxTool) -> No
     confusing behavior at run time, so pin the shape here.
     """
     schema = read_tool.get_schema()["function"]["parameters"]
-    assert schema["properties"] == {}
+    assert schema["properties"] == {
+        "thread_id": {
+            "type": "string",
+            "description": "Only drain results stamped with this thread id.",
+        }
+    }
     assert schema["additionalProperties"] is False
     # No ``required`` field expected — the empty-properties shape
     # is the canonical "no args" form OpenAI accepts.

@@ -297,7 +297,8 @@ class SysReadInboxTool(Tool):
             "a textual summary. Large backlogs are delivered across "
             "multiple reads; when messages remain queued, call "
             "sys_read_inbox again to receive them. An empty inbox "
-            "returns a sentinel string."
+            "returns a sentinel string. Pass thread_id to drain only "
+            "that thread; other and unthreaded results remain queued."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -314,7 +315,12 @@ class SysReadInboxTool(Tool):
                 "description": SysReadInboxTool.description(),
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "thread_id": {
+                            "type": "string",
+                            "description": "Only drain results stamped with this thread id.",
+                        }
+                    },
                     "additionalProperties": False,
                 },
             },
