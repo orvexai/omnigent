@@ -54,6 +54,7 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.mcp_pool import ServerMcpPool
+from omnigent.server.owner_forward import OwnerForwardMiddleware
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
     ServerPerformanceMetrics,
@@ -1487,6 +1488,14 @@ def create_app(
     app.state.managed_launches = ManagedLaunchTracker()
     app.state.server_metrics = server_metrics
     app.state.server_metrics_otel = server_metrics_otel
+    # Exception-driven HTTP forwarding is the single transport chokepoint for
+    # session ownership misses. It is inert when pod identity is unset and
+    # leaves WebSocket scopes untouched for the separately reviewed Stage 4.
+    app.add_middleware(
+        OwnerForwardMiddleware,
+        pod_addr=pod_addr,
+        routing_stats=app.state.routing_stats,
+    )
     app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)
     # CSWSH guard: reject cross-origin WebSocket handshakes before any
     # route accepts them. Added after the metrics middleware so it is the
