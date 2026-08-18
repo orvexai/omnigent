@@ -1,10 +1,10 @@
-name: Orvex CI
+name: MCP CI
 
-# orvex-only copy of ci.yml, scoped to the orvex branch so it can be enabled
+# Fork-only copy of ci.yml, scoped to the mcp branch so it can be enabled
 # without ci.yml (which stays disabled and untouched on main) ever running.
 # Keep this in sync with ci.yml by hand if that workflow's job logic changes.
 #
-# Unit-test pytest matrix on every non-draft PR and on push to orvex. Tests are
+# Unit-test pytest matrix on every non-draft PR and on push to mcp. Tests are
 # split across directory-based matrix groups (runtime-*, server-*, inner-rest,
 # tools, repl-sdk, spec-llms, runner-app, stores, misc) so slow files don't
 # bottleneck one runner; the slowest groups use `--dist=worksteal` to fan tests
@@ -16,11 +16,11 @@ name: Orvex CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    branches: [orvex]
+    branches: [mcp]
     paths-ignore: ['web/**', 'tests/e2e_ui/**', 'CHANGELOG.md']
   push:
     branches:
-      - orvex
+      - mcp
     paths-ignore: ['web/**', 'tests/e2e_ui/**', 'CHANGELOG.md']
 
 permissions:
