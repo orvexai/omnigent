@@ -111,10 +111,29 @@ def run_migrations(database_url: str) -> None:
         migration_engine.dispose()
 
 
+def _resolve_database_url(cfg: dict[str, Any]) -> str:
+    """Resolve and normalize the database URL without app startup side effects.
+
+    :param cfg: Parsed server configuration mapping.
+    :returns: A SQLAlchemy database URL using the psycopg3 scheme when needed.
+    :raises RuntimeError: If no database URL is configured.
+    """
+    from omnigent.db.utils import normalize_database_url
+
+    database_url = os.environ.get("DATABASE_URL") or cfg.get("database_uri")
+    if not database_url:
+        raise RuntimeError(
+            "DATABASE_URL is required (env), or set `database_uri:` in the server config. "
+            "Accepted forms: "
+            "'postgresql+psycopg://user:pw@host:5432/omnigent' (explicit psycopg3), "
+            "or the 'postgres://' / 'postgresql://' URLs emitted by Railway, Render, etc."
+        )
+    return normalize_database_url(database_url)
+
+
 def _resolve_config() -> _ResolvedConfig:
     """Load config and resolve startup settings before migrations run."""
 
-    from omnigent.db.utils import normalize_database_url
     from omnigent.server.paas_env import detect_base_url, resolve_bind_host
     from omnigent.server.server_config import load_server_config
 
@@ -126,19 +145,7 @@ def _resolve_config() -> _ResolvedConfig:
     # DATABASE_URL (carries the password) and the cookie / OIDC secrets.
     cfg = load_server_config()
 
-    # DATABASE_URL is env-first (compose/PaaS inject it; it's a secret),
-    # with `database_uri:` in the config as a fallback for self-managed DBs.
-    database_url = os.environ.get("DATABASE_URL") or cfg.get("database_uri")
-    if not database_url:
-        raise RuntimeError(
-            "DATABASE_URL is required (env), or set `database_uri:` in the server config. "
-            "Accepted forms: "
-            "'postgresql+psycopg://user:pw@host:5432/omnigent' (explicit psycopg3), "
-            "or the 'postgres://' / 'postgresql://' URLs emitted by Railway, Render, etc."
-        )
-    # Normalize PaaS-style URLs (postgres:// or postgresql://) to the
-    # psycopg3 dialect specifier that SQLAlchemy requires.
-    database_url = normalize_database_url(database_url)
+    database_url = _resolve_database_url(cfg)
 
     # App settings are config-first, env fallback, then the built-in default.
     artifact_dir = Path(
@@ -473,5 +480,57 @@ def main() -> None:
         sys.exit(1)
 
 
-if __name__ == "__main__":
+def migrate_only() -> int:
+    """Run migrations for the short-lived migration Job.
+
+    :returns: Zero on success, or one when configuration, connection, or
+        migration fails.
+    """
+    migration_engine = None
+    try:
+        from omnigent.db.utils import (
+            _get_current_db_revision,
+            _get_head_db_revision,
+            _run_migrations,
+        )
+        from omnigent.server.server_config import load_server_config
+
+        database_url = _resolve_database_url(load_server_config())
+        import sqlalchemy
+
+        migration_engine = sqlalchemy.create_engine(database_url)
+        current = _get_current_db_revision(migration_engine)
+        head = _get_head_db_revision(database_url)
+        if current == head:
+            logger.info("Database schema already at head (%s)", head)
+        else:
+            logger.info("Migrating database schema: %s → %s", current or "<empty>", head)
+        _run_migrations(migration_engine, database_url)
+        return 0
+    except Exception:  # noqa: BLE001 — a Job must fail promptly without retry sleep
+        logger.error("Database migration failed:\n%s", traceback.format_exc())
+        return 1
+    finally:
+        if migration_engine is not None:
+            migration_engine.dispose()
+
+
+def _cli() -> int:
+    """Dispatch the server or migrate-only command line mode."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run the Omnigent Docker entrypoint")
+    parser.add_argument(
+        "--migrate-only",
+        action="store_true",
+        help="run database migrations and exit without starting the server",
+    )
+    args = parser.parse_args()
+    if args.migrate_only:
+        return migrate_only()
     main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_cli())

@@ -1,0 +1,10 @@
+---
+# Identity used by the Tekton task that creates and observes the migration Job.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tekton-omnigent-migrate
+  namespace: tekton-pipelines
+  labels:
+    app.kubernetes.io/part-of: omnigent
+    app.kubernetes.io/component: ci-cd

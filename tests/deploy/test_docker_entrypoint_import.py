@@ -12,7 +12,9 @@ blow up if called during import).
 from __future__ import annotations
 
 import importlib
+import os
 import sys
+import time
 from pathlib import Path
 from typing import NoReturn
 
@@ -130,6 +132,90 @@ def test_resolve_config_rejects_non_s3_artifact_uri(
     monkeypatch.setenv("OMNIGENT_ARTIFACT_URI", "gs://my-bucket")
     with pytest.raises(RuntimeError, match="s3://"):
         _resolve_config()
+
+
+@pytest.mark.parametrize(
+    ("database_url", "expected"),
+    [
+        (
+            "postgres://u:p@localhost:5432/omnigent",
+            "postgresql+psycopg://u:p@localhost:5432/omnigent",
+        ),
+        (
+            "postgresql://u:p@localhost:5432/omnigent",
+            "postgresql+psycopg://u:p@localhost:5432/omnigent",
+        ),
+        (
+            "postgresql+psycopg://u:p@localhost:5432/omnigent",
+            "postgresql+psycopg://u:p@localhost:5432/omnigent",
+        ),
+    ],
+)
+def test_migration_database_url_matches_full_config_resolution(
+    _entrypoint_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    database_url: str,
+    expected: str,
+) -> None:
+    from deploy.docker.entrypoint import _resolve_config, _resolve_database_url
+    from omnigent.server.server_config import load_server_config
+
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    cfg = load_server_config()
+    assert _resolve_database_url(cfg) == expected
+    assert _resolve_config().database_url == expected
+
+
+def test_migration_database_url_can_come_from_config_file(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deploy.docker.entrypoint import _resolve_config, _resolve_database_url
+    from omnigent.server.server_config import load_server_config
+
+    monkeypatch.delenv("DATABASE_URL")
+    config_path = Path(os.environ["OMNIGENT_CONFIG"])
+    config_path.write_text("database_uri: postgres://u:p@localhost/omnigent\n")
+    cfg = load_server_config()
+    expected = "postgresql+psycopg://u:p@localhost/omnigent"
+    assert _resolve_database_url(cfg) == expected
+    assert _resolve_config().database_url == expected
+
+
+def test_migrate_only_cli_bypasses_startup_catch_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deploy.docker.entrypoint as entrypoint
+
+    called: list[str] = []
+    monkeypatch.setattr(sys, "argv", ["entrypoint.py", "--migrate-only"])
+    monkeypatch.setattr(entrypoint, "main", lambda: called.append("main"))
+    monkeypatch.setattr(entrypoint, "migrate_only", lambda: 0)
+
+    assert entrypoint._cli() == 0
+    assert called == []
+
+
+def test_migrate_only_cli_rejects_bad_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deploy.docker.entrypoint as entrypoint
+
+    monkeypatch.setattr(sys, "argv", ["entrypoint.py", "--unknown"])
+    with pytest.raises(SystemExit) as exc_info:
+        entrypoint._cli()
+    assert exc_info.value.code == 2
+
+
+def test_migrate_only_failure_returns_promptly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deploy.docker.entrypoint as entrypoint
+
+    def _fail(_cfg: dict[str, object]) -> str:
+        raise RuntimeError("migration failed")
+
+    monkeypatch.setattr(entrypoint, "_resolve_database_url", _fail)
+    started = time.monotonic()
+    assert entrypoint.migrate_only() == 1
+    assert time.monotonic() - started < 2
 
 
 @pytest.mark.parametrize(
