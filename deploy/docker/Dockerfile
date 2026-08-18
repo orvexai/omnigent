@@ -153,6 +153,10 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 # [databricks] extra in pyproject — so add it explicitly here.
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
+# boto3 is optional in pyproject.toml — required by the S3 artifact store.
+# Install it in the server image before OMNIGENT_ARTIFACT_URI is configured.
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e '.[s3]'
+
 # Optional managed-sandbox provider extras for the SERVER (the launcher imports
 # the provider SDK — e.g. the kubernetes client for `sandbox.provider:
 # kubernetes`). Off by default; the runner host image needs none of these. Build
