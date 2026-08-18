@@ -126,6 +126,20 @@ _GITHUB_SCOPES = "read:user user:email"
 # ── OIDCConfig ───────────────────────────────────────────────────
 
 
+_DEFAULT_SESSION_TTL_HOURS = 720
+
+
+def _resolve_session_ttl_hours() -> int:
+    """Return the signed-in session lifetime in hours.
+
+    A session that expires mid-task costs more than the marginal risk of a
+    longer one, so the default is 30 days rather than a working day; dropping
+    the env var cannot silently shorten it.
+    """
+    raw = os.environ.get("OMNIGENT_OIDC_SESSION_TTL_HOURS", "").strip()
+    return int(raw) if raw else _DEFAULT_SESSION_TTL_HOURS
+
+
 @dataclass(frozen=True)
 class OIDCConfig:
     """Validated OIDC configuration, constructed once at startup.
@@ -287,7 +301,7 @@ class OIDCConfig:
                 "OMNIGENT_OIDC_COOKIE_SECRET must be at least 32 bytes (64 hex chars)"
             )
 
-        session_ttl_hours = int(os.environ.get("OMNIGENT_OIDC_SESSION_TTL_HOURS", "8"))
+        session_ttl_hours = _resolve_session_ttl_hours()
         logout_redirect_uri = (
             os.environ.get("OMNIGENT_OIDC_LOGOUT_REDIRECT_URI", "").strip() or None
         )

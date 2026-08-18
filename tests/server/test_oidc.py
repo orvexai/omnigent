@@ -21,7 +21,9 @@ from omnigent.server.auth import (
     resolve_auth_header_strip_prefix,
 )
 from omnigent.server.oidc import (
+    _DEFAULT_SESSION_TTL_HOURS,
     OIDCConfig,
+    _resolve_session_ttl_hours,
     derive_code_challenge,
     generate_code_verifier,
     hmac_digest,
@@ -950,3 +952,32 @@ def test_oidc_redirect_uri_required_without_domain(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(RuntimeError, match="OMNIGENT_OIDC_REDIRECT_URI"):
         OIDCConfig.from_env()
+
+
+def test_session_ttl_defaults_to_thirty_days(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unset session TTL must mean 30 days, not a working day.
+
+    The deployment sets this explicitly, so the default only shows up if that
+    key is ever dropped — at which point signing everyone out after 8 hours
+    would look like an unrelated auth bug.
+    """
+    monkeypatch.delenv("OMNIGENT_OIDC_SESSION_TTL_HOURS", raising=False)
+    assert _resolve_session_ttl_hours() == 720
+    assert _resolve_session_ttl_hours() / 24 == 30
+    assert _DEFAULT_SESSION_TTL_HOURS == 720
+
+
+def test_session_ttl_env_still_overrides_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit value wins, so a deployment can still shorten sessions."""
+    monkeypatch.setenv("OMNIGENT_OIDC_SESSION_TTL_HOURS", "1")
+    assert _resolve_session_ttl_hours() == 1
+
+
+def test_session_ttl_blank_env_falls_back_to_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty value is a missing value, not a zero-hour session."""
+    monkeypatch.setenv("OMNIGENT_OIDC_SESSION_TTL_HOURS", "   ")
+    assert _resolve_session_ttl_hours() == 720
