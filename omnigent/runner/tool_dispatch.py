@@ -2953,7 +2953,7 @@ async def _send_to_peer_session(
                 "message": "target session is closed and cannot accept input.",
             }
         )
-    busy_mode = if_busy or "reject"
+    busy_mode = if_busy or "queue"
     cancelled_work_id: str | None = None
     status = _optional_string(snap_data.get("status"))
     if status in ("running", "waiting"):

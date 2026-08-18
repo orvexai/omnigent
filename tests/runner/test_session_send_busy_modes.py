@@ -987,11 +987,25 @@ async def test_u5_child_default_is_queue_and_never_implicit_interrupt(
 
 
 @pytest.mark.asyncio
-async def test_u5_peer_default_is_reject(clean_busy_registry: None) -> None:
+async def test_u5_peer_default_is_queue(clean_busy_registry: None) -> None:
+    """A busy peer queues by default so a stale status cannot bounce a send."""
     runner_app._remote_dispatch_start_ref = lambda **_: None
     output, posted, _ = await _send_child(
         target=PEER,
         target_body=_snapshot(PEER, parent=None, status="running"),
+    )
+    assert "error" not in json.loads(output)
+    assert [body["type"] for body in posted] == ["message"]
+
+
+@pytest.mark.asyncio
+async def test_u5_peer_reject_still_available(clean_busy_registry: None) -> None:
+    """Explicit reject preserves the old refusal for a caller that wants it."""
+    runner_app._remote_dispatch_start_ref = lambda **_: None
+    output, posted, _ = await _send_child(
+        target=PEER,
+        target_body=_snapshot(PEER, parent=None, status="running"),
+        arguments={"if_busy": "reject"},
     )
     assert json.loads(output)["error"] == "session_busy"
     assert posted == []

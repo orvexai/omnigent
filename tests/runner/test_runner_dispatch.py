@@ -9271,7 +9271,9 @@ async def test_sys_session_send_refuses_a_busy_peer_without_posting() -> None:
         ) as server_client:
             output = await execute_tool(
                 tool_name="sys_session_send",
-                arguments=json.dumps({"session_id": "conv_other", "args": "hi"}),
+                arguments=json.dumps(
+                    {"session_id": "conv_other", "args": "hi", "if_busy": "reject"}
+                ),
                 server_client=server_client,
                 conversation_id="conv_caller",
                 agent_spec=SimpleNamespace(sub_agents=[]),
