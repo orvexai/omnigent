@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -335,6 +336,54 @@ class _FakeRunnerWSFactory:
         return _CM(self._conn)
 
 
+class _FakeOwnerWSConnector:
+    """Owner-pod connector used by Stage 4 pre-accept and close tests."""
+
+    def __init__(
+        self,
+        conn: _FakeRunnerWSConn | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.conn = conn
+        self.error = error
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def __call__(self, uri: str, **kwargs: object):
+        self.calls.append((uri, kwargs))
+        connector = self
+
+        class _CM:
+            async def __aenter__(self_inner):
+                if connector.error is not None:
+                    raise connector.error
+                return connector.conn
+
+            async def __aexit__(self_inner, exc_type, exc, tb) -> None:
+                return None
+
+        return _CM()
+
+
+class _StubTerminalRouter:
+    def __init__(self, *, online: bool, owner: str | None) -> None:
+        self.online = online
+        self.owner = owner
+
+    def runner_is_online(self, runner_id: str) -> bool:
+        return self.online
+
+    def runner_owner_addr(self, runner_id: str) -> str | None:
+        return self.owner
+
+
+class _RoutedConversationStore:
+    def __init__(self, runner_id: str = "runner-1") -> None:
+        self.conversation = SimpleNamespace(runner_id=runner_id)
+
+    def get_conversation(self, conversation_id: str) -> SimpleNamespace:
+        return self.conversation
+
+
 async def test_attach_terminal_rejects_unauthorized_user_before_runner_proxy() -> None:
     """A user without session access cannot attach to another user's terminal."""
     conv_store = _StubConversationStore()
@@ -615,6 +664,121 @@ async def test_attach_terminal_runner_close_propagates_close_code(
             ws.receive_bytes()
 
     assert exc_info.value.code == 4404
+
+
+async def test_attach_terminal_forwarded_marker_is_not_forwarded_again() -> None:
+    """A marked request is refused without dialing a second owner."""
+    owner_connector = _FakeOwnerWSConnector(_FakeRunnerWSConn())
+    app = FastAPI()
+    app.include_router(
+        create_terminal_attach_router(
+            conversation_store=_RoutedConversationStore(),  # type: ignore[arg-type]
+            runner_router=_StubTerminalRouter(online=False, owner="10.20.30.40:8000"),
+            pod_addr="10.20.30.41:8000",
+            owner_ws_connector=owner_connector,
+        ),
+        prefix="/v1",
+    )
+
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach",
+            headers={"X-Omnigent-Forwarded-By": "10.20.30.1:8000"},
+        ):
+            pass
+
+    assert exc_info.value.code == 4400
+    assert owner_connector.calls == []
+
+
+async def test_attach_terminal_owner_drop_is_distinguishable() -> None:
+    """An established owner failure closes the browser with its failure code."""
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+
+    class _OwnerDrops(_FakeRunnerWSConn):
+        async def recv(self) -> bytes | str:
+            raise ConnectionClosedError(Close(1011, "owner failed"), None, None)
+
+    owner_connector = _FakeOwnerWSConnector(_OwnerDrops())
+    app = FastAPI()
+    app.include_router(
+        create_terminal_attach_router(
+            conversation_store=_RoutedConversationStore(),  # type: ignore[arg-type]
+            runner_router=_StubTerminalRouter(online=False, owner="10.20.30.40:8000"),
+            pod_addr="10.20.30.41:8000",
+            owner_ws_connector=owner_connector,
+        ),
+        prefix="/v1",
+    )
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach"
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_bytes()
+
+    assert exc_info.value.code == 1011
+    assert owner_connector.calls[0][0] == (
+        "ws://10.20.30.40:8000/v1/sessions/conv_ws/resources/terminals/"
+        "terminal_bash_s1/attach"
+    )
+    assert ("X-Omnigent-Forwarded-By", "10.20.30.41:8000") in owner_connector.calls[0][1][
+        "additional_headers"
+    ]
+
+
+async def test_attach_terminal_unreachable_owner_refuses_before_accept() -> None:
+    """A failed owner handshake remains a clean re-addressable close."""
+    owner_connector = _FakeOwnerWSConnector(error=OSError("owner unavailable"))
+    app = FastAPI()
+    app.include_router(
+        create_terminal_attach_router(
+            conversation_store=_RoutedConversationStore(),  # type: ignore[arg-type]
+            runner_router=_StubTerminalRouter(online=False, owner="10.20.30.40:8000"),
+            pod_addr="10.20.30.41:8000",
+            owner_ws_connector=owner_connector,
+        ),
+        prefix="/v1",
+    )
+
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach"
+        ):
+            pass
+
+    assert exc_info.value.code == 4400
+    assert len(owner_connector.calls) == 1
+
+
+async def test_attach_terminal_local_owner_takes_no_extra_hop() -> None:
+    """An online local runner uses the existing runner factory directly."""
+    factory = _FakeRunnerWSFactory(_FakeRunnerWSConn(outgoing=[b"local"]))
+    owner_connector = _FakeOwnerWSConnector(_FakeRunnerWSConn())
+    app = FastAPI()
+    app.include_router(
+        create_terminal_attach_router(
+            conversation_store=_RoutedConversationStore(),  # type: ignore[arg-type]
+            runner_router=_StubTerminalRouter(online=True, owner="10.20.30.41:8000"),
+            pod_addr="10.20.30.41:8000",
+            owner_ws_connector=owner_connector,
+        ),
+        prefix="/v1",
+    )
+    set_runner_ws_factory(factory)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach"
+    ) as ws:
+        assert ws.receive_bytes() == b"local"
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+
+    assert owner_connector.calls == []
+    assert factory.calls == [
+        "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=false"
+    ]
 
 
 # ── WS attach: local fallback when no ws factory ─────────

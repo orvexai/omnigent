@@ -73,8 +73,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import logging
-from typing import Final
+import os
+from collections.abc import Callable
+from typing import Any, Final
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
@@ -109,6 +112,9 @@ def create_terminal_attach_router(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     conversation_store: ConversationStore | None = None,
+    runner_router: Any | None = None,
+    pod_addr: str | None = None,
+    owner_ws_connector: Callable[..., Any] | None = None,
 ) -> APIRouter:
     """
     Build the router exposing the terminal-attach WebSocket route.
@@ -127,6 +133,11 @@ def create_terminal_attach_router(
         interactive (write) attach requires owner access — only the
         session owner may type into the shared PTY.
     :param conversation_store: Conversation store used by permission checks.
+    :param runner_router: Durable runner router used to detect a remote owner
+        before accepting the browser WebSocket.
+    :param pod_addr: This pod's dialable ``IPv4:port`` address.
+    :param owner_ws_connector: Internal connector override for deterministic
+        tests; production uses :func:`websockets.asyncio.client.connect`.
     :returns: An :class:`APIRouter` carrying the attach route.
     """
     router = APIRouter()
@@ -168,6 +179,73 @@ def create_terminal_attach_router(
             permission_store=permission_store,
             conversation_store=conversation_store,
         )
+
+        owner_addr, ownership_checked = await _remote_terminal_owner(
+            session_id,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            pod_addr=pod_addr,
+        )
+        if ownership_checked:
+            if (
+                owner_addr is None
+                or owner_addr == pod_addr
+                or not _owner_forward_enabled()
+                or _has_forwarded_marker(websocket)
+            ):
+                # A known-but-unavailable owner and a deliberately disabled
+                # forward are both clean re-addressable refusals.
+                await websocket.close(
+                    code=_WS_CLOSE_WRONG_REPLICA,
+                    reason="terminal owner unavailable; retry",
+                )
+                return
+            owner_url = _owner_ws_url(owner_addr, websocket)
+            if owner_url is None:
+                await websocket.close(
+                    code=_WS_CLOSE_WRONG_REPLICA,
+                    reason="terminal owner address is invalid; retry",
+                )
+                return
+            accepted = False
+            try:
+                owner_cm = _owner_ws_connector(owner_ws_connector)
+                owner_headers = _forward_ws_headers(websocket, pod_addr=pod_addr)
+                async with owner_cm(
+                    owner_url,
+                    additional_headers=owner_headers,
+                    max_size=1 << 20,
+                    max_queue=16,
+                    write_limit=32768,
+                    open_timeout=5,
+                    close_timeout=5,
+                ) as owner_ws:
+                    await websocket.accept()
+                    accepted = True
+                    try:
+                        await _shuttle_ws_frames(websocket, owner_ws)
+                    except _RunnerWSClosed as closed:
+                        code = (
+                            closed.code
+                            if closed.code and closed.code >= 1000
+                            else _WS_CLOSE_INTERNAL_ERROR
+                        )
+                        with contextlib.suppress(RuntimeError):
+                            await websocket.close(code=code, reason=closed.reason or "")
+            except Exception:  # noqa: BLE001
+                # No half-open browser socket: a failed owner handshake is a
+                # re-addressable 4400, while a post-accept owner failure is a
+                # distinguishable internal close.
+                with contextlib.suppress(RuntimeError):
+                    await websocket.close(
+                        code=_WS_CLOSE_INTERNAL_ERROR if accepted else _WS_CLOSE_WRONG_REPLICA,
+                        reason=(
+                            "terminal owner relay failed"
+                            if accepted
+                            else "terminal owner unreachable; retry"
+                        ),
+                    )
+            return
         await websocket.accept()
 
         ws_factory = get_runner_ws_factory()
@@ -287,6 +365,94 @@ def create_terminal_attach_router(
             )
 
     return router
+
+
+def _owner_forward_enabled() -> bool:
+    """Return whether owner WebSocket forwarding is enabled."""
+    return os.environ.get("OMNIGENT_OWNER_FORWARD", "1") != "0"
+
+
+async def _remote_terminal_owner(
+    session_id: str,
+    *,
+    conversation_store: ConversationStore | None,
+    runner_router: Any | None,
+    pod_addr: str | None,
+) -> tuple[str | None, bool]:
+    """Resolve a remote owner before accepting a terminal WebSocket.
+
+    The boolean distinguishes a known routed session from the legacy/local
+    setup where no durable routing inputs were supplied.
+    """
+    if conversation_store is None or runner_router is None or pod_addr is None:
+        return None, False
+    try:
+        conversation = await asyncio.to_thread(
+            conversation_store.get_conversation,
+            session_id,
+        )
+        runner_id = getattr(conversation, "runner_id", None)
+        if not runner_id or runner_router.runner_is_online(runner_id):
+            return None, False
+        owner = runner_router.runner_owner_addr(runner_id)
+        return owner if owner != pod_addr else None, True
+    except Exception:  # noqa: BLE001
+        # The existing route remains responsible for classifying an ordinary
+        # lookup failure; forwarding must never turn a DB outage into a loop.
+        return None, False
+
+
+def _owner_ws_connector(override: Callable[..., Any] | None) -> Callable[..., Any]:
+    """Return the production connector or a deterministic test override."""
+    if override is not None:
+        return override
+    from websockets.asyncio.client import connect
+
+    return connect
+
+
+def _owner_ws_url(owner_addr: str, websocket: WebSocket) -> str | None:
+    """Build a validated owner URL from the original WebSocket scope."""
+    host, separator, raw_port = owner_addr.rpartition(":")
+    if not separator or not host or not raw_port:
+        return None
+    try:
+        if ipaddress.ip_address(host).version != 4 or int(raw_port) != 8000:
+            return None
+    except ValueError:
+        return None
+    raw_path = websocket.scope.get("raw_path", websocket.url.path.encode())
+    query = websocket.scope.get("query_string", b"")
+    path = raw_path.decode("ascii", "surrogateescape")
+    suffix = f"?{query.decode('ascii', 'surrogateescape')}" if query else ""
+    return f"ws://{owner_addr}{path}{suffix}"
+
+
+def _has_forwarded_marker(websocket: WebSocket) -> bool:
+    """Treat any inbound marker as an untrusted no-forward instruction."""
+    return websocket.headers.get("x-omnigent-forwarded-by") is not None
+
+
+def _forward_ws_headers(websocket: WebSocket, *, pod_addr: str | None) -> list[tuple[str, str]]:
+    """Replay identity/origin headers while removing hop-by-hop handshake data."""
+    excluded = {
+        "host",
+        "connection",
+        "upgrade",
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-extensions",
+        "sec-websocket-protocol",
+        "x-omnigent-forwarded-by",
+    }
+    headers = [
+        (key.decode("latin-1"), value.decode("latin-1"))
+        for key, value in websocket.scope.get("headers", [])
+        if key.decode("latin-1").lower() not in excluded
+    ]
+    if pod_addr is not None:
+        headers.append(("X-Omnigent-Forwarded-By", pod_addr))
+    return headers
 
 
 async def _authorize_terminal_attach(
