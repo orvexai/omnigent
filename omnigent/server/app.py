@@ -2396,6 +2396,8 @@ def create_app(
             auth_provider=auth_provider,
             permission_store=permission_store,
             conversation_store=conversation_store,
+            runner_router=runner_router,
+            pod_addr=pod_addr,
         ),
         prefix="/v1",
         tags=["terminals"],
