@@ -161,7 +161,9 @@ class SysSessionSendTool(Tool):
             "pass their file ids via the object args form's 'file_ids' "
             "list on the first named (agent, title) send only; file_ids "
             "cannot be used with session_id or when continuing an existing "
-            "named session."
+            "named session. Use thread_subject to open a new correlation "
+            "thread, thread_id to attach to one, or omit both to continue "
+            "the outstanding/newest thread."
         )
 
     def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
@@ -368,6 +370,20 @@ def _build_sys_session_send_schema(
                         "description": (
                             "What to do when the target is busy. Omitted defaults to "
                             "queue for a child and for a peer; interrupt is never implicit."
+                        ),
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": (
+                            "Attach to an existing thread returned by an earlier sys_session_send."
+                        ),
+                    },
+                    "thread_subject": {
+                        "type": "string",
+                        "maxLength": 256,
+                        "description": (
+                            "Open a new thread with this short subject. Presence "
+                            "of this field always starts a new thread."
                         ),
                     },
                     "session_id": {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import deque
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from typing import Any
@@ -30,6 +31,9 @@ def clean_busy_registry() -> Any:
         "children": dict(runner_app._child_session_parents),
         "drained": set(runner_app._drained_delivered_subagent_children),
         "remote": runner_app._remote_dispatch_start_ref,
+        "peer_queues": {
+            key: list(value) for key, value in runner_app._peer_dispatch_queues.items()
+        },
     }
     runner_app._subagent_work_by_child.clear()
     runner_app._subagent_work_by_parent.clear()
@@ -37,6 +41,7 @@ def clean_busy_registry() -> Any:
     runner_app._child_session_parents.clear()
     runner_app._drained_delivered_subagent_children.clear()
     runner_app._remote_dispatch_start_ref = None
+    runner_app._peer_dispatch_queues.clear()
     try:
         yield
     finally:
@@ -51,6 +56,9 @@ def clean_busy_registry() -> Any:
         runner_app._drained_delivered_subagent_children.clear()
         runner_app._drained_delivered_subagent_children.update(saved["drained"])
         runner_app._remote_dispatch_start_ref = saved["remote"]
+        runner_app._peer_dispatch_queues.clear()
+        for key, callbacks in saved["peer_queues"].items():
+            runner_app._peer_dispatch_queues[key] = deque(callbacks)
 
 
 def _snapshot(
@@ -239,13 +247,17 @@ async def test_i3_queue_transcript_order_uses_two_real_message_bodies(
 
 
 @pytest.mark.asyncio
-async def test_i4_queue_refuses_other_dispatcher_without_post(clean_busy_registry: None) -> None:
-    runner_app.register_subagent_work(
+async def test_i4_queue_defers_other_dispatcher_without_post(clean_busy_registry: None) -> None:
+    active = runner_app.register_subagent_work(
         parent_session_id=OTHER_PARENT, child_session_id=CHILD, agent="worker", title="task"
     )
     output, posted, _ = await _send_child(arguments={"if_busy": "queue"})
-    assert json.loads(output)["error"] == "session_busy_other_dispatcher"
+    handle = json.loads(output)
+    assert handle["status"] == "queued"
+    assert handle["work_id"] != active.work_id
+    assert handle["thread_id"]
     assert posted == []
+    assert len(runner_app._peer_dispatch_queues[CHILD]) == 1
 
 
 @pytest.mark.asyncio
@@ -971,7 +983,10 @@ async def test_c3_two_parents_only_owner_can_coalesce(clean_busy_registry: None)
     )
     infos = [json.loads(result[0]) for result in outputs]
     assert any(info.get("work_id") == entry.work_id for info in infos)
-    assert any(info.get("error") == "session_busy_other_dispatcher" for info in infos), infos
+    queued = [info for info in infos if info.get("work_id") != entry.work_id]
+    assert len(queued) == 1, infos
+    assert queued[0]["status"] == "queued"
+    assert queued[0]["queued"] is True
 
 
 @pytest.mark.asyncio

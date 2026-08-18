@@ -22,6 +22,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
@@ -1105,6 +1106,7 @@ class _SubagentWorkEntry:
     :param queued_sends: Number of coalesced messages sent during this dispatch.
     :param last_sent_text: Exact text of the most recent dispatched message.
     :param last_anchor_item_id: Transcript item preceding the most recent message.
+    :param thread_id: Message thread carrying this dispatch, when threaded.
     """
 
     parent_session_id: str
@@ -1122,6 +1124,32 @@ class _SubagentWorkEntry:
     queued_sends: int = 0
     last_sent_text: str | None = None
     last_anchor_item_id: str | None = None
+    thread_id: str | None = None
+
+
+@dataclasses.dataclass
+class _MessageThread:
+    """Runner-local identity and accounting for one directional thread."""
+
+    thread_id: str
+    opener_session_id: str
+    target_session_id: str
+    subject: str | None
+    created_at: float
+    last_activity_at: float
+    message_count: int = 0
+    state: str = "open"
+    open_work_id: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _ThreadResolution:
+    """Result of resolving a caller's requested thread."""
+
+    thread: _MessageThread | None
+    error: str | None = None
+    blocking_thread_id: str | None = None
+    minted: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1149,6 +1177,147 @@ class _SubagentDeliveryAck:
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 _drained_delivered_subagent_children: set[str] = set()
+
+_threads_by_id: dict[str, _MessageThread] = {}
+_threads_by_pair: dict[tuple[str, str], str] = {}
+_closed_thread_ids: deque[str] = deque(maxlen=1024)
+
+_THREAD_MESSAGE_CAP = 32
+_THREADS_PER_PAIR_CAP = 16
+_OPEN_THREADS_PER_SESSION_CAP = 64
+_THREAD_SUBJECT_MAX_CHARS = 256
+
+
+def _open_threads_for_pair(opener_session_id: str, target_session_id: str) -> list[_MessageThread]:
+    return [
+        thread
+        for thread in _threads_by_id.values()
+        if thread.opener_session_id == opener_session_id
+        and thread.target_session_id == target_session_id
+        and thread.state == "open"
+    ]
+
+
+def _refresh_thread_pair_index(opener_session_id: str, target_session_id: str) -> None:
+    """Keep the directional pair index pointed at its newest open thread."""
+    candidates = _open_threads_for_pair(opener_session_id, target_session_id)
+    key = (opener_session_id, target_session_id)
+    if candidates:
+        _threads_by_pair[key] = max(candidates, key=lambda item: item.created_at).thread_id
+    else:
+        _threads_by_pair.pop(key, None)
+
+
+def resolve_message_thread(
+    caller_session_id: str,
+    target_session_id: str,
+    *,
+    thread_id: str | None = None,
+    thread_subject: str | None = None,
+    outstanding_entry: _SubagentWorkEntry | None = None,
+) -> _ThreadResolution:
+    """Resolve or mint a directional two-session message thread.
+
+    The caller-supplied id is never adopted. A thread subject deliberately
+    starts a new scope, while omitted parameters continue the caller's live
+    dispatch or newest open directional thread.
+    """
+    if thread_id is not None:
+        if thread_id in _closed_thread_ids:
+            return _ThreadResolution(None, error="thread_closed")
+        thread = _threads_by_id.get(thread_id)
+        if thread is None:
+            return _ThreadResolution(None, error="unknown_thread")
+        if caller_session_id not in (thread.opener_session_id, thread.target_session_id):
+            return _ThreadResolution(None, error="not_a_thread_participant")
+        if thread.state != "open":
+            return _ThreadResolution(None, error="thread_closed")
+        if thread.message_count >= _THREAD_MESSAGE_CAP:
+            return _ThreadResolution(None, error="thread_full")
+        if (
+            outstanding_entry is not None
+            and outstanding_entry.status not in _SUBAGENT_TERMINAL_STATUSES
+            and outstanding_entry.thread_id != thread.thread_id
+        ):
+            return _ThreadResolution(
+                None,
+                error="thread_blocked",
+                blocking_thread_id=outstanding_entry.thread_id,
+            )
+        return _ThreadResolution(thread)
+
+    if thread_subject is None and outstanding_entry is not None:
+        if (
+            outstanding_entry.parent_session_id == caller_session_id
+            and outstanding_entry.thread_id is not None
+        ):
+            thread = _threads_by_id.get(outstanding_entry.thread_id)
+            if thread is not None and thread.state == "open":
+                if thread.message_count >= _THREAD_MESSAGE_CAP:
+                    return _ThreadResolution(None, error="thread_full")
+                return _ThreadResolution(thread)
+
+    if thread_subject is None:
+        candidates = _open_threads_for_pair(caller_session_id, target_session_id)
+        if candidates:
+            thread = max(candidates, key=lambda item: item.created_at)
+            if thread.message_count >= _THREAD_MESSAGE_CAP:
+                return _ThreadResolution(None, error="thread_full")
+            return _ThreadResolution(thread)
+
+    open_pair = _open_threads_for_pair(caller_session_id, target_session_id)
+    open_by_caller = sum(
+        thread.opener_session_id == caller_session_id and thread.state == "open"
+        for thread in _threads_by_id.values()
+    )
+    if len(open_pair) >= _THREADS_PER_PAIR_CAP:
+        return _ThreadResolution(None, error="thread_pair_full")
+    if open_by_caller >= _OPEN_THREADS_PER_SESSION_CAP:
+        return _ThreadResolution(None, error="session_thread_cap")
+    now = time.time()
+    thread = _MessageThread(
+        thread_id=f"th_{uuid.uuid4().hex[:12]}",
+        opener_session_id=caller_session_id,
+        target_session_id=target_session_id,
+        subject=thread_subject[:_THREAD_SUBJECT_MAX_CHARS] if thread_subject is not None else None,
+        created_at=now,
+        last_activity_at=now,
+    )
+    _threads_by_id[thread.thread_id] = thread
+    _threads_by_pair[(caller_session_id, target_session_id)] = thread.thread_id
+    return _ThreadResolution(thread, minted=True)
+
+
+def claim_message_thread(thread: _MessageThread) -> str | None:
+    """Reserve one message slot before its network delivery begins."""
+    if thread.state != "open" or thread.message_count >= _THREAD_MESSAGE_CAP:
+        return "thread_full"
+    thread.message_count += 1
+    thread.last_activity_at = time.time()
+    return None
+
+
+def rollback_message_thread(thread: _MessageThread, *, minted: bool) -> None:
+    """Undo a reservation when the message could not be delivered."""
+    thread.message_count = max(0, thread.message_count - 1)
+    if minted and thread.message_count == 0:
+        _threads_by_id.pop(thread.thread_id, None)
+        if _threads_by_pair.get((thread.opener_session_id, thread.target_session_id)) == (
+            thread.thread_id
+        ):
+            _refresh_thread_pair_index(thread.opener_session_id, thread.target_session_id)
+
+
+def close_message_thread(thread_id: str) -> None:
+    """Mark a thread closed and remove it from the newest-open pair index."""
+    thread = _threads_by_id.get(thread_id)
+    if thread is None:
+        return
+    thread.state = "closed"
+    _closed_thread_ids.append(thread_id)
+    _threads_by_id.pop(thread_id, None)
+    _refresh_thread_pair_index(thread.opener_session_id, thread.target_session_id)
+
 
 # Per-(parent, agent_type) monotonic ordinal counter for structured
 # sub-agent names (e.g. "researcher-1", "researcher-2").
@@ -1193,6 +1362,8 @@ def register_subagent_work(
     title: str,
     wrapper_label: str | None = None,
     created_by: str | None = None,
+    thread_id: str | None = None,
+    work_id: str | None = None,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -1210,10 +1381,16 @@ def register_subagent_work(
         label, e.g. ``"claude-code-native-ui"``.
     :param created_by: Human actor that dispatched this child turn, if
         known from the parent turn context.
+    :param thread_id: Message thread carrying this dispatch, when threaded.
+    :param work_id: Existing id for a dispatch promoted from the peer queue.
     :returns: The registered work entry.
     """
     prior = _subagent_work_by_child.get(child_session_id)
     if prior is not None:
+        if prior.thread_id is not None:
+            prior_thread = _threads_by_id.get(prior.thread_id)
+            if prior_thread is not None and prior_thread.open_work_id == prior.work_id:
+                prior_thread.open_work_id = None
         children = _subagent_work_by_parent.get(prior.parent_session_id)
         if children is not None:
             children.discard(child_session_id)
@@ -1223,15 +1400,20 @@ def register_subagent_work(
     entry = _SubagentWorkEntry(
         parent_session_id=parent_session_id,
         child_session_id=child_session_id,
-        work_id=f"subagent_{uuid.uuid4().hex[:12]}",
+        work_id=work_id or new_subagent_work_id(),
         agent=agent,
         title=title,
         wrapper_label=wrapper_label,
         created_by=created_by,
+        thread_id=thread_id,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
+    if thread_id is not None:
+        thread = _threads_by_id.get(thread_id)
+        if thread is not None and thread.state == "open":
+            thread.open_work_id = entry.work_id
     return entry
 
 
@@ -1321,6 +1503,10 @@ def unregister_subagent_work(
         return
     if work_id is not None and entry.work_id != work_id:
         return
+    if entry.thread_id is not None:
+        thread = _threads_by_id.get(entry.thread_id)
+        if thread is not None and thread.open_work_id == entry.work_id:
+            thread.open_work_id = None
     if remember_drained_delivery and entry.delivered:
         _drained_delivered_subagent_children.add(child_session_id)
     _subagent_work_by_child.pop(child_session_id, None)
@@ -1345,6 +1531,7 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     :returns: None.
     """
     unregister_subagent_work(session_id)
+    _peer_dispatch_queues.pop(session_id, None)
     _drained_delivered_subagent_children.discard(session_id)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
@@ -1420,11 +1607,23 @@ def mark_subagent_work_terminal(
         entry.status = status
         entry.output = output
         entry.completed_at = time.time()
-        return _deliver_subagent_completion(entry)
+        if entry.thread_id is not None:
+            thread = _threads_by_id.get(entry.thread_id)
+            if thread is not None and thread.open_work_id == entry.work_id:
+                thread.open_work_id = None
+        ack = _deliver_subagent_completion(entry)
+        _start_next_peer_dispatch(child_session_id)
+        return ack
     entry.status = status
     entry.output = output
     entry.completed_at = time.time()
-    return _deliver_subagent_completion(entry)
+    if entry.thread_id is not None:
+        thread = _threads_by_id.get(entry.thread_id)
+        if thread is not None and thread.open_work_id == entry.work_id:
+            thread.open_work_id = None
+    ack = _deliver_subagent_completion(entry)
+    _start_next_peer_dispatch(child_session_id)
+    return ack
 
 
 def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDeliveryAck:
@@ -1470,6 +1669,14 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
             "title": entry.title,
             "status": entry.status,
             "output": output,
+            **({"thread_id": entry.thread_id} if entry.thread_id is not None else {}),
+            **(
+                {"thread_subject": _threads_by_id[entry.thread_id].subject}
+                if entry.thread_id is not None
+                and entry.thread_id in _threads_by_id
+                and _threads_by_id[entry.thread_id].subject is not None
+                else {}
+            ),
         }
     )
     entry.delivered = True
@@ -1666,7 +1873,27 @@ def _subagent_delivery_not_confirmed_response(
     )
 
 
-def _format_subagent_wake_notice(*, agent: str, title: str, status: str, pending: int) -> str:
+def _pending_inbox_thread_ids(parent_session_id: str) -> list[str]:
+    """Return distinct thread ids represented by currently queued results."""
+    inbox = _session_inboxes_ref.get(parent_session_id)
+    if inbox is None:
+        return []
+    found: list[str] = []
+    for payload in cast(Any, inbox)._queue:
+        thread_id = payload.get("thread_id")
+        if isinstance(thread_id, str) and thread_id and thread_id not in found:
+            found.append(thread_id)
+    return found
+
+
+def _format_subagent_wake_notice(
+    *,
+    agent: str,
+    title: str,
+    status: str,
+    pending: int,
+    thread_ids: list[str] | None = None,
+) -> str:
     """
     Build the framework notice that wakes a parent after a child finishes.
 
@@ -1680,9 +1907,13 @@ def _format_subagent_wake_notice(*, agent: str, title: str, status: str, pending
         sys_read_inbox to collect.]"``.
     """
     noun = "result" if pending == 1 else "results"
+    thread_suffix = ""
+    if thread_ids:
+        thread_suffix = f" on threads {', '.join(thread_ids)}"
     return (
         f"[System: sub-agent {agent}/{title} finished ({status}) — "
-        f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
+        f"{pending} {noun} waiting in inbox{thread_suffix}. "
+        "Call sys_read_inbox to collect.]"
     )
 
 
@@ -1939,10 +2170,63 @@ _SUBAGENT_QUEUED_SEND_CAP = 8
 # parent can no longer receive into.
 _remote_dispatch_tasks: dict[str, asyncio.Task[None]] = {}
 
+# Cross-runner peer sends from other callers wait here while one dispatch owns
+# the target. The queue preserves one active turn per target.
+_peer_dispatch_queues: dict[str, deque[Callable[[], Awaitable[None]]]] = {}
+_peer_dispatch_tasks: set[asyncio.Task[Any]] = set()
+
 # Set by :func:`create_runner_app` so the tool dispatcher can start a
 # poll-based dispatch. ``None`` outside a live runner app (the dispatcher
 # then refuses the send rather than registering work nothing will clear).
 _remote_dispatch_start_ref: Callable[..., None] | None = None
+
+
+def new_subagent_work_id() -> str:
+    """Mint a work id for a dispatch before it enters the active registry."""
+    return f"subagent_{uuid.uuid4().hex[:12]}"
+
+
+def peer_dispatch_queue_full(target_session_id: str) -> bool:
+    """Return whether a target's deferred peer-send queue is at capacity."""
+    return len(_peer_dispatch_queues.get(target_session_id, ())) >= _SUBAGENT_QUEUED_SEND_CAP
+
+
+def enqueue_peer_dispatch(
+    target_session_id: str,
+    callback: Callable[[], Awaitable[None]],
+) -> bool:
+    """Queue one peer dispatch without changing the active target slot."""
+    if peer_dispatch_queue_full(target_session_id):
+        return False
+    _peer_dispatch_queues.setdefault(target_session_id, deque()).append(callback)
+    return True
+
+
+def _consume_peer_dispatch_task(task: asyncio.Task[Any]) -> None:
+    """Retain queue task failures in runner logs instead of dropping them."""
+    _peer_dispatch_tasks.discard(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        _logger.error(
+            "queued peer dispatch failed",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
+def _start_next_peer_dispatch(target_session_id: str) -> None:
+    """Promote the next deferred peer dispatch after a terminal result."""
+    queue = _peer_dispatch_queues.get(target_session_id)
+    if not queue:
+        _peer_dispatch_queues.pop(target_session_id, None)
+        return
+    callback = queue.popleft()
+    if not queue:
+        _peer_dispatch_queues.pop(target_session_id, None)
+    task = asyncio.create_task(callback(), name=f"peer-dispatch-queue-{target_session_id}")
+    task.add_done_callback(_consume_peer_dispatch_task)
+    _peer_dispatch_tasks.add(task)
 
 
 def _optional_str(value: object) -> str | None:
@@ -5708,6 +5992,7 @@ def create_runner_app(
                 title=entries[0].title if entries else "",
                 status="completed",
                 pending=inbox.qsize(),
+                thread_ids=_pending_inbox_thread_ids(parent_id),
             )
             result = await _deliver_subagent_wake_post(server_client, parent_id, notice)
             if result.delivered:
@@ -5783,20 +6068,23 @@ def create_runner_app(
         except RuntimeError:
             return
         _subagent_wake_pending.add(entry.parent_session_id)
-        notice = _format_subagent_wake_notice(
-            agent=entry.agent,
-            title=entry.title,
-            status=entry.status,
-            pending=inbox.qsize(),
-        )
-        _wake_task = loop.create_task(
-            _post_subagent_wake_notice(
+
+        async def _post_wake() -> None:
+            notice = _format_subagent_wake_notice(
+                agent=entry.agent,
+                title=entry.title,
+                status=entry.status,
+                pending=inbox.qsize(),
+                thread_ids=_pending_inbox_thread_ids(entry.parent_session_id),
+            )
+            await _post_subagent_wake_notice(
                 entry.parent_session_id,
                 notice,
                 entry.child_session_id,
                 entry.created_by,
             )
-        )
+
+        _wake_task = loop.create_task(_post_wake())
         _wake_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_wake_task)
 

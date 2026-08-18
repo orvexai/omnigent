@@ -973,6 +973,25 @@ class _SessionTurnIdentity:
     parent_session_id: str | None
 
 
+@dataclass
+class _QueuedPeerDispatch:
+    """Deferred peer send waiting for the target's active turn to finish."""
+
+    target_session_id: str
+    message: str
+    server_client: httpx.AsyncClient
+    conversation_id: str
+    snap_data: _JsonObject
+    sender_identity: _SessionTurnIdentity
+    thread: Any
+    thread_minted: bool
+    work_id: str
+    agent_label: str
+    peer_title: str | None
+    cancelled_work_id: str | None
+    relation: Literal["parent", "peer"]
+
+
 def _subagent_label(child: _JsonObject) -> _SubagentLabel:
     """
     Extract child identity fields from a child-session summary.
@@ -1197,12 +1216,18 @@ def _agent_message_envelope(
     message: str,
     sender: _SessionTurnIdentity,
     relation: Literal["parent", "child", "peer"],
+    *,
+    thread_id: str | None = None,
+    thread_subject: str | None = None,
 ) -> str:
     """Wrap agent-originated text with sender provenance and reply routing.
 
     :param message: Raw message text supplied by the sending agent.
     :param sender: Best-effort identity of the sending session.
     :param relation: The sender's relation to the receiver.
+    :param thread_id: Runner-minted message thread id, when this is a
+        ``sys_session_send`` message.
+    :param thread_subject: Optional subject for the message thread.
     :returns: The provenance envelope containing the sanitised message.
     """
     # This is prompt framing, not authentication; verify ``from`` with
@@ -1215,19 +1240,95 @@ def _agent_message_envelope(
     )
     sender_agent = _html.escape(sender.agent_name or "unknown", quote=True)
     sender_title = _html.escape(sender.title or "unknown", quote=True)
+    thread_attrs = (
+        f' thread="{_html.escape(thread_id, quote=True)}"' if thread_id is not None else ""
+    )
+    subject_attr = (
+        f' subject="{_html.escape(thread_subject, quote=True)}"'
+        if thread_subject is not None
+        else ""
+    )
+    thread_guidance = ""
+    if thread_id is not None:
+        subject_text = (
+            f' ("{_html.escape(thread_subject, quote=True)}")'
+            if thread_subject is not None
+            else ""
+        )
+        thread_guidance = (
+            f"This message is on thread {thread_id}{subject_text}.\n"
+            "Your final turn text is delivered back to that agent's inbox "
+            "on this thread automatically —\n"
+            "you do not need to call sys_session_send to reply.\n"
+        )
+    else:
+        thread_guidance = (
+            f"Your final turn text is delivered back to that agent's inbox automatically "
+            f"— write it for {sender.session_id} ({sender.agent_name or 'unknown'}), "
+            "not for a person.\n"
+            "Do not call sys_session_send to reply to this message; ending your turn "
+            "is the reply.\n"
+        )
     return (
         f'<omnigent-agent-message from="{_html.escape(sender.session_id, quote=True)}" '
-        f'agent="{sender_agent}" title="{sender_title}" relation="{relation}">\n'
+        f'agent="{sender_agent}" title="{sender_title}" relation="{relation}"'
+        f"{thread_attrs}{subject_attr}>\n"
         "This message came from an agent, not a human.\n"
-        f"Your final turn text is delivered back to that agent's inbox automatically "
-        f"— write it for {sender.session_id} ({sender.agent_name or 'unknown'}), "
-        "not for a person.\n"
-        "Do not call sys_session_send to reply to this message; ending your turn is the reply.\n"
-        f"To verify who sent this, call sys_session_get_info with "
-        f"session_id={sender.session_id}.\n"
-        f"Message:\n{safe_message}\n"
-        "</omnigent-agent-message>"
+        + thread_guidance
+        + "To verify who sent this, call sys_session_get_info with "
+        + f"session_id={sender.session_id}.\n"
+        + f"Message:\n{safe_message}\n"
+        + "</omnigent-agent-message>"
     )
+
+
+def _resolve_thread_for_send(
+    *,
+    runner_app: Any,
+    caller_session_id: str,
+    target_session_id: str,
+    thread_id: str | None,
+    thread_subject: str | None,
+    outstanding_entry: Any = None,
+) -> tuple[Any | None, bool, str | None]:
+    """Resolve and reserve the thread slot before posting a message."""
+    resolution = runner_app.resolve_message_thread(
+        caller_session_id,
+        target_session_id,
+        thread_id=thread_id,
+        thread_subject=thread_subject,
+        outstanding_entry=outstanding_entry,
+    )
+    if resolution.error is not None:
+        error: _JsonObject = {"error": resolution.error}
+        if resolution.blocking_thread_id is not None:
+            error["blocking_thread_id"] = resolution.blocking_thread_id
+        return None, False, json.dumps(error)
+    assert resolution.thread is not None
+    if (
+        outstanding_entry is not None
+        and outstanding_entry.status not in {"completed", "failed", "cancelled"}
+        and outstanding_entry.thread_id is not None
+        and outstanding_entry.thread_id != resolution.thread.thread_id
+    ):
+        if resolution.minted:
+            runner_app.rollback_message_thread(resolution.thread, minted=True)
+        return (
+            None,
+            False,
+            json.dumps(
+                {
+                    "error": "thread_blocked",
+                    "blocking_thread_id": outstanding_entry.thread_id,
+                }
+            ),
+        )
+    claim_error = runner_app.claim_message_thread(resolution.thread)
+    if claim_error is not None:
+        if resolution.minted:
+            runner_app.rollback_message_thread(resolution.thread, minted=True)
+        return None, False, json.dumps({"error": claim_error})
+    return resolution.thread, resolution.minted, None
 
 
 async def _post_child_message_event(
@@ -1919,6 +2020,28 @@ async def _execute_subagent_tool(
     if_busy = args.get("if_busy")
     if if_busy is not None and if_busy not in ("reject", "queue", "interrupt"):
         return 'Error: sys_session_send invalid "if_busy"; expected reject, queue, or interrupt'
+    thread_id = args.get("thread_id")
+    thread_subject = args.get("thread_subject")
+    if thread_id is not None and not isinstance(thread_id, str):
+        return "Error: sys_session_send invalid 'thread_id'; expected a string"
+    if thread_subject is not None and not isinstance(thread_subject, str):
+        return "Error: sys_session_send invalid 'thread_subject'; expected a string"
+    if thread_id is not None:
+        requested_thread = _runner_app._threads_by_id.get(thread_id)
+        if requested_thread is None:
+            error = (
+                "thread_closed"
+                if thread_id in _runner_app._closed_thread_ids
+                else "unknown_thread"
+            )
+            return json.dumps({"error": error})
+        if conversation_id not in (
+            requested_thread.opener_session_id,
+            requested_thread.target_session_id,
+        ):
+            return json.dumps({"error": "not_a_thread_participant"})
+        if requested_thread.state != "open":
+            return json.dumps({"error": "thread_closed"})
     if session_inbox is not None:
         _runner_app._session_inboxes_ref.setdefault(conversation_id, session_inbox)
     elif conversation_id not in _runner_app._session_inboxes_ref:
@@ -1995,6 +2118,8 @@ async def _execute_subagent_tool(
             publish_event=publish_event,
             sender_identity=dispatch_identity,
             if_busy=if_busy,
+            thread_id=thread_id,
+            thread_subject=thread_subject,
         )
 
     # Named mode: (agent, title) spawn-or-continue.
@@ -2105,11 +2230,17 @@ async def _execute_subagent_tool(
                     "conversation after completion."
                 )
             if busy_mode == "queue" and existing_work.parent_session_id != conversation_id:
-                return json.dumps(
-                    {
-                        "error": "session_busy_other_dispatcher",
-                        "conversation_id": child_session_id,
-                    }
+                return await _queue_peer_dispatch(
+                    target_session_id=child_session_id,
+                    message=message,
+                    server_client=server_client,
+                    conversation_id=conversation_id,
+                    snap_data=existing,
+                    sender_identity=dispatch_identity,
+                    thread_id=thread_id,
+                    thread_subject=thread_subject,
+                    cancelled_work_id=cancelled_work_id,
+                    relation="parent",
                 )
             if busy_mode == "interrupt":
                 cancelled_work_id, cancel_error = await _interrupt_before_send(
@@ -2336,6 +2467,20 @@ async def _execute_subagent_tool(
 
             session_stream.publish(conversation_id, _evt.model_dump())
 
+    thread, thread_minted, thread_error = _resolve_thread_for_send(
+        runner_app=_runner_app,
+        caller_session_id=conversation_id,
+        target_session_id=child_session_id,
+        thread_id=thread_id,
+        thread_subject=thread_subject,
+        outstanding_entry=existing_work,
+    )
+    if thread_error is not None:
+        return thread_error
+    assert thread is not None
+    if existing_work is not None and existing_work.thread_id is None:
+        existing_work.thread_id = thread.thread_id
+
     assert session_name is not None
     # Register the child→parent mapping so the runner can fan out the
     # child's status/preview deltas onto the PARENT's stream (the child's
@@ -2356,6 +2501,7 @@ async def _execute_subagent_tool(
         "waiting",
     )
     if coalesced and existing_work.queued_sends >= _runner_app._SUBAGENT_QUEUED_SEND_CAP:
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         return json.dumps(
             {
                 "error": "queue_full",
@@ -2373,6 +2519,7 @@ async def _execute_subagent_tool(
             title=session_name,
             wrapper_label=child_wrapper_label,
             created_by=dispatch_identity.actor,
+            thread_id=thread.thread_id,
         )
     )
     assert work_entry is not None
@@ -2399,6 +2546,7 @@ async def _execute_subagent_tool(
         server_client=server_client,
     )
     if copy_result.error is not None:
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         teardown_warning = await _teardown_failed_child(
             server_client,
             child_session_id,
@@ -2412,7 +2560,13 @@ async def _execute_subagent_tool(
     message_content = [
         {
             **content_item,
-            "text": _agent_message_envelope(content_item["text"], dispatch_identity, "parent"),
+            "text": _agent_message_envelope(
+                cast(str, content_item["text"]),
+                dispatch_identity,
+                "parent",
+                thread_id=thread.thread_id,
+                thread_subject=thread.subject,
+            ),
         }
         if content_item.get("type") == "input_text" and isinstance(content_item.get("text"), str)
         else content_item
@@ -2430,6 +2584,7 @@ async def _execute_subagent_tool(
             created_by=dispatch_identity.actor,
         )
     except httpx.HTTPError as exc:
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         teardown_warning = None
         if not coalesced:
             teardown_warning = await _teardown_failed_child(
@@ -2442,6 +2597,7 @@ async def _execute_subagent_tool(
             return f"{error}\n{teardown_warning}"
         return error
     if msg_resp.status_code >= 400:
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         teardown_warning = None
         if not coalesced:
             teardown_warning = await _teardown_failed_child(
@@ -2460,6 +2616,7 @@ async def _execute_subagent_tool(
 
     denial = event_denial_reason(msg_resp)
     if denial is not None:
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         if not coalesced:
             await _teardown_failed_child(
                 server_client,
@@ -2488,6 +2645,7 @@ async def _execute_subagent_tool(
                 title=session_name,
                 wrapper_label=child_wrapper_label,
                 created_by=dispatch_identity.actor,
+                thread_id=thread.thread_id,
             )
             coalesced = False
 
@@ -2503,10 +2661,11 @@ async def _execute_subagent_tool(
         _runner_app.note_subagent_work_send(
             child_session_id,
             work_id=work_entry.work_id,
-            sent_text=wrapped_message,
+            sent_text=cast(str, wrapped_message),
         )
         is None
     ):
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         return json.dumps({"error": "dispatch_superseded", "conversation_id": child_session_id})
 
     # Return the structured handle mirrored from ``spawn.py``. The debug panel
@@ -2518,6 +2677,9 @@ async def _execute_subagent_tool(
             "conversation_id": child_session_id,
             "kind": "sub_agent",
             "work_id": work_entry.work_id,
+            "thread_id": thread.thread_id,
+            "thread_subject": thread.subject,
+            "thread_message_count": thread.message_count,
             "agent": sub_agent_name,
             "title": session_name,
             "status": "queued" if coalesced else "launching",
@@ -2901,6 +3063,96 @@ def _session_is_local_to_caller(
     )
 
 
+async def _queue_peer_dispatch(
+    *,
+    target_session_id: str,
+    message: str,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    snap_data: _JsonObject,
+    sender_identity: _SessionTurnIdentity,
+    thread_id: str | None,
+    thread_subject: str | None,
+    cancelled_work_id: str | None,
+    relation: Literal["parent", "peer"],
+) -> str:
+    """Queue a second caller's peer send behind the active target dispatch."""
+    from omnigent.runner import app as _runner_app
+
+    if _runner_app.peer_dispatch_queue_full(target_session_id):
+        return json.dumps(
+            {
+                "error": "queue_full",
+                "conversation_id": target_session_id,
+                "message": "the target's deferred peer-send queue is full",
+            }
+        )
+    thread, thread_minted, thread_error = _resolve_thread_for_send(
+        runner_app=_runner_app,
+        caller_session_id=conversation_id,
+        target_session_id=target_session_id,
+        thread_id=thread_id,
+        thread_subject=thread_subject,
+        outstanding_entry=None,
+    )
+    if thread_error is not None:
+        return thread_error
+    assert thread is not None
+    agent_label = _optional_string(snap_data.get("agent_name")) or "agent"
+    peer_title = title_without_closed_marker(_optional_string(snap_data.get("title"))) or None
+    item = _QueuedPeerDispatch(
+        target_session_id=target_session_id,
+        message=message,
+        server_client=server_client,
+        conversation_id=conversation_id,
+        snap_data=snap_data,
+        sender_identity=sender_identity,
+        thread=thread,
+        thread_minted=thread_minted,
+        work_id=_runner_app.new_subagent_work_id(),
+        agent_label=agent_label,
+        peer_title=peer_title,
+        cancelled_work_id=cancelled_work_id,
+        relation=relation,
+    )
+    if not _runner_app.enqueue_peer_dispatch(
+        target_session_id,
+        lambda: _activate_queued_peer_dispatch(item),
+    ):
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
+        return json.dumps(
+            {
+                "error": "queue_full",
+                "conversation_id": target_session_id,
+                "message": "the target's deferred peer-send queue is full",
+            }
+        )
+    return json.dumps(
+        {
+            "task_id": target_session_id,
+            "handle_id": target_session_id,
+            "conversation_id": target_session_id,
+            "work_id": item.work_id,
+            "thread_id": thread.thread_id,
+            "thread_subject": thread.subject,
+            "thread_message_count": thread.message_count,
+            "kind": "peer_session",
+            "agent": agent_label,
+            "title": peer_title,
+            "host_id": snap_data.get("host_id"),
+            "status": "queued",
+            "queued": True,
+            **({"cancelled_work_id": cancelled_work_id} if cancelled_work_id else {}),
+            **({"steered": True} if cancelled_work_id else {}),
+            "message": (
+                f"[System: message queued for session {target_session_id} "
+                f"({agent_label}) behind another caller's dispatch. Its reply "
+                "will appear in your inbox; call sys_read_inbox to collect.]"
+            ),
+        }
+    )
+
+
 async def _send_to_peer_session(
     target_session_id: str,
     message: str,
@@ -2910,6 +3162,8 @@ async def _send_to_peer_session(
     snap_data: _JsonObject,
     sender_identity: _SessionTurnIdentity,
     if_busy: str | None = None,
+    thread_id: str | None = None,
+    thread_subject: str | None = None,
 ) -> str:
     """
     Message a session that is not the caller's child, and await its reply.
@@ -3031,11 +3285,17 @@ async def _send_to_peer_session(
             )
         if busy_mode == "queue":
             if existing.parent_session_id != conversation_id:
-                return json.dumps(
-                    {
-                        "error": "session_busy_other_dispatcher",
-                        "conversation_id": target_session_id,
-                    }
+                return await _queue_peer_dispatch(
+                    target_session_id=target_session_id,
+                    message=message,
+                    server_client=server_client,
+                    conversation_id=conversation_id,
+                    snap_data=snap_data,
+                    sender_identity=sender_identity,
+                    thread_id=thread_id,
+                    thread_subject=thread_subject,
+                    cancelled_work_id=cancelled_work_id,
+                    relation="peer",
                 )
         else:
             cancelled_work_id, cancel_error = await _interrupt_before_send(
@@ -3049,10 +3309,30 @@ async def _send_to_peer_session(
                 return cancel_error
             existing = None
 
+    thread, thread_minted, thread_error = _resolve_thread_for_send(
+        runner_app=_runner_app,
+        caller_session_id=conversation_id,
+        target_session_id=target_session_id,
+        thread_id=thread_id,
+        thread_subject=thread_subject,
+        outstanding_entry=existing,
+    )
+    if thread_error is not None:
+        return thread_error
+    assert thread is not None
+    if existing is not None and existing.thread_id is None:
+        existing.thread_id = thread.thread_id
+
     # Anchor BEFORE posting so the poller can distinguish our reply.
     anchor_item_id = await _newest_item_id(target_session_id, server_client)
     relation = "child" if target_session_id == sender_identity.parent_session_id else "peer"
-    wrapped_message = _agent_message_envelope(message, sender_identity, relation)
+    wrapped_message = _agent_message_envelope(
+        message,
+        sender_identity,
+        relation,
+        thread_id=thread.thread_id,
+        thread_subject=thread.subject,
+    )
     agent_label = _optional_string(snap_data.get("agent_name")) or "agent"
     peer_title = title_without_closed_marker(_optional_string(snap_data.get("title"))) or None
     coalesced = existing is not None and existing.status in ("launching", "running", "waiting")
@@ -3061,6 +3341,7 @@ async def _send_to_peer_session(
         and existing is not None
         and existing.queued_sends >= _runner_app._SUBAGENT_QUEUED_SEND_CAP
     ):
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         return json.dumps(
             {
                 "error": "queue_full",
@@ -3078,6 +3359,7 @@ async def _send_to_peer_session(
             title=peer_title or "",
             wrapper_label=_session_wrapper_label(snap_data),
             created_by=sender_identity.actor,
+            thread_id=thread.thread_id,
         )
     )
     assert work_entry is not None
@@ -3089,15 +3371,18 @@ async def _send_to_peer_session(
             created_by=sender_identity.actor,
         )
     except httpx.HTTPError as exc:
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         if not coalesced:
             _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
         return f"Error: failed to send message to session: {type(exc).__name__}: {exc}"
     if msg_resp.status_code >= 400:
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         if not coalesced:
             _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
         return _message_post_error(msg_resp, session_id=target_session_id, target_label="session")
     denial = event_denial_reason(msg_resp)
     if denial is not None:
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         if not coalesced:
             _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
         return json.dumps(
@@ -3126,22 +3411,24 @@ async def _send_to_peer_session(
                 title=peer_title or "",
                 wrapper_label=_session_wrapper_label(snap_data),
                 created_by=sender_identity.actor,
+                thread_id=thread.thread_id,
             )
             coalesced = False
     noted = _runner_app.note_subagent_work_send(
         target_session_id,
         work_id=work_entry.work_id,
-        sent_text=wrapped_message,
+        sent_text=cast(str, wrapped_message),
         anchor_item_id=anchor_item_id,
     )
     if noted is None:
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         return json.dumps({"error": "dispatch_superseded", "conversation_id": target_session_id})
     if not coalesced:
         start_remote(
             child_session_id=target_session_id,
             work_id=work_entry.work_id,
             anchor_item_id=anchor_item_id,
-            sent_text=wrapped_message,
+            sent_text=cast(str, wrapped_message),
         )
     return json.dumps(
         {
@@ -3149,6 +3436,9 @@ async def _send_to_peer_session(
             "handle_id": target_session_id,
             "conversation_id": target_session_id,
             "work_id": work_entry.work_id,
+            "thread_id": thread.thread_id,
+            "thread_subject": thread.subject,
+            "thread_message_count": thread.message_count,
             "kind": "peer_session",
             "agent": agent_label,
             "title": peer_title,
@@ -3172,6 +3462,87 @@ async def _send_to_peer_session(
     )
 
 
+async def _activate_queued_peer_dispatch(item: _QueuedPeerDispatch) -> None:
+    """Promote and post one deferred peer dispatch after the target frees up."""
+    from omnigent.runner import app as _runner_app
+
+    anchor_item_id = await _newest_item_id(item.target_session_id, item.server_client)
+    wrapped_message = _agent_message_envelope(
+        item.message,
+        item.sender_identity,
+        item.relation,
+        thread_id=item.thread.thread_id,
+        thread_subject=item.thread.subject,
+    )
+    work_entry = _runner_app.register_subagent_work(
+        parent_session_id=item.conversation_id,
+        child_session_id=item.target_session_id,
+        agent=item.agent_label,
+        title=item.peer_title or "",
+        wrapper_label=_session_wrapper_label(item.snap_data),
+        created_by=item.sender_identity.actor,
+        thread_id=item.thread.thread_id,
+        work_id=item.work_id,
+    )
+    try:
+        msg_resp = await _post_child_message_event(
+            item.server_client,
+            item.target_session_id,
+            content=[{"type": "input_text", "text": wrapped_message}],
+            created_by=item.sender_identity.actor,
+        )
+    except httpx.HTTPError as exc:
+        _runner_app.rollback_message_thread(item.thread, minted=item.thread_minted)
+        _runner_app.mark_subagent_work_terminal(
+            item.target_session_id,
+            status="failed",
+            output=f"Error: failed to send queued peer message: {type(exc).__name__}: {exc}",
+        )
+        return
+    if msg_resp.status_code >= 400:
+        _runner_app.rollback_message_thread(item.thread, minted=item.thread_minted)
+        _runner_app.mark_subagent_work_terminal(
+            item.target_session_id,
+            status="failed",
+            output=(
+                f"Error: queued peer message rejected: {msg_resp.status_code} "
+                f"{msg_resp.text[:200]}"
+            ),
+        )
+        return
+    denial = event_denial_reason(msg_resp)
+    if denial is not None:
+        _runner_app.rollback_message_thread(item.thread, minted=item.thread_minted)
+        _runner_app.mark_subagent_work_terminal(
+            item.target_session_id,
+            status="failed",
+            output=f"Error: the target refused the queued peer message: {denial}",
+        )
+        return
+    noted = _runner_app.note_subagent_work_send(
+        item.target_session_id,
+        work_id=work_entry.work_id,
+        sent_text=wrapped_message,
+        anchor_item_id=anchor_item_id,
+    )
+    if noted is None:
+        _runner_app.rollback_message_thread(item.thread, minted=item.thread_minted)
+        _runner_app.mark_subagent_work_terminal(
+            item.target_session_id,
+            status="failed",
+            output="Error: queued peer dispatch was superseded before delivery",
+        )
+        return
+    start_remote = _runner_app._remote_dispatch_start_ref
+    if start_remote is not None:
+        start_remote(
+            child_session_id=item.target_session_id,
+            work_id=work_entry.work_id,
+            anchor_item_id=anchor_item_id,
+            sent_text=wrapped_message,
+        )
+
+
 async def _send_to_existing_session(
     target_session_id: str,
     message: str,
@@ -3181,6 +3552,8 @@ async def _send_to_existing_session(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     sender_identity: _SessionTurnIdentity,
     if_busy: str | None = None,
+    thread_id: str | None = None,
+    thread_subject: str | None = None,
 ) -> str:
     """
     Post a message to an existing direct-child session, return a handle.
@@ -3237,6 +3610,8 @@ async def _send_to_existing_session(
             snap_data=snap_data,
             sender_identity=sender_identity,
             if_busy=if_busy,
+            thread_id=thread_id,
+            thread_subject=thread_subject,
         )
     if is_session_closed(snap_data.get("labels"), snap_data.get("title")):
         return json.dumps(
@@ -3273,11 +3648,17 @@ async def _send_to_existing_session(
                 "wait for completion before sending again (use sys_cancel_task to interrupt it)"
             )
         if busy_mode == "queue" and existing_work.parent_session_id != conversation_id:
-            return json.dumps(
-                {
-                    "error": "session_busy_other_dispatcher",
-                    "conversation_id": target_session_id,
-                }
+            return await _queue_peer_dispatch(
+                target_session_id=target_session_id,
+                message=message,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                snap_data=snap_data,
+                sender_identity=sender_identity,
+                thread_id=thread_id,
+                thread_subject=thread_subject,
+                cancelled_work_id=cancelled_work_id,
+                relation="parent",
             )
         if busy_mode == "interrupt":
             cancelled_work_id, cancel_error = await _interrupt_before_send(
@@ -3305,6 +3686,19 @@ async def _send_to_existing_session(
             if cancel_error is not None:
                 return cancel_error
             interrupt_confirmed = True
+    thread, thread_minted, thread_error = _resolve_thread_for_send(
+        runner_app=_runner_app,
+        caller_session_id=conversation_id,
+        target_session_id=target_session_id,
+        thread_id=thread_id,
+        thread_subject=thread_subject,
+        outstanding_entry=existing_work,
+    )
+    if thread_error is not None:
+        return thread_error
+    assert thread is not None
+    if existing_work is not None and existing_work.thread_id is None:
+        existing_work.thread_id = thread.thread_id
     _runner_app.register_child_session(
         target_session_id,
         parent_session_id=conversation_id,
@@ -3322,6 +3716,7 @@ async def _send_to_existing_session(
         and existing_work is not None
         and existing_work.queued_sends >= _runner_app._SUBAGENT_QUEUED_SEND_CAP
     ):
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         return json.dumps(
             {
                 "error": "queue_full",
@@ -3339,6 +3734,7 @@ async def _send_to_existing_session(
             title=child_label or "",
             wrapper_label=_session_wrapper_label(snap_data),
             created_by=sender_identity.actor,
+            thread_id=thread.thread_id,
         )
     )
     assert work_entry is not None
@@ -3352,7 +3748,13 @@ async def _send_to_existing_session(
             publish_event=publish_event,
         )
 
-    wrapped_message = _agent_message_envelope(message, sender_identity, "parent")
+    wrapped_message = _agent_message_envelope(
+        message,
+        sender_identity,
+        "parent",
+        thread_id=thread.thread_id,
+        thread_subject=thread.subject,
+    )
     try:
         msg_resp = await _post_child_message_event(
             server_client,
@@ -3361,17 +3763,20 @@ async def _send_to_existing_session(
             created_by=sender_identity.actor,
         )
     except httpx.HTTPError as exc:
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         if not coalesced:
             _runner_app.unregister_child_session(target_session_id)
             _runner_app.unregister_subagent_work(target_session_id)
         return f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
     if msg_resp.status_code >= 400:
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         if not coalesced:
             _runner_app.unregister_child_session(target_session_id)
             _runner_app.unregister_subagent_work(target_session_id)
         return _message_post_error(msg_resp, session_id=target_session_id, target_label="child")
     denial = event_denial_reason(msg_resp)
     if denial is not None:
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         # A policy denial answers 202, so the status check above misses it.
         # Without this the child never starts a turn while its work entry
         # stays "launching" forever — the child becomes permanently
@@ -3406,6 +3811,7 @@ async def _send_to_existing_session(
                 title=child_label or "",
                 wrapper_label=_session_wrapper_label(snap_data),
                 created_by=sender_identity.actor,
+                thread_id=thread.thread_id,
             )
             coalesced = False
 
@@ -3413,10 +3819,11 @@ async def _send_to_existing_session(
         _runner_app.note_subagent_work_send(
             target_session_id,
             work_id=work_entry.work_id,
-            sent_text=wrapped_message,
+            sent_text=cast(str, wrapped_message),
         )
         is None
     ):
+        _runner_app.rollback_message_thread(thread, minted=thread_minted)
         return json.dumps({"error": "dispatch_superseded", "conversation_id": target_session_id})
     return json.dumps(
         {
@@ -3428,6 +3835,9 @@ async def _send_to_existing_session(
             # otherwise indistinguishable in the inbox; work_id is what
             # matches a delivered result back to the send that caused it.
             "work_id": work_entry.work_id,
+            "thread_id": thread.thread_id,
+            "thread_subject": thread.subject,
+            "thread_message_count": thread.message_count,
             "kind": "sub_agent",
             "agent": agent_label,
             "title": child_label,
@@ -8565,10 +8975,14 @@ async def _execute_async_inbox_tool(
     """
     del harness_client
     if tool_name == SysReadInboxTool.name():
+        thread_filter = args.get("thread_id")
+        if not isinstance(thread_filter, str):
+            thread_filter = None
         return await _drain_inbox(
             session_inbox,
             server_client=server_client,
             conversation_id=conversation_id,
+            thread_id=thread_filter,
         )
 
     if tool_name == SysCallAsyncTool.name():
@@ -8673,23 +9087,28 @@ def _format_async_task_item(payload: _JsonObject) -> str:
         # which of its requests this result answers.
         work_id = payload.get("work_id")
         dispatch = f" (dispatch {work_id})" if work_id else ""
+        thread_id = payload.get("thread_id")
+        thread = f" (thread {thread_id})" if thread_id else ""
         if status == "completed":
             if not has_output:
                 return (
-                    f"[System: sub-agent task {handle_id} completed{dispatch} — "
+                    f"[System: sub-agent task {handle_id} completed{dispatch}{thread} — "
                     f"{target} produced no output]"
                 )
             return (
-                f"[System: sub-agent task {handle_id} completed{dispatch} — "
+                f"[System: sub-agent task {handle_id} completed{dispatch}{thread} — "
                 f"{target} returned: {output}]"
             )
         if status == "failed":
             return (
-                f"[System: sub-agent task {handle_id} failed{dispatch} — {target} error: {output}]"
+                f"[System: sub-agent task {handle_id} failed{dispatch}{thread} — "
+                f"{target} error: {output}]"
             )
         if status == "cancelled":
-            return f"[System: sub-agent task {handle_id} cancelled{dispatch} — {target}]"
-        return f"[System: sub-agent task {handle_id} {status}{dispatch} — {target}: {output}]"
+            return f"[System: sub-agent task {handle_id} cancelled{dispatch}{thread} — {target}]"
+        return (
+            f"[System: sub-agent task {handle_id} {status}{dispatch}{thread} — {target}: {output}]"
+        )
     if status == "completed":
         if not has_output:
             return f"[System: task {handle_id} completed — {tool} produced no output]"
@@ -8767,6 +9186,8 @@ async def _post_subagent_policy_verdict(
     :param server_client: HTTP client pointed at Omnigent server.
     :param conversation_id: Parent session id, e.g.
         ``"conv_parent123"``.
+    :param thread_id: Optional thread filter; non-matching payloads remain
+        queued and are not policy-evaluated.
     :param payload: Completed sub-agent inbox payload.
     :param output: Raw child output text.
     :returns: Parsed policy verdict, or ``None`` on failure.
@@ -8918,6 +9339,7 @@ async def _drain_inbox(
     *,
     server_client: httpx.AsyncClient | None = None,
     conversation_id: str | None = None,
+    thread_id: str | None = None,
 ) -> str:
     """
     Non-blocking drain of the per-session inbox queue.
@@ -8933,15 +9355,22 @@ async def _drain_inbox(
     :returns: Formatted string of completed tasks.
     """
     if inbox is None or inbox.empty():
+        if thread_id is not None:
+            return f"[System: no messages on thread {thread_id}; inbox is empty.]"
         return "Inbox is empty — no completed tasks."
     items: list[str] = []
+    item_thread_ids: list[str | None] = []
     retry_payloads: list[_JsonObject] = []
+    filtered_payloads: list[_JsonObject] = []
     deferred_payloads: list[_JsonObject] = []
     while not inbox.empty():
         try:
             payload = inbox.get_nowait()
         except asyncio.QueueEmpty:
             break
+        if thread_id is not None and payload.get("thread_id") != thread_id:
+            filtered_payloads.append(payload)
+            continue
         if payload.get("type") == "terminal_idle":
             try:
                 formatted_item = _format_terminal_idle_item(payload)
@@ -8964,20 +9393,18 @@ async def _drain_inbox(
             retry_original = evaluation.retry_original
             evaluated_payload = evaluation.payload
 
-        remaining_if_returned = inbox.qsize() + len(retry_payloads) + int(retry_original)
         candidate_items = [*items, formatted_item]
         candidate = "\n\n".join(candidate_items)
-        if remaining_if_returned:
-            remaining_line = (
-                f"[System: {remaining_if_returned} message(s) remain queued; "
-                "call sys_read_inbox again to receive them.]"
-            )
-            candidate = f"{candidate}\n\n{remaining_line}"
         if items and len(candidate) > _INBOX_DRAIN_MAX_CHARS:
             deferred_payloads.append(payload)
             break
 
         items.append(formatted_item)
+        item_thread_ids.append(
+            payload.get("thread_id")
+            if isinstance(payload.get("thread_id"), str) and payload.get("thread_id")
+            else None
+        )
         if retry_original:
             retry_payloads.append(payload)
         else:
@@ -8989,19 +9416,64 @@ async def _drain_inbox(
             tail.append(inbox.get_nowait())
         except asyncio.QueueEmpty:
             break
-    for payload in [*retry_payloads, *deferred_payloads, *tail]:
+    remaining_payloads = [*retry_payloads, *filtered_payloads, *deferred_payloads, *tail]
+    for payload in remaining_payloads:
         inbox.put_nowait(payload)
 
     if not items:
+        if thread_id is not None:
+            if not remaining_payloads:
+                return f"[System: no messages on thread {thread_id}; inbox is empty.]"
+            return (
+                f"[System: no messages on thread {thread_id}; "
+                f"{len(remaining_payloads)} message(s) remain on other threads "
+                f"({_format_remaining_thread_counts(remaining_payloads)}).]"
+            )
         return "Inbox is empty — no completed tasks."
+    if thread_id is None and any(value is not None for value in item_thread_ids):
+        grouped: dict[str, list[str]] = {}
+        group_order: list[str] = []
+        for rendered, item_thread_id in zip(items, item_thread_ids, strict=True):
+            group = item_thread_id or "unthreaded"
+            if group not in grouped:
+                grouped[group] = []
+                group_order.append(group)
+            grouped[group].append(rendered)
+        items = [
+            rendered
+            for group in group_order
+            for rendered in [
+                f"[System: thread {group}]" if group != "unthreaded" else "[System: unthreaded]",
+                *grouped[group],
+            ]
+        ]
     remaining_count = inbox.qsize()
     if remaining_count:
+        if thread_id is not None:
+            remaining_line = (
+                f"[System: {remaining_count} message(s) remain queued "
+                f"({_format_remaining_thread_counts(remaining_payloads)}); "
+                "call sys_read_inbox again with that thread_id or with no filter.]"
+            )
+            return "\n\n".join([*items, remaining_line])
         remaining_line = (
             f"[System: {remaining_count} message(s) remain queued; "
             "call sys_read_inbox again to receive them.]"
         )
         return "\n\n".join([*items, remaining_line])
     return "\n\n".join(items)
+
+
+def _format_remaining_thread_counts(payloads: list[_JsonObject]) -> str:
+    """Describe queued thread populations without exposing item contents."""
+    counts: dict[str, int] = {}
+    for payload in payloads:
+        value = payload.get("thread_id")
+        key = value if isinstance(value, str) and value else "unthreaded"
+        counts[key] = counts.get(key, 0) + 1
+    return ", ".join(
+        f"{thread_id} x{count}" if count > 1 else thread_id for thread_id, count in counts.items()
+    )
 
 
 async def _evaluate_async_tool_call_policy(
