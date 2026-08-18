@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -820,6 +821,53 @@ def test_session_list_surfaces_free_form_titled_child(session_fixture: _Fixture)
     }
     # The conventional child is unaffected.
     assert listed[session_fixture.child_conv_id]["agent"] == "researcher"
+
+
+def test_runner_session_list_rows_have_status_and_extend_legacy_shape() -> None:
+    """The runner projection adds status while preserving the old row shape."""
+    from omnigent.runner.tool_dispatch import _child_rows_to_entries
+
+    rows = [
+        {
+            "id": "conv_named",
+            "title": "researcher:auth",
+            "tool": "researcher",
+            "session_name": "auth",
+            "sub_agent_name": "researcher",
+            "busy": True,
+            "current_task_status": "in_progress",
+            "updated_at": 123,
+            "last_task_error": None,
+            "pending_elicitations_count": 0,
+            "labels": {},
+            "task_summary": "Inspect auth",
+        },
+        {
+            "id": "conv_freeform",
+            "title": "bug: login 500",
+            "tool": "bug",
+            "session_name": "login 500",
+            "sub_agent_name": None,
+            "busy": False,
+            "current_task_status": "completed",
+            "updated_at": 124,
+            "last_task_error": None,
+            "pending_elicitations_count": 0,
+            "labels": {},
+            "task_summary": None,
+        },
+    ]
+    entries = _child_rows_to_entries(rows, SimpleNamespace(sub_agents=[]))
+
+    assert all("current_task_status" in entry for entry in entries)
+    recorded_pre_change = {
+        "agent": "researcher",
+        "title": "auth",
+        "conversation_id": "conv_named",
+    }
+    post_change = entries[0]
+    assert recorded_pre_change.items() <= post_change.items()
+    assert set(recorded_pre_change) < set(post_change)
 
 
 def test_session_list_does_not_invent_an_agent_from_a_colon_in_a_free_form_title(
