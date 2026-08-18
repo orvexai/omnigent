@@ -107,6 +107,14 @@ _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
 _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT: int = 1000
 
 
+# Bound retries when a turn-end edge arrives before its mirrored transcript.
+_MAX_CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRALS: int = 2
+
+
+# Exceed the ~660 s worst supported gap between the second rejection and retry.
+_CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRAL_TTL_S: int = 900
+
+
 _EXTERNAL_COMPACTION_STATUS_TYPE: str = "external_compaction_status"
 
 
@@ -584,6 +592,14 @@ _pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = 
 )
 
 
+# Keep per-session retry state bounded without adding persistence or worker coordination.
+_claude_native_subagent_idle_deferrals: cachetools.TTLCache[str, int] = cachetools.TTLCache(
+    maxsize=512,
+    ttl=_CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRAL_TTL_S,
+)
+_claude_native_subagent_idle_deferral_capacity_logged = False
+
+
 _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 
 
@@ -794,6 +810,7 @@ __all__ = [
     "_CLAUDE_NATIVE_MODEL",
     "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
     "_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS",
+    "_CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRAL_TTL_S",
     "_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY",
     "_CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
     "_CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY",
@@ -870,6 +887,7 @@ __all__ = [
     "_LAST_TASK_ERROR_REMEDIATION_LABEL_KEY",
     "_LAST_TASK_ERROR_TITLE_LABEL_KEY",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
+    "_MAX_CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRALS",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",
     "_MCP_ELICITATION_TYPE",
@@ -911,6 +929,8 @@ __all__ = [
     "_browser_action_owners",
     "_browser_action_registry",
     "_catalog_prefetch_tasks",
+    "_claude_native_subagent_idle_deferral_capacity_logged",
+    "_claude_native_subagent_idle_deferrals",
     "_deferred_elicitation_clear_tasks",
     "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",

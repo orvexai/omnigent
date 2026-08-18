@@ -169,6 +169,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _child_session_summaries_from_conversations,
+    _defer_claude_native_subagent_idle_status,
     _dispatch_session_event_to_runner,
     _enrich_idle_status_with_subagent_output,
     _ensure_native_terminal_ready,
@@ -1065,6 +1066,9 @@ def register_events_routes(
             forward_body = body.model_dump()
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
                 forward_body["data"], status, session_id, conversation_store
+            )
+            _defer_claude_native_subagent_idle_status(
+                forward_body["data"], status, conv, session_id
             )
             runner_result = await _forward_session_change_to_runner(
                 session_id,

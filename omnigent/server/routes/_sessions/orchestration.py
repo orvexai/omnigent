@@ -23,6 +23,14 @@ from fastapi import (
 from fastapi.responses import Response
 from pydantic import ValidationError
 
+# Shared constants, state, and small dataclasses live in the _sessions.common
+# leaf module; import them here so this module and its re-exporters see the same
+# objects. The mutable caches are shared by reference across the package.
+# Runtime bindings that tests patch on the historical ``sessions`` facade are
+# imported from common as facade-delegating proxies. They stay out of common's
+# ``__all__`` and the facade's explicit re-exports, preserving its real runtime
+# bindings so a facade-level monkeypatch is honoured in this module too.
+import omnigent.server.routes._sessions.common as _sessions_common
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.entities import (
     Agent,
@@ -128,14 +136,6 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_agent,
     validate_session_model_metadata,
 )
-
-# Shared constants, state, and small dataclasses live in the _sessions.common
-# leaf module; import them here so this module and its re-exporters see the same
-# objects. The mutable caches are shared by reference across the package.
-# Runtime bindings that tests patch on the historical ``sessions`` facade are
-# imported from common as facade-delegating proxies. They stay out of common's
-# ``__all__`` and the facade's explicit re-exports, preserving its real runtime
-# bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
     _CLAUDE_NATIVE_MODEL,
@@ -150,6 +150,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _LAST_CONTEXT_TOKENS_LABEL_KEY,
     _LAST_CONTEXT_WINDOW_LABEL_KEY,
     _MANAGED_RESUMABLE_TUNNEL_STALE_S,
+    _MAX_CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRALS,
     _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER,
     _MODEL_TOKEN_KEYS,
     _PI_NATIVE_WRAPPER_LABEL_VALUE,
@@ -159,6 +160,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL,
+    _claude_native_subagent_idle_deferrals,
     _deferred_elicitation_clear_tasks,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
@@ -223,6 +225,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _handle_advise_models_mcp,
     _invalidate_runner_backed_snapshot_state,
+    _is_claude_native_subagent,
     _is_codex_native_subagent,
     _is_kiro_native_session,
     _is_native_interrupt_record,
@@ -2221,6 +2224,54 @@ async def _enrich_idle_status_with_subagent_output(
     if output is None:
         return data
     return {**data, "output": output}
+
+
+def _defer_claude_native_subagent_idle_status(
+    data: dict[str, Any],
+    status: str,
+    conv: Conversation,
+    session_id: str,
+) -> None:
+    """
+    Reject an empty Claude-native child idle edge while its transcript can arrive.
+
+    :param data: The enriched external status payload.
+    :param status: Status edge being forwarded.
+    :param conv: Conversation row for the status edge.
+    :param session_id: Session id for the status edge.
+    :returns: ``None`` when the edge may continue to runner forwarding.
+    :raises OmnigentError: With a retryable conflict while the deferral budget
+        remains.
+    """
+    key = session_id
+    if "output" in data:
+        _claude_native_subagent_idle_deferrals.pop(key, None)
+        return
+    if status != "idle" or not _is_claude_native_subagent(conv):
+        return
+    _claude_native_subagent_idle_deferrals.expire()
+    is_new_key = key not in _claude_native_subagent_idle_deferrals
+    if is_new_key and len(_claude_native_subagent_idle_deferrals) >= (
+        _claude_native_subagent_idle_deferrals.maxsize
+    ):
+        if not _sessions_common._claude_native_subagent_idle_deferral_capacity_logged:
+            _logger.warning(
+                "Claude-native sub-agent idle deferral is inactive: cache size=%d maxsize=%d",
+                len(_claude_native_subagent_idle_deferrals),
+                _claude_native_subagent_idle_deferrals.maxsize,
+            )
+            _sessions_common._claude_native_subagent_idle_deferral_capacity_logged = True
+        return
+    if is_new_key:
+        _sessions_common._claude_native_subagent_idle_deferral_capacity_logged = False
+    attempt = _claude_native_subagent_idle_deferrals.get(key, 0) + 1
+    if attempt <= _MAX_CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRALS:
+        _claude_native_subagent_idle_deferrals[key] = attempt
+        raise OmnigentError(
+            "Claude-native sub-agent turn-end edge arrived before the transcript mirror",
+            code=ErrorCode.CONFLICT,
+        )
+    _claude_native_subagent_idle_deferrals.pop(key, None)
 
 
 async def _heal_subagent_runner_binding_via_parent(
@@ -9230,6 +9281,7 @@ __all__ = [
     "_child_session_summaries_from_conversations",
     "_create_session_from_bundle",
     "_create_session_from_existing_agent",
+    "_defer_claude_native_subagent_idle_status",
     "_detached_stop_tasks",
     "_dispatch_session_event_to_runner",
     "_drive_terminal_resolved_elicitation",

@@ -51,10 +51,15 @@ def _clean_pending_elicitations_index() -> Any:
     inflate another's count (the ``== 0`` assertions would break).
     """
     from omnigent.runtime import pending_elicitations
+    from omnigent.server.routes._sessions.common import (
+        _claude_native_subagent_idle_deferrals,
+    )
 
     pending_elicitations.reset_for_tests()
+    _claude_native_subagent_idle_deferrals.clear()
     yield
     pending_elicitations.reset_for_tests()
+    _claude_native_subagent_idle_deferrals.clear()
 
 
 # ── Helpers ──────────────────────────────────────────────
@@ -1741,6 +1746,25 @@ async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale
         sessions_module, "_recover_subagent_status_forward_via_parent", _recover_spy
     )
 
+    # A finished child turn has assistant text; keep recovery independent of transcript deferral.
+    item_resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": "resp_recovery_ok",
+                "source_id": "src_recovery_ok",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": "RECOVERY_OK"}],
+                },
+            },
+        },
+    )
+    assert item_resp.status_code == 202, item_resp.text
+
     resp = await client.post(
         f"/v1/sessions/{child['id']}/events",
         json={"type": "external_session_status", "data": {"status": "idle"}},
@@ -1784,6 +1808,27 @@ async def test_subagent_background_task_count_still_delivers_to_parent(
         sessions_module, "_recover_subagent_status_forward_via_parent", _recover_spy
     )
 
+    # A finished child turn has assistant text; keep recovery independent of transcript deferral.
+    item_resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": "resp_recovery_background",
+                "source_id": "src_recovery_background",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [
+                        {"type": "output_text", "text": "RECOVERY_BACKGROUND"},
+                    ],
+                },
+            },
+        },
+    )
+    assert item_resp.status_code == 202, item_resp.text
+
     resp = await client.post(
         f"/v1/sessions/{child['id']}/events",
         json={
@@ -1824,12 +1869,80 @@ async def test_subagent_idle_forward_503s_when_recovery_also_fails(
         sessions_module, "_recover_subagent_status_forward_via_parent", _recover_none
     )
 
+    # A finished child turn has assistant text; keep recovery independent of transcript deferral.
+    item_resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": "resp_recovery_fail",
+                "source_id": "src_recovery_fail",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": "RECOVERY_FAIL"}],
+                },
+            },
+        },
+    )
+    assert item_resp.status_code == 202, item_resp.text
+
     resp = await client.post(
         f"/v1/sessions/{child['id']}/events",
         json={"type": "external_session_status", "data": {"status": "idle"}},
     )
 
     assert resp.status_code == 503, resp.text
+
+
+async def test_subagent_idle_forward_defers_then_still_reaches_recovery(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty Claude-native idle edges defer before stale-binding recovery."""
+    from omnigent.server.routes._sessions.common import (
+        _MAX_CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRALS,
+    )
+
+    child = await _create_native_child(client, name="orch-recover-deferred")
+
+    async def _forward_none(*_args: Any, **_kwargs: Any) -> None:
+        """Child's pinned runner is unreachable — the direct forward fails."""
+        return
+
+    recovered_for: list[str] = []
+
+    async def _recover_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        """Stand in for recovery and record when the give-up attempt reaches it."""
+        recovered_for.append(child_conv.id)
+        return sessions_module._RunnerForwardResult(status_code=202, body="")
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
+    monkeypatch.setattr(
+        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_spy
+    )
+
+    status_payload = {
+        "type": "external_session_status",
+        "data": {"status": "idle", "response_id": "resp_recovery_deferred"},
+    }
+    for _ in range(_MAX_CLAUDE_NATIVE_SUBAGENT_IDLE_DEFERRALS):
+        resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json=status_payload,
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"]["code"] == "conflict"
+        assert recovered_for == []
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json=status_payload,
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert recovered_for == [child["id"]]
 
 
 # ── message-send stale-runner heal (issue #3067) ─────────────────────────────
