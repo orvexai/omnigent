@@ -33,7 +33,9 @@ env:
   PIP_INDEX_URL: https://pypi.org/simple
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  # Branch-keyed so a newer push cancels the older run: sixteen shards per
+  # push would otherwise stack up and starve the four-runner pool.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
