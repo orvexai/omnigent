@@ -120,6 +120,7 @@ from omnigent.tools.builtins.timer import (
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
+from omnigent.tools.schema_validation import validate_tool_arguments
 
 _logger = logging.getLogger(__name__)
 
@@ -7905,6 +7906,20 @@ async def execute_tool(
     if error is not None:
         return json.dumps({"error": error})
     assert args is not None
+
+    # Runner-owned builtins bypass ToolManager.invoke(), so apply the same
+    # executable schema contract before choosing a dispatch branch. MCP-owned
+    # tools are checked by their manager against the discovered MCP schema.
+    if agent_spec is not None:
+        registered_tool = ToolManager(agent_spec).get_tool(tool_name)
+        if registered_tool is not None:
+            schema = registered_tool.get_schema()
+            function = schema.get("function")
+            parameters = function.get("parameters") if isinstance(function, dict) else None
+            if isinstance(parameters, dict):
+                validation_error = validate_tool_arguments(tool_name, args, parameters)
+                if validation_error is not None:
+                    return f"Error: {validation_error}"
 
     try:
         if mcp_manager is not None:

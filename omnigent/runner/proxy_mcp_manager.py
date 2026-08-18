@@ -36,6 +36,7 @@ from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
 from omnigent.spec.types import AgentSpec
+from omnigent.tools.schema_validation import validate_tool_arguments
 
 _logger = logging.getLogger(__name__)
 
@@ -101,6 +102,7 @@ class ProxyMcpManager:
         self._session_id = session_id
         self._omnigent_client = ap_client
         self._publish_event = publish_event
+        self._schemas: dict[str, _JsonObject] = {}
 
     @property
     def _mcp_url(self) -> str:
@@ -216,6 +218,13 @@ class ProxyMcpManager:
             schemas.append(schema)
             tool_names.add(name)
 
+        self._schemas = {
+            name: parameters
+            for schema in schemas
+            if isinstance(name := schema.get("name"), str)
+            and isinstance(parameters := schema.get("parameters"), dict)
+        }
+
         return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures={})
 
     async def call_tool(
@@ -247,6 +256,12 @@ class ProxyMcpManager:
         :raises RuntimeError: On network failure or unexpected protocol errors.
         """
         del spec  # Omnigent server resolves spec from session context
+
+        parameters = self._schemas.get(tool_name)
+        if parameters is not None:
+            validation_error = validate_tool_arguments(tool_name, arguments, parameters)
+            if validation_error is not None:
+                raise ValueError(validation_error)
 
         payload: _JsonObject = {
             "jsonrpc": "2.0",

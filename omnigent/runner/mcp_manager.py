@@ -19,6 +19,7 @@ from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.spec.types import AgentSpec, MCPServerConfig, RetryPolicy
 from omnigent.tools.base import is_valid_tool_name
 from omnigent.tools.mcp import McpServerConnection
+from omnigent.tools.schema_validation import validate_tool_arguments
 
 _logger = logging.getLogger(__name__)
 
@@ -462,6 +463,19 @@ class RunnerMcpManager:
             owning_server, bare_name = route
             if owning_server.connection is None:
                 raise RuntimeError(f"runner has no live MCP serving tool {tool_name!r}")
+
+            tool_def = next(
+                (candidate for candidate in owning_server.tools if candidate.name == bare_name),
+                None,
+            )
+            if tool_def is not None and isinstance(tool_def.inputSchema, dict):
+                validation_error = validate_tool_arguments(
+                    tool_name,
+                    arguments,
+                    tool_def.inputSchema,
+                )
+                if validation_error is not None:
+                    raise ValueError(validation_error)
 
             return await owning_server.connection.call_tool(
                 bare_name,
