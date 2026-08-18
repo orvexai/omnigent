@@ -196,7 +196,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
-    _adopt_durable_status,
     _antigravity_subagent_labels_from_body,
     _antigravity_subagent_title,
     _await_settled_managed_launch,
@@ -284,7 +283,6 @@ from omnigent.server.routes._sessions.helpers import (
     _require_declared_subagent,
     _require_external_status_forward,
     _resolve_harness,
-    _resolve_liveness_decision,
     _resolve_llm_model,
     _resolve_subagent_spec,
     _resource_event_item_from_sse,
@@ -600,15 +598,9 @@ async def _best_effort_stop(
         resolution, or ``None`` in tests / in-process setups.
     """
     try:
-        conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
-        own_status = _session_status_from_cache(
-            session_id,
-            getattr(conversation, "live_status", None),
-        )
-        status = own_status
-        if status != "running":
-            status = _session_status_with_child_rollup(session_id, descendant_ids)
+        status = _session_status_with_child_rollup(session_id, descendant_ids)
+        own_status = _session_status_from_cache(session_id)
     except Exception:  # noqa: BLE001
         _logger.debug(
             "Best-effort stop failed for %s; proceeding anyway",
@@ -639,19 +631,7 @@ async def _best_effort_stop(
     if own_status == "running" or has_background_tasks:
         await _stop(session_id)
     for descendant_id in descendant_ids:
-        try:
-            descendant = await asyncio.to_thread(
-                conversation_store.get_conversation, descendant_id
-            )
-        except Exception:  # noqa: BLE001
-            descendant = None
-        if (
-            _session_status_from_cache(
-                descendant_id,
-                getattr(descendant, "live_status", None),
-            )
-            == "running"
-        ):
+        if _session_status_cache.get(descendant_id) in ("running", "waiting"):
             await _stop(descendant_id)
 
 
@@ -2562,7 +2542,7 @@ async def _publish_runner_recovered_status_impl(
             last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
         if last_error is None or last_error.get("code") != "runner_disconnected":
             return
-    _adopt_durable_status(session_id, "idle")
+    _session_status_cache[session_id] = "idle"
     session_live_state.persist_live_status(session_id, "idle")
     event = SessionStatusEvent(
         type="session.status",
@@ -2619,30 +2599,15 @@ async def _mark_runner_sessions_offline_impl(
         # consumes the marker — so peek without discarding here.
         if conv.id in _intentional_stop_sessions:
             continue
-        decision = _resolve_liveness_decision(
-            _session_status_cache.get(conv.id),
-            conv.live_status,
-        )
-        if decision == "adopt_row":
-            _adopt_durable_status(conv.id, conv.live_status)
+        # Cache first (this replica holds the runner's tunnel, so it saw the
+        # turn edges), falling back to the row for a session whose live state
+        # was published before a restart.
+        live = _session_status_cache.get(conv.id, conv.live_status)
+        interrupted = live in ("running", "waiting")
         dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
-        if decision != "fail" and not dead_on_arrival:
+        if not interrupted and not dead_on_arrival:
             continue
-        persist_status = True
-        if decision == "fail":
-            try:
-                claimed = await asyncio.to_thread(
-                    conversation_store.set_session_live_status_if_busy,
-                    conv.id,
-                    "failed",
-                )
-            except Exception:  # noqa: BLE001 — preserve the best-effort failure path
-                _logger.exception("Failed to claim disconnected session status: %s", conv.id)
-            else:
-                if not claimed:
-                    continue
-                persist_status = False
-        _publish_status(conv.id, "failed", error, persist_status=persist_status)
+        _publish_status(conv.id, "failed", error)
         await _persist_session_status_error_labels(conv.id, error, conversation_store)
 
 
@@ -5777,9 +5742,8 @@ async def _relay_runner_stream(
                 )
             else:
                 cached_status = _session_status_cache.get(session_id)
-                row_status: str | None = None
-                row_read_succeeded = False
-                if conversation_store is not None:
+                persisted_status = None
+                if cached_status is None and conversation_store is not None:
                     try:
                         conv = await asyncio.to_thread(
                             conversation_store.get_conversation,
@@ -5790,43 +5754,18 @@ async def _relay_runner_stream(
                             "Failed to read session status after runner transport loss: %s",
                             session_id,
                         )
-                    else:
-                        row_read_succeeded = True
-                        row_status = getattr(conv, "live_status", None)
-                decision = _resolve_liveness_decision(cached_status, row_status)
-                if decision == "adopt_row":
-                    _adopt_durable_status(session_id, row_status)
-                if decision != "fail":
+                        return
+                    persisted_status = getattr(conv, "live_status", None)
+                live_status = cached_status if cached_status is not None else persisted_status
+                if live_status not in ("running", "waiting"):
                     return
-                persist_status = True
-                if conversation_store is not None and row_read_succeeded:
-                    try:
-                        claimed = await asyncio.to_thread(
-                            conversation_store.set_session_live_status_if_busy,
-                            session_id,
-                            "failed",
-                        )
-                    except Exception:  # noqa: BLE001 — preserve the best-effort failure path
-                        _logger.exception(
-                            "Failed to claim disconnected session status: %s",
-                            session_id,
-                        )
-                    else:
-                        if not claimed:
-                            return
-                        persist_status = False
                 # Publish a failed status so the client's SSE stream sees a
                 # clean error event instead of silent truncation (#1114).
                 disconnect_error = ErrorDetail(
                     code="runner_disconnected",
                     message="Runner disconnected unexpectedly.",
                 )
-                _publish_status(
-                    session_id,
-                    "failed",
-                    disconnect_error,
-                    persist_status=persist_status,
-                )
+                _publish_status(session_id, "failed", disconnect_error)
                 # Persist the disconnect cause as durable labels so the
                 # distinction survives into snapshots and child-session
                 # summaries. Without this the relay-fed cache only carries a

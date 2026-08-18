@@ -1,6 +1,6 @@
 """Tests for the session live-state persistence chokepoint.
 
-Covers ``omnigent.server.session_live_state``: status writes are submitted,
+Covers ``omnigent.server.session_live_state``: writes are deduplicated,
 ordered, and best-effort, and the pending-elicitations index drives the
 persisted count through its hook. These writes are what let a replica
 that does NOT hold a session's runner tunnel serve the sidebar's live
@@ -80,43 +80,23 @@ def recording_store() -> _RecordingStore:
     pending_elicitations.set_count_persist_hook(None)
 
 
-def test_persist_live_status_forwards_repeats_to_sql_dedupe(
-    recording_store: _RecordingStore,
-) -> None:
-    """Every encoded publish reaches the store, whose SQL dedupes repeats."""
+def test_persist_live_status_dedupes_transitions(recording_store: _RecordingStore) -> None:
+    """Only actual transitions reach the store; re-publishes are dropped.
+
+    The SSE relay republishes statuses freely (e.g. a PTY watcher's
+    repeated ``idle``); without dedupe every list tick would turn into
+    row churn on the conversations table.
+    """
     session_live_state.persist_live_status("conv_1", "running")
     session_live_state.persist_live_status("conv_1", "running")
     session_live_state.persist_live_status("conv_1", "idle")
     session_live_state.persist_live_status("conv_2", "idle")
-    _wait_until(lambda: len(recording_store.status_writes) >= 4)
+    _wait_until(lambda: len(recording_store.status_writes) >= 3)
     assert recording_store.status_writes == [
-        ("conv_1", "running"),
         ("conv_1", "running"),
         ("conv_1", "idle"),
         ("conv_2", "idle"),
     ]
-
-
-def test_idle_running_idle_republishes_terminal_edge(recording_store: _RecordingStore) -> None:
-    """A pod must rewrite idle after another pod changes the shared row."""
-    row = {"conv_1": "idle"}
-
-    def set_status(conversation_id: str, status: str) -> None:
-        row[conversation_id] = status
-        recording_store.status_writes.append((conversation_id, status))
-
-    recording_store.set_session_live_status = set_status  # type: ignore[method-assign]
-    session_live_state.persist_live_status("conv_1", "idle")
-    session_live_state.persist_live_status("conv_1", "running")
-    session_live_state.persist_live_status("conv_1", "idle")
-    _wait_until(lambda: len(recording_store.status_writes) == 3)
-
-    assert recording_store.status_writes == [
-        ("conv_1", "idle"),
-        ("conv_1", "running"),
-        ("conv_1", "idle"),
-    ]
-    assert row["conv_1"] == "idle"
 
 
 def test_pending_count_hook_persists_publish_and_resolve(
@@ -206,25 +186,45 @@ def test_write_runs_in_callers_workspace_scope(recording_store: _RecordingStore)
     assert seen == [4242], "write thread did not observe the caller's bound workspace"
 
 
-def test_dropped_terminal_write_is_best_effort() -> None:
-    """A failed background write is logged and does not retry in this unit."""
+def test_dropped_write_evicts_dedupe_entry_for_retry() -> None:
+    """A dropped best-effort write must not pin a stale dedupe entry.
+
+    ``persist_live_status`` records the value in its dedupe cache before
+    enqueueing the (best-effort) write. If that write is dropped, a later
+    *identical* publish would be deduped away and the row would stay stale
+    until a different value arrived. On failure the entry is evicted, so
+    the next identical publish re-attempts the write.
+    """
     calls: list[tuple[str, str]] = []
 
     class _FlakyStore(_RecordingStore):
         def set_session_live_status(self, conversation_id: str, status: str) -> None:
             calls.append((conversation_id, status))
-            raise RuntimeError("boom")
+            if len(calls) == 1:
+                raise RuntimeError("boom")  # first attempt fails
+            super().set_session_live_status(conversation_id, status)
 
     store = _FlakyStore()
     session_live_state.configure(store)  # type: ignore[arg-type]
     try:
         session_live_state.persist_live_status("conv_1", "running")
-        _wait_until(lambda: len(calls) == 1)
+        # Wait for the EVICTION, not just the first call: the worker
+        # appends to ``calls`` and only then runs the failure callback that
+        # drops the dedupe entry. Gating the retry on "conv_1" leaving the
+        # dedupe map (the exact contract under test) removes the race where
+        # the second publish races the eviction and gets deduped away.
+        _wait_until(lambda: "conv_1" not in session_live_state._last_status)
+        assert "conv_1" not in session_live_state._last_status, "dropped write did not evict"
+
+        # Same value again: without the eviction above this would dedupe to
+        # a no-op; because the entry was cleared, the retry re-attempts.
+        session_live_state.persist_live_status("conv_1", "running")
+        _wait_until(lambda: bool(store.status_writes))
     finally:
         session_live_state.configure(None)
 
-    assert calls == [("conv_1", "running")]
-    assert store.status_writes == []
+    assert calls == [("conv_1", "running"), ("conv_1", "running")]
+    assert store.status_writes == [("conv_1", "running")], "retry never landed"
 
 
 def test_unencodable_status_is_dropped_before_enqueue(

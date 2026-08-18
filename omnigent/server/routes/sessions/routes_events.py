@@ -133,7 +133,6 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client_for_resource_access,
     _handle_external_session_todos,
     _is_codex_native_subagent,
-    _last_task_error_from_labels,
     _launch_runner_on_host,
     _persist_external_assistant_message,
     _persist_external_codex_approval_mode_change,
@@ -1061,29 +1060,14 @@ def register_events_routes(
             if effective_status != status:
                 status = effective_status
                 body.data["status"] = status
-            durable_error = _last_task_error_from_labels(conv.labels)
-            durable_code = durable_error.get("code") if durable_error is not None else None
-            published = _publish_status(
+            _publish_status(
                 session_id,
                 status,
                 status_error,
                 response_id=response_id,
                 background_task_count=bg_count,
                 blocked_on=blocked_on,
-                durable_status=conv.live_status,
-                durable_error_code=durable_code,
             )
-            if (
-                published
-                and status in {"idle", "failed"}
-                and durable_code == "runner_disconnected"
-            ):
-                await _persist_session_status_error_labels(
-                    session_id,
-                    None,
-                    conversation_store,
-                    only_if_disconnect=True,
-                )
             forward_body = body.model_dump()
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
                 forward_body["data"], status, session_id, conversation_store, conv

@@ -14,9 +14,11 @@ the synchronous source on the tunnel-holding replica; every cache write
 also enqueues a row write here. Writes are:
 
 - **best-effort** — a failed write logs and is dropped; live state is
-  display state, and the next transition rewrites it.
-- **ordered per pod** — a single-worker executor serializes submissions from
-  this process; it does not impose event order across pods.
+  display state, and the next transition rewrites it. A dropped write
+  also evicts its dedupe entry, so the next *identical* publish is not
+  swallowed and gets a fresh attempt (see :func:`_submit`).
+- **ordered** — a single-worker executor serializes writes, so a
+  ``running`` → ``idle`` pair can never apply out of order.
 - **off the event loop** — the store is synchronous SQLAlchemy; callers
   (the SSE relay, the tunnel handlers, the pub-sub hot path) only pay a
   dict check and a queue put. The write runs in a copy of the caller's
@@ -25,8 +27,8 @@ also enqueues a row write here. Writes are:
   worker thread; a bare executor would run at the default workspace and
   every ``WHERE workspace_id == …`` would match no rows on a multi-tenant
   replica.
-- **deduplicated** — SQL suppresses unchanged live-status values, while
-  pending-count writes retain their process-local dedupe.
+- **deduplicated** — re-publishing an unchanged status / count is a
+  no-op, so chatty relays don't turn into row churn.
 
 No-op until :func:`configure` wires a store (the server app does this at
 startup); the runner process and unit tests that never configure it are
@@ -63,9 +65,11 @@ _store: ConversationStore | None = None
 _scheduled_task_store: ScheduledTaskStore | None = None
 # Single worker => writes apply in submission order (see module docstring).
 _executor: ThreadPoolExecutor | None = None
-# Last unencodable status warned about per session. Unbounded like the
+# Last status seen per session, for dedupe — the value whose write was
+# enqueued, or (for an unencodable status) the value whose warning was
+# already logged, so repeats of either are suppressed. Unbounded like the
 # in-memory caches these writes mirror; entries live for the process.
-_warned_unencodable_status: dict[str, str] = {}
+_last_status: dict[str, str] = {}
 # Last count persisted per session, for dedupe.
 _last_pending: dict[str, int] = {}
 
@@ -86,16 +90,11 @@ def configure(
     global _store, _scheduled_task_store
     _store = store
     _scheduled_task_store = scheduled_task_store
-    _warned_unencodable_status.clear()
+    _last_status.clear()
     _last_pending.clear()
 
 
-def _submit(
-    description: str,
-    fn,
-    *args,
-    on_failure=None,
-) -> None:  # type: ignore[no-untyped-def]
+def _submit(description: str, fn, *args, on_failure=None) -> None:  # type: ignore[no-untyped-def]
     """
     Run one store write on the ordered background worker.
 
@@ -113,7 +112,9 @@ def _submit(
     :param fn: The store method to call.
     :param args: Arguments for *fn*.
     :param on_failure: Optional zero-arg callback run (on the worker
-        thread) when the write raises.
+        thread) when the write raises. Used to evict a dedupe entry so a
+        dropped write's value can be re-attempted by the next identical
+        publish instead of being swallowed.
     """
     global _executor
     if _executor is None:
@@ -136,8 +137,8 @@ def persist_live_status(session_id: str, status: str) -> None:
     """
     Persist a relay-observed turn status transition.
 
-    Called wherever ``_session_status_cache`` is written. Every encoded
-    status is forwarded to the store; SQL performs the cross-pod dedupe.
+    Called wherever ``_session_status_cache`` is written. Deduplicated:
+    only an actual transition reaches the database.
 
     :param session_id: Session/conversation identifier.
     :param status: One of ``idle`` / ``running`` / ``waiting`` / ``failed``.
@@ -146,21 +147,33 @@ def persist_live_status(session_id: str, status: str) -> None:
         return
     if status not in _KNOWN_LIVE_STATUSES:
         # ``SessionStatusEvent.status`` permits values the live-status codec
-        # can't encode (``"launching"``), so drop unknown values here.
-        if _warned_unencodable_status.get(session_id) != status:
+        # can't encode (``"launching"``), and the relay forwards raw event
+        # statuses. Drop unknown values here rather than at the store: the
+        # encode would raise, and the best-effort ``_evict`` on that failure
+        # would clear the dedupe entry, so every republish would re-attempt
+        # and re-log. Warn once (this transition is deduped away) and skip.
+        if _last_status.get(session_id) != status:
             _logger.warning(
                 "session live-state: skipping unencodable status %r for %s",
                 status,
                 session_id,
             )
-        _warned_unencodable_status[session_id] = status
+        _last_status[session_id] = status
         return
-    _submit(
-        "live_status",
-        _store.set_session_live_status,
-        session_id,
-        status,
-    )
+    if _last_status.get(session_id) == status:
+        return
+    _last_status[session_id] = status
+
+    def _evict() -> None:
+        # A dropped write must not leave the dedupe cache asserting this
+        # value reached the DB — otherwise a later identical publish is
+        # swallowed and the row stays stale until a *different* status
+        # arrives. Evict only if we still own the entry (a newer publish
+        # may have overwritten it, and its write is the live one).
+        if _last_status.get(session_id) == status:
+            _last_status.pop(session_id, None)
+
+    _submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
 
 
 def persist_scheduled_run_completion(

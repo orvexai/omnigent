@@ -2368,7 +2368,7 @@ def register_core_routes(
 
         # Switching mid-turn would tear the running harness subprocess out
         # from under an active stream. Reject; the caller retries when idle.
-        if _session_status_from_cache(session_id, session.live_status) == "running":
+        if _session_status_from_cache(session_id) == "running":
             raise OmnigentError(
                 "Session is busy — wait for the current turn to finish before switching agent.",
                 code=ErrorCode.CONFLICT,

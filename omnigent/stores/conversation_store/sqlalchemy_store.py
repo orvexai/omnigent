@@ -94,15 +94,6 @@ from omnigent.stores.conversation_store import (
     pinned_label_key,
 )
 
-_LAST_TASK_ERROR_LABEL_KEYS = (
-    "omnigent.last_task_error_code",
-    "omnigent.last_task_error_message",
-    "omnigent.last_task_error_title",
-    "omnigent.last_task_error_cause",
-    "omnigent.last_task_error_remediation",
-)
-_RUNNER_DISCONNECTED_ERROR_CODE = "runner_disconnected"
-
 _logger = logging.getLogger(__name__)
 
 # Server-side deadline (ms) for the content-search query in
@@ -3006,59 +2997,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.id == conversation_id,
-                    SqlConversationMetadata.live_status.is_distinct_from(
-                        encode_session_live_status(status)
-                    ),
                 )
                 .values(live_status=encode_session_live_status(status))
             )
-
-    def set_session_live_status_if_busy(self, conversation_id: str, status: str) -> bool:
-        """Set a terminal status only while the durable status is busy."""
-        target = encode_session_live_status(status)
-        with self._session("set_session_live_status_if_busy") as session:
-            result = session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id == conversation_id,
-                    SqlConversationMetadata.live_status.in_(
-                        (
-                            encode_session_live_status("running"),
-                            encode_session_live_status("waiting"),
-                        )
-                    ),
-                    SqlConversationMetadata.live_status.is_distinct_from(target),
-                )
-                .values(live_status=target)
-            )
-            return result.rowcount > 0
-
-    def clear_disconnect_error_labels_if_current(self, conversation_id: str) -> bool:
-        """Clear error labels only while the current code is a disconnect."""
-        code_label = aliased(SqlConversationLabel)
-        code_exists = (
-            select(1)
-            .where(
-                code_label.workspace_id == current_workspace_id(),
-                code_label.conversation_id == conversation_id,
-                code_label.key == _LAST_TASK_ERROR_LABEL_KEYS[0],
-                code_label.value == _RUNNER_DISCONNECTED_ERROR_CODE,
-            )
-            .exists()
-        )
-        with self._conv_session("clear_disconnect_error_labels_if_current") as session:
-            result = session.execute(
-                update(SqlConversationLabel)
-                .where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.conversation_id == conversation_id,
-                    SqlConversationLabel.key.in_(_LAST_TASK_ERROR_LABEL_KEYS),
-                    code_exists,
-                )
-                .values(value="")
-            )
-            return result.rowcount > 0
 
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         """

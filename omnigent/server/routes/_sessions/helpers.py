@@ -1143,42 +1143,6 @@ def _owner_from_grants(grants: list[SessionPermission]) -> str | None:
     return next((g.user_id for g in grants if g.level >= LEVEL_OWNER), None)
 
 
-_BUSY = ("running", "waiting")
-_TERMINAL = ("idle", "failed")
-_PASSIVELY_CLEARABLE_FAILURES = ("runner_disconnected",)
-
-
-def _resolve_liveness_decision(
-    cached: str | None,
-    row: str | None,
-) -> Literal["fail", "adopt_row", "decline"]:
-    """Decide what a runner departure means for one session."""
-    if cached in _BUSY:
-        return "adopt_row" if row in _TERMINAL else "fail"
-    if cached is not None:
-        return "decline"
-    return "fail" if row in _BUSY else "decline"
-
-
-def _resolve_idle_after_failure(
-    cached: str | None,
-    durable_status: str | None,
-    durable_error_code: str | None,
-) -> Literal["accept", "suppress"]:
-    """Decide whether a trailing idle may erase a failed state."""
-    if cached != "failed" and durable_status != "failed":
-        return "accept"
-    if durable_error_code in _PASSIVELY_CLEARABLE_FAILURES:
-        return "accept"
-    return "suppress"
-
-
-def _adopt_durable_status(session_id: str, status: str | None) -> None:
-    """Adopt the row's status into the local cache without publishing."""
-    if status is not None:
-        _session_status_cache[session_id] = status
-
-
 def _session_status_from_cache(
     conversation_id: str,
     db_status: str | None = None,
@@ -3738,11 +3702,7 @@ def _publish_status(
     response_id: str | None = None,
     background_task_count: int | None = None,
     blocked_on: str | None = None,
-    *,
-    durable_status: str | None = None,
-    durable_error_code: str | None = None,
-    persist_status: bool = True,
-) -> bool:
+) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
     update the cache the list endpoint reads.
@@ -3782,26 +3742,17 @@ def _publish_status(
     # in-process flow performs a legitimate ``failed`` → ``idle``
     # transition (compaction failure publishes ``running`` → ``idle``, not
     # ``failed``), so this is a safe, harness-agnostic invariant.
-    if (
-        status == "idle"
-        and _resolve_idle_after_failure(
-            _session_status_cache.get(session_id),
-            durable_status,
-            durable_error_code,
-        )
-        == "suppress"
-    ):
+    if status == "idle" and _session_status_cache.get(session_id) == "failed":
         # Session stays ``failed`` (terminal); the turn is over, so drop any
         # tracked in-flight response id rather than leaving it for the
         # snapshot to reopen a streaming bubble.
         _session_active_response_cache.pop(session_id, None)
-        return False
+        return
     _session_status_cache[session_id] = status
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
-    if persist_status:
-        session_live_state.persist_live_status(session_id, status)
+    session_live_state.persist_live_status(session_id, status)
     # Event-driven scheduled-run completion. A terminal edge (idle = the turn
     # completed; failed = it errored/disconnected) flips the conversation's
     # still-``running`` scheduled_task_run to succeeded/failed. This is the
@@ -3860,7 +3811,6 @@ def _publish_status(
     if blocked_on is None:
         payload.pop("blocked_on", None)
     session_stream.publish(session_id, payload)
-    return True
 
 
 def _truncate_label(value: str) -> str:
@@ -3886,8 +3836,6 @@ async def _persist_session_status_error_labels(
     session_id: str,
     error: ErrorDetail | None,
     conversation_store: ConversationStore,
-    *,
-    only_if_disconnect: bool = False,
 ) -> None:
     """
     Persist or clear the reload-visible failure detail for a session status.
@@ -3925,13 +3873,7 @@ async def _persist_session_status_error_labels(
         }
     )
     try:
-        if error is None and only_if_disconnect:
-            await asyncio.to_thread(
-                conversation_store.clear_disconnect_error_labels_if_current,
-                session_id,
-            )
-        else:
-            await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
+        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
     except Exception:  # noqa: BLE001
         _logger.exception(
             "Failed to persist session status error labels for %s",
@@ -6684,7 +6626,7 @@ async def _run_compact_locked(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         # Recheck after acquiring — a turn may have started while waiting.
-        if _session_status_from_cache(session_id, conv.live_status) == "running":
+        if _session_status_cache.get(session_id) in ("running", "waiting"):
             raise OmnigentError(
                 "Cannot compact while a turn is running; cancel or wait for it to finish first",
                 code=ErrorCode.CONFLICT,

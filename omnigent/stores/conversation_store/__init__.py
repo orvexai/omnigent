@@ -1252,22 +1252,11 @@ class ConversationStore(ABC):
 
         Written by the replica whose SSE relay observed the transition
         (idle/running/waiting/failed) so any replica's session list can
-        serve it. Implementations should deduplicate unchanged values in the
-        update statement. Must NOT bump ``updated_at``.
+        serve it. Must NOT bump ``updated_at``.
 
         :param conversation_id: Session/conversation identifier.
         :param status: One of ``enum_codecs.SESSION_LIVE_STATUS``.
         """
-        ...
-
-    @abstractmethod
-    def set_session_live_status_if_busy(self, conversation_id: str, status: str) -> bool:
-        """Set a terminal status only while the durable status is busy."""
-        ...
-
-    @abstractmethod
-    def clear_disconnect_error_labels_if_current(self, conversation_id: str) -> bool:
-        """Clear error labels only when their code is runner-disconnected."""
         ...
 
     @abstractmethod
