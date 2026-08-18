@@ -6,6 +6,7 @@ from sqlalchemy import Engine, delete, update
 
 from omnigent.db.db_models import SqlRunnerTunnel, current_workspace_id
 from omnigent.db.utils import make_named_managed_session_maker, now_epoch
+from omnigent.stores.conversation_store import runner_seen_is_fresh
 
 
 class RunnerTunnelStore:
@@ -65,7 +66,13 @@ class RunnerTunnelStore:
             )
 
     def owner(self, runner_id: str) -> str | None:
-        """Return the durable owner address for a runner, if claimed."""
+        """Return a fresh durable owner address for a runner, if claimed.
+
+        The tunnel ping loop refreshes this lease; stale rows are treated as
+        absent so they cannot trigger a forward to a dead replica.
+        """
         with self._session("lookup_runner_tunnel") as session:
             row = session.get(SqlRunnerTunnel, (current_workspace_id(), runner_id))
-            return row.owner_addr if row is not None else None
+            if row is None or not runner_seen_is_fresh(row.updated_at):
+                return None
+            return row.owner_addr
