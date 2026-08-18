@@ -1,93 +1,34 @@
-# Agent guidance
+## omnigent
 
-Guidance for AI agents (Claude Code, Copilot, Cursor, etc.) working in this
-repository. See `CONTRIBUTING.md` for the full contributor workflow.
+Omnigent is an open-source meta-harness for running and governing AI agents. The Python 3.12 application lives in `omnigent/`; React/Vite, desktop, mobile, and editor clients live under `web/` and `editors/`. Contributor guidance lives in `CONTRIBUTING.md`, deeper system material in `docs/`, and BMad planning output in `_bmad-output/planning-artifacts/`.
 
-## Committing
+## Policy
 
-Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
-let it run on staged files via `git commit`). Fix any issues it reports so the
-commit lands clean — CI runs the same checks.
+- Never commit org-specific changes to `main`; it is an exact fast-forward mirror of upstream. Keep org customizations on `orvex`.
+- Sign off every commit with `git commit -s`.
+- Before committing, run the pre-commit hook and fix everything it reports.
+- Every PR must reference an issue and preserve every section and checkbox in `.github/pull_request_template.md`; UI changes must include images or video in Demo.
+- Add or update focused tests for observable behavior changes. New user-facing features require an e2e happy-path test; web behavior changes require a colocated Vitest test, and user-facing UI changes also require `tests/e2e_ui/` coverage.
+- Name the planned removal version in code and in the PR or commit description whenever deprecating a feature.
 
-## Local development shortcuts
+## Where things are
 
-Use `just` for common tasks; run `just --list` for grouped recipes.
+- Full contributor and review workflow: `CONTRIBUTING.md` and `.github/copilot-instructions.md`
+- Web streaming-model parity rules: `web/AGENTS.md`
+- Real-LLM journeys: `tests/e2e/AGENTS.md`
+- Per-harness integration journeys: `tests/integration/AGENTS.md`
+- `.github/triage_v2/` has its own scoped `AGENTS.md`.
+- `omnigent/onboarding/agent/AGENTS.md`, `dev/repro-agent/AGENTS.md`, and `dev/resolve-agent/AGENTS.md` are product-agent prompts; edit them as runtime behavior, not as generic repository guidance.
 
-- `just ensure` — install/check prerequisites
-- `just run-ios` / `just run-android` — build/run mobile apps
-- `just dev` / `just dev-mobile` — start the omnigent dev pod
-- `just electron-dev` / `just electron-build` — Electron desktop shell
-- `just lint` / `just lint-all` — run pre-commit
-- `just normalize-locks` — rewrite lockfile registries to PyPI/npmjs.org
+## Running and verifying
 
-## Pull requests
+- Use `omnidev` for worktree-safe full-stack testing. Open the exact UI URL it displays, and run checkout-bound CLI commands through `omnidev omnigent`; ports and state are isolated per worktree.
+- Use WSL2 with the checkout in its Linux filesystem for Windows development; native Windows and Git Bash cannot run the full pytest/pre-commit toolchain.
+- Follow the scoped test guides for integration and e2e prerequisites, credentials, background execution, and cleanup.
+- End every task with concrete human verification steps, including inputs and expected behavior.
 
-When you open a pull request, fill in the repo's PR template at
-`.github/pull_request_template.md` (case-sensitive on Linux — note the lowercase
-filename). Keep every section and checkbox row so reviewers can skim them.
+## Conventions that differ from defaults
 
-- **Summary** — what changed and why.
-- **Test Plan** — how you verified it.
-- **Demo** — a **video or images** showing the change. Expected on contributor
-  PRs for UI / frontend changes (check the "UI / frontend change" box under
-  *Type of change*) so reviewers can see the new behaviour without checking out
-  the branch. Use `N/A` for non-visual changes.
-- **Type of change** / **Test coverage** — check all that apply (at least one
-  each).
-- **Coverage notes** — required if you checked "Manual verification completed"
-  or "Not applicable".
-
-Generate the description from the actual diff and this session's context — lead
-with the motivation, then the change. Don't pass a `--body` that skips these
-sections.
-
-## Finishing a task
-
-When you finish a task, print instructions to the user on how to test it: the
-commands to run, the inputs to provide, or the steps to reproduce so they can
-verify the result themselves. Prefer verification that is best performed by a
-human, such as concrete manual behavior checks, rather than only listing unit
-test commands. Don't leave the user guessing how to confirm the work — tell
-them exactly what to do.
-
-## Deprecating features
-
-When deprecating a feature, note the version in which it is expected to be
-removed so we can clean it up when that version ships. Call out the deprecation
-version in code (e.g. a `@deprecated` tag or comment naming the target release)
-and in the PR/commit description, so there's a clear marker to act on later.
-
-## Code comments
-
-Keep comments short and focused on the code, not on the change history.
-
-- **Keep them brief** — prefer one or two lines. Avoid comments longer than
-  three lines; if you need more, the code likely needs refactoring or a doc
-  string, not a wall of inline commentary.
-- **Describe the scenario, not the PR** — explain *what* the code handles or
-  *why* it exists, in terms a future reader needs. Don't reference PR numbers,
-  issue numbers, or ticket IDs (e.g. `#1646`, `fixes JIRA-123`); the scenario
-  should be clear without chasing external links.
-
-## Database query names
-
-Application stores use `make_named_managed_session_maker` and give every
-session a stable semantic operation name. The session-level name must describe
-the caller's intent rather than repeat SQL syntax; use a nested
-`query_name_scope` only when one transaction needs distinct names for important
-subqueries. Because the named session covers implicit flush and commit, don't
-add an explicit `flush()` only to make a query name observable.
-
-## Framework-owned instructions
-
-Keep runtime lifecycle and metadata instructions separate from portable agent
-instructions:
-
-- Agent-spec and per-request instructions are user-authored. Framework-owned
-  instructions are additive runtime behavior and are appended after them in
-  `omnigent/runtime/prompt.py`.
-- Keep the canonical instruction text and lifecycle gate in the owning framework
-  module. Harness adapters should only transport the composed instructions; do
-  not duplicate policy across adapters or add lifecycle metadata to `AgentSpec`.
-- If framework instructions grow beyond a small ordered list, introduce a
-  structured `FrameworkInstructions` value at the prompt-composition boundary.
+- Keep code comments to one or two scenario-focused lines; do not narrate change history or cite issue or PR numbers.
+- Application stores use `make_named_managed_session_maker` with stable, intent-based operation names. Use nested `query_name_scope` only for important distinct subqueries; never add `flush()` solely for observability.
+- Keep framework-owned lifecycle and metadata instructions in the owning framework module and compose them in `omnigent/runtime/prompt.py`; harness adapters only transport the result and must not add lifecycle metadata to `AgentSpec`.
