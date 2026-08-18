@@ -1,0 +1,8 @@
+release=20260814
+python=3.12.14
+
+arm64.asset=cpython-3.12.14+20260814-aarch64-apple-darwin-install_only_stripped.tar.gz
+arm64.sha256=dd5b76ab11451a4a4367c17c61d944dded56b425396b07f102922a7ebef7d55f
+
+x86_64.asset=cpython-3.12.14+20260814-x86_64-apple-darwin-install_only_stripped.tar.gz
+x86_64.sha256=aec265e3cddaccdb2a3d783331596351b24d4a63c97af0a38f75f643c9451de9
