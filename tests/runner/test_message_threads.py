@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from omnigent.runner import app
+from omnigent.runner import tool_dispatch as dispatch
 from omnigent.runner.tool_dispatch import _agent_message_envelope, _SessionTurnIdentity
 from omnigent.tools.builtins.async_inbox import SysReadInboxTool
 from omnigent.tools.builtins.spawn import _build_sys_session_send_schema
@@ -19,12 +22,14 @@ def clean_thread_registry():
     saved_pair = dict(app._threads_by_pair)
     saved_closed = list(app._closed_thread_ids)
     saved_work = dict(app._subagent_work_by_child)
+    saved_work_parent = {key: set(value) for key, value in app._subagent_work_by_parent.items()}
     saved_inboxes = dict(app._session_inboxes_ref)
     try:
         app._threads_by_id.clear()
         app._threads_by_pair.clear()
         app._closed_thread_ids.clear()
         app._subagent_work_by_child.clear()
+        app._subagent_work_by_parent.clear()
         app._session_inboxes_ref.clear()
         yield
     finally:
@@ -36,6 +41,8 @@ def clean_thread_registry():
         app._closed_thread_ids.extend(saved_closed)
         app._subagent_work_by_child.clear()
         app._subagent_work_by_child.update(saved_work)
+        app._subagent_work_by_parent.clear()
+        app._subagent_work_by_parent.update(saved_work_parent)
         app._session_inboxes_ref.clear()
         app._session_inboxes_ref.update(saved_inboxes)
 
@@ -98,8 +105,7 @@ def test_closing_thread_prunes_registry_and_pair_index() -> None:
     assert thread_id not in app._threads_by_id
     assert ("parent", "child") not in app._threads_by_pair
     assert (
-        app.resolve_message_thread("parent", "child", thread_id=thread_id).error
-        == "thread_closed"
+        app.resolve_message_thread("parent", "child", thread_id=thread_id).error == "thread_closed"
     )
 
 
@@ -211,3 +217,112 @@ def test_send_and_inbox_schemas_advertise_thread_parameters_in_both_modes() -> N
 
     inbox_properties = SysReadInboxTool().get_schema()["function"]["parameters"]["properties"]
     assert "thread_id" in inbox_properties
+
+
+def test_thread_label_value_keeps_participants_and_id_budget_with_long_subject() -> None:
+    created = app.resolve_message_thread("conv_parent", "conv_target", thread_subject="x" * 500)
+    assert created.thread is not None
+
+    key = app.message_thread_label_key(created.thread.thread_id)
+    value = app.serialize_message_thread_label(created.thread)
+    decoded = json.loads(value)
+
+    assert key == f"omnigent.thread.{created.thread.thread_id}"
+    assert len(value.encode("utf-8")) <= app.LABEL_VALUE_MAX_LEN - app._THREAD_LABEL_HEADROOM
+    assert decoded["o"] == "conv_parent"
+    assert decoded["t"] == "conv_target"
+    assert decoded["s"]
+    assert len(decoded["s"]) < 500
+
+
+def test_restart_rehydrates_thread_from_target_label_and_preserves_subject() -> None:
+    async def scenario() -> None:
+        target = "conv_target"
+        caller = "conv_parent"
+        events: list[dict[str, object]] = []
+        patch_paths: list[str] = []
+        labels: dict[str, str] = {}
+        inbox: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        app._session_inboxes_ref[caller] = inbox
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "PATCH":
+                patch_paths.append(request.url.path)
+                labels.update(json.loads(request.content).get("labels", {}))
+                return httpx.Response(200, json={"id": target, "labels": labels})
+            if request.method == "GET" and request.url.path == f"/v1/sessions/{target}/items":
+                return httpx.Response(200, json={"data": []})
+            if request.method == "POST" and request.url.path == f"/v1/sessions/{target}/events":
+                events.append(json.loads(request.content))
+                return httpx.Response(202, json={"delivery": "accepted"})
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        async def target_online(*_args: object, **_kwargs: object) -> bool:
+            return True
+
+        identity = dispatch._SessionTurnIdentity(
+            session_id=caller,
+            actor=None,
+            agent_name="parent",
+            title="parent",
+            parent_session_id=None,
+        )
+        snap = {
+            "status": "idle",
+            "runner_id": "runner-1",
+            "agent_name": "worker",
+            "title": "worker:review",
+            "labels": labels,
+        }
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://server"
+        ) as client:
+            old_online = dispatch._runner_online_or_none
+            old_start = app._remote_dispatch_start_ref
+            dispatch._runner_online_or_none = target_online
+            app._remote_dispatch_start_ref = lambda **_kwargs: None
+            try:
+                first = json.loads(
+                    await dispatch._send_to_peer_session(
+                        target,
+                        "first",
+                        server_client=client,
+                        conversation_id=caller,
+                        snap_data=snap,
+                        sender_identity=identity,
+                        thread_subject="review",
+                    )
+                )
+                thread_id = first["thread_id"]
+                subject = first["thread_subject"]
+                app.mark_subagent_work_terminal(target, status="completed", output="done")
+
+                app._threads_by_id.clear()
+                app._threads_by_pair.clear()
+                app._closed_thread_ids.clear()
+                app._subagent_work_by_child.clear()
+                app._subagent_work_by_parent.clear()
+
+                second = json.loads(
+                    await dispatch._send_to_peer_session(
+                        target,
+                        "after restart",
+                        server_client=client,
+                        conversation_id=caller,
+                        snap_data=snap,
+                        sender_identity=identity,
+                        thread_id=thread_id,
+                    )
+                )
+                assert second["thread_id"] == thread_id
+                assert second["thread_subject"] == subject
+                assert len(events) == 2
+                assert patch_paths == [
+                    f"/v1/sessions/{caller}",
+                    f"/v1/sessions/{target}",
+                ]
+            finally:
+                dispatch._runner_online_or_none = old_online
+                app._remote_dispatch_start_ref = old_start
+
+    asyncio.run(scenario())

@@ -8176,7 +8176,11 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
-def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
+def _reject_server_reserved_label_seed(
+    labels: dict[str, str] | None,
+    *,
+    allow_runner_thread_labels: bool = False,
+) -> None:
     """
     Reject a client-supplied label map that touches server-internal keys.
 
@@ -8185,6 +8189,8 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     critical metadata (e.g. the policy-evaluation actor identity).
 
     :param labels: The client-supplied label mapping, or ``None``.
+    :param allow_runner_thread_labels: Whether the route has authenticated a
+        runner write for its minted thread labels.
     :raises OmnigentError: 400 when any reserved key is present.
     """
     if not labels:
@@ -8192,6 +8198,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     if _TURN_ACTOR_LABEL in labels:
         raise OmnigentError(
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # Runner-minted message-thread labels carry the fixed participant set;
+    # allowing client seeds would let callers forge thread membership.
+    thread_key = next((k for k in labels if k.startswith("omnigent.thread.")), None)
+    if thread_key is not None and not allow_runner_thread_labels:
+        raise OmnigentError(
+            f"label {thread_key!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
     # Pins are per-user: the client may only write the bare canonical

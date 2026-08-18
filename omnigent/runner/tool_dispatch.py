@@ -33,7 +33,7 @@ import re
 import tempfile
 import time as _time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
@@ -1282,7 +1282,48 @@ def _agent_message_envelope(
     )
 
 
-def _resolve_thread_for_send(
+async def _persist_message_thread_label(
+    *,
+    runner_app: Any,
+    thread: Any,
+    server_client: httpx.AsyncClient,
+) -> None:
+    """Persist one minted thread label on both fixed endpoint sessions."""
+    value = runner_app.serialize_message_thread_label(thread)
+    key = runner_app.message_thread_label_key(thread.thread_id)
+    for session_id in (thread.opener_session_id, thread.target_session_id):
+        response = await server_client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"labels": {key: value}},
+            timeout=30.0,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"thread label write returned {response.status_code} for {session_id}"
+            )
+
+
+async def _delete_message_thread_labels(
+    *,
+    runner_app: Any,
+    thread: Any,
+    server_client: httpx.AsyncClient,
+) -> None:
+    """Delete one closed thread label from both endpoint sessions."""
+    key = runner_app.message_thread_label_key(thread.thread_id)
+    for session_id in (thread.opener_session_id, thread.target_session_id):
+        response = await server_client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"labels": {key: ""}},
+            timeout=30.0,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"thread label delete returned {response.status_code} for {session_id}"
+            )
+
+
+async def _resolve_thread_for_send(
     *,
     runner_app: Any,
     caller_session_id: str,
@@ -1290,14 +1331,32 @@ def _resolve_thread_for_send(
     thread_id: str | None,
     thread_subject: str | None,
     outstanding_entry: Any = None,
+    persisted_labels: Mapping[str, str] | None = None,
+    server_client: httpx.AsyncClient | None = None,
 ) -> tuple[Any | None, bool, str | None]:
     """Resolve and reserve the thread slot before posting a message."""
+    labels = persisted_labels
+    if (
+        thread_id is not None
+        and (labels is None or runner_app.message_thread_label_key(thread_id) not in labels)
+        and server_client is not None
+    ):
+        try:
+            response = await server_client.get(
+                f"/v1/sessions/{caller_session_id}/labels", timeout=10.0
+            )
+            if response.status_code == 200:
+                body = _string_object_dict(response.json())
+                labels = _string_mapping(body.get("labels")) if body is not None else labels
+        except Exception:  # noqa: BLE001 - a label miss remains an honest unknown id
+            labels = labels
     resolution = runner_app.resolve_message_thread(
         caller_session_id,
         target_session_id,
         thread_id=thread_id,
         thread_subject=thread_subject,
         outstanding_entry=outstanding_entry,
+        persisted_labels=labels,
     )
     if resolution.error is not None:
         error: _JsonObject = {"error": resolution.error}
@@ -1305,6 +1364,19 @@ def _resolve_thread_for_send(
             error["blocking_thread_id"] = resolution.blocking_thread_id
         return None, False, json.dumps(error)
     assert resolution.thread is not None
+    if resolution.minted and server_client is not None:
+        try:
+            await _persist_message_thread_label(
+                runner_app=runner_app,
+                thread=resolution.thread,
+                server_client=server_client,
+            )
+        except Exception:  # noqa: BLE001 - delivery remains backward compatible on old servers
+            _logger.warning(
+                "Could not persist message thread %s; continuing with runner-local state",
+                resolution.thread.thread_id,
+                exc_info=True,
+            )
     if (
         outstanding_entry is not None
         and outstanding_entry.status not in {"completed", "failed", "cancelled"}
@@ -2026,22 +2098,6 @@ async def _execute_subagent_tool(
         return "Error: sys_session_send invalid 'thread_id'; expected a string"
     if thread_subject is not None and not isinstance(thread_subject, str):
         return "Error: sys_session_send invalid 'thread_subject'; expected a string"
-    if thread_id is not None:
-        requested_thread = _runner_app._threads_by_id.get(thread_id)
-        if requested_thread is None:
-            error = (
-                "thread_closed"
-                if thread_id in _runner_app._closed_thread_ids
-                else "unknown_thread"
-            )
-            return json.dumps({"error": error})
-        if conversation_id not in (
-            requested_thread.opener_session_id,
-            requested_thread.target_session_id,
-        ):
-            return json.dumps({"error": "not_a_thread_participant"})
-        if requested_thread.state != "open":
-            return json.dumps({"error": "thread_closed"})
     if session_inbox is not None:
         _runner_app._session_inboxes_ref.setdefault(conversation_id, session_inbox)
     elif conversation_id not in _runner_app._session_inboxes_ref:
@@ -2176,6 +2232,35 @@ async def _execute_subagent_tool(
         if isinstance(existing, str):
             return existing
     assert not isinstance(existing, str)
+    if thread_id is not None and existing is None:
+        persisted_labels: Mapping[str, str] | None = None
+        try:
+            labels_response = await server_client.get(
+                f"/v1/sessions/{conversation_id}/labels", timeout=10.0
+            )
+            if labels_response.status_code == 200:
+                labels_body = _string_object_dict(labels_response.json())
+                persisted_labels = (
+                    _string_mapping(labels_body.get("labels")) if labels_body is not None else None
+                )
+        except Exception:  # noqa: BLE001 - resolution below remains typed
+            pass
+        reference = _runner_app.validate_message_thread_reference(
+            conversation_id,
+            thread_id,
+            persisted_labels=persisted_labels,
+        )
+        if reference.error is not None:
+            return json.dumps({"error": reference.error})
+        return json.dumps(
+            {
+                "error": "thread_target_required",
+                "conversation_id": reference.thread.target_session_id
+                if reference.thread is not None
+                else None,
+                "message": "name the existing thread target with session_id or title",
+            }
+        )
     created_child = False
     child_wrapper_label: str | None = None
     busy_mode = if_busy or "queue"
@@ -2467,13 +2552,15 @@ async def _execute_subagent_tool(
 
             session_stream.publish(conversation_id, _evt.model_dump())
 
-    thread, thread_minted, thread_error = _resolve_thread_for_send(
+    thread, thread_minted, thread_error = await _resolve_thread_for_send(
         runner_app=_runner_app,
         caller_session_id=conversation_id,
         target_session_id=child_session_id,
         thread_id=thread_id,
         thread_subject=thread_subject,
         outstanding_entry=existing_work,
+        persisted_labels=_string_mapping(existing.get("labels")) if existing is not None else None,
+        server_client=server_client,
     )
     if thread_error is not None:
         return thread_error
@@ -3087,13 +3174,15 @@ async def _queue_peer_dispatch(
                 "message": "the target's deferred peer-send queue is full",
             }
         )
-    thread, thread_minted, thread_error = _resolve_thread_for_send(
+    thread, thread_minted, thread_error = await _resolve_thread_for_send(
         runner_app=_runner_app,
         caller_session_id=conversation_id,
         target_session_id=target_session_id,
         thread_id=thread_id,
         thread_subject=thread_subject,
         outstanding_entry=None,
+        persisted_labels=_string_mapping(snap_data.get("labels")),
+        server_client=server_client,
     )
     if thread_error is not None:
         return thread_error
@@ -3309,13 +3398,15 @@ async def _send_to_peer_session(
                 return cancel_error
             existing = None
 
-    thread, thread_minted, thread_error = _resolve_thread_for_send(
+    thread, thread_minted, thread_error = await _resolve_thread_for_send(
         runner_app=_runner_app,
         caller_session_id=conversation_id,
         target_session_id=target_session_id,
         thread_id=thread_id,
         thread_subject=thread_subject,
         outstanding_entry=existing,
+        persisted_labels=_string_mapping(snap_data.get("labels")),
+        server_client=server_client,
     )
     if thread_error is not None:
         return thread_error
@@ -3686,13 +3777,15 @@ async def _send_to_existing_session(
             if cancel_error is not None:
                 return cancel_error
             interrupt_confirmed = True
-    thread, thread_minted, thread_error = _resolve_thread_for_send(
+    thread, thread_minted, thread_error = await _resolve_thread_for_send(
         runner_app=_runner_app,
         caller_session_id=conversation_id,
         target_session_id=target_session_id,
         thread_id=thread_id,
         thread_subject=thread_subject,
         outstanding_entry=existing_work,
+        persisted_labels=_string_mapping(snap_data.get("labels")),
+        server_client=server_client,
     )
     if thread_error is not None:
         return thread_error
@@ -7645,6 +7738,8 @@ async def _session_close_via_rest(
         from the caller's), or ``session_not_a_sub_agent`` (the target
         is a top-level session, not a sub-agent).
     """
+    from omnigent.runner import app as _runner_app
+
     target_id = args.get("conversation_id")
     if not isinstance(target_id, str) or not target_id:
         return json.dumps(
@@ -7676,6 +7771,22 @@ async def _session_close_via_rest(
         return json.dumps({"error": f"sys_session_close failed: {exc}"})
     if patch.status_code != 200:
         return json.dumps({"error": f"sys_session_close returned {patch.status_code}"})
+    for thread in list(_runner_app._threads_by_id.values()):
+        if target_id not in (thread.opener_session_id, thread.target_session_id):
+            continue
+        _runner_app.close_message_thread(thread.thread_id)
+        try:
+            await _delete_message_thread_labels(
+                runner_app=_runner_app,
+                thread=thread,
+                server_client=server_client,
+            )
+        except Exception:  # noqa: BLE001 - session close remains successful
+            _logger.warning(
+                "Could not delete labels for closed message thread %s",
+                thread.thread_id,
+                exc_info=True,
+            )
     return json.dumps(
         {
             "closed": True,

@@ -45,6 +45,7 @@ from omnigent.reasoning_effort import (
     validate_effort,
 )
 from omnigent.runner.identity import (
+    OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.routing import RunnerRouter
@@ -1545,15 +1546,45 @@ def register_core_routes(
                     code=ErrorCode.FORBIDDEN,
                 )
         if body.labels:
-            _reject_server_reserved_label_seed(body.labels)
+            _thread_label_keys = tuple(
+                key for key in body.labels if key.startswith("omnigent.thread.")
+            )
+            _conv_for_reserved = None
+            if _thread_label_keys:
+                _conv_for_reserved = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                if (
+                    permission_store is None
+                    and not request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
+                    and request.headers.get("origin") != OMNIGENT_INTERNAL_WS_ORIGIN
+                ):
+                    raise OmnigentError(
+                        "message-thread labels may only be written by a runner",
+                        code=ErrorCode.FORBIDDEN,
+                    )
+                _require_cost_control_label_authority(
+                    reserved_keys=_thread_label_keys,
+                    tunnel_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
+                    bound_runner_id=(
+                        _conv_for_reserved.runner_id if _conv_for_reserved is not None else None
+                    ),
+                    allowed_tunnel_tokens=runner_tunnel_tokens,
+                    multi_user=permission_store is not None,
+                )
+            _reject_server_reserved_label_seed(
+                body.labels,
+                allow_runner_thread_labels=bool(_thread_label_keys),
+            )
             # Advisor-owned cost_control.* labels are written only by the
             # session's bound runner; gate them on runner proof BEFORE any
             # store mutation so a rejected request leaves the session untouched.
             _reserved_labels = reserved_cost_control_keys(body.labels)
             if _reserved_labels:
-                _conv_for_reserved = await asyncio.to_thread(
-                    conversation_store.get_conversation, session_id
-                )
+                if _conv_for_reserved is None:
+                    _conv_for_reserved = await asyncio.to_thread(
+                        conversation_store.get_conversation, session_id
+                    )
                 _require_cost_control_label_authority(
                     reserved_keys=_reserved_labels,
                     tunnel_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
@@ -1878,7 +1909,16 @@ def register_core_routes(
         # so without this an empty string would linger as a stored value.
         # The pinned key was rewritten to the caller's per-user key above, so
         # clear that one (not the canonical bare key) on an empty value.
-        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id)):
+        _thread_clear_keys = tuple(
+            key
+            for key, value in labels_to_set.items()
+            if key.startswith("omnigent.thread.") and value == ""
+        )
+        for _clear_key in (
+            PROJECT_LABEL_KEY,
+            pinned_label_key(user_id),
+            *_thread_clear_keys,
+        ):
             if labels_to_set.get(_clear_key) == "":
                 labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
