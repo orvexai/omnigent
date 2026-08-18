@@ -1,0 +1,521 @@
+# Build standalone `omnigent` executables for Linux and macOS and
+# attach them to a GitHub Release.
+#
+# Why this exists alongside release-omnigent.yml: upstream ships omnigent as
+# pure-Python wheels, so a single artifact already covers every OS *for users
+# who have Python and uv*. This workflow targets the other case — dropping one
+# self-contained file on a machine (a host/runner box, a locked-down laptop)
+# with no Python toolchain at all.
+#
+# Release flow:
+#   1. Push an `orvex-vX.Y.Z` tag -> build and smoke the Linux binary, then
+#      publish a draft GitHub Release with its archives, wheels + SHA256SUMS.
+#   2. Review the draft, then publish it by hand.
+#   Manual `workflow_dispatch` builds and uploads the Linux and macOS artifacts
+#   WITHOUT touching Releases.
+#
+# Versioning: this fork numbers its own releases. The version in
+# `pyproject.toml` is upstream's — it identifies the line we rebased onto, not
+# any build we control, and it moves under us on the next rebase. The release
+# version is whatever the tag says, stamped at BUILD TIME and never committed,
+# so it can't conflict with an upstream merge. Which upstream commit a release
+# was cut from stays recoverable: the tag names it, and `omnigent --version`
+# prints it from the build-info stamp.
+#
+# Tags are `orvex-vX.Y.Z` — plain finals, not upstream's `X.Y.Z.dev0`. A
+# `.dev` version is a PEP 440 PRE-release that resolvers skip without --pre,
+# so shipping releases spelled that way would be wrong.
+#
+# The tag namespace is ours on purpose. Upstream owns 40-odd `v*` tags; a
+# single `git push origin --tags` after a sync would otherwise fire this
+# workflow once per upstream tag, and any tag reachable from mcp would pass
+# the ref guard and publish a bogus release. It also leaves `v0.10.0` free
+# for upstream while `orvex-v0.10.0` stays unambiguously ours.
+#
+# The SPA is built by setup.py during `pip install .` (it is skipped only when
+# OMNIGENT_SKIP_WEB_UI=true). The macOS legs assemble prebuilt macOS wheels on
+# Linux; they do not compile or execute the macOS payload.
+# The former opt-in `build-other-platforms` matrix over GitHub-hosted Windows
+# and macOS runners has been removed: it never shipped an artifact and did not
+# satisfy this repository's public-runners rule. This leaves Windows with no
+# binary path until a separately designed, supported Windows unit is added.
+name: Release binaries (Linux/macOS)
+
+on:
+  push:
+    tags:
+      - "orvex-v*"
+  workflow_dispatch:
+    inputs:
+      skip_web_ui:
+        description: "Build without the bundled web UI (faster; CLI/host only)."
+        type: boolean
+        default: false
+  # CI-test the workflow on change; the publish job is gated off PR events.
+  pull_request:
+    paths:
+      - ".github/workflows/release-binaries.yml"
+      - ".github/scripts/macos-bundle/**"
+
+permissions:
+  contents: read
+
+# Serialize on the ref so a re-tag can't race itself.
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Binaries ship from `mcp` only. Without this, the rule would rest on the
+  # workflow file happening to live on one branch — merge it elsewhere and that
+  # branch silently gains the ability to cut a release.
+  guard:
+    if: github.repository == 'orvexai/omnigent'
+    name: release-ref
+    runs-on: public-runners
+    timeout-minutes: 5
+
+    steps:
+      # A pull_request run is the workflow's own CI test (paths-filtered to
+      # this file) and its publish job is gated off PR events, so it builds
+      # without ever releasing. Everything else must come from mcp.
+      - if: github.event_name != 'pull_request'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - if: github.event_name != 'pull_request'
+        name: Require the ref to be mcp
+        env:
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" = "refs/heads/mcp" ]; then
+            echo "ref is mcp"
+            exit 0
+          fi
+          # A tag is allowed only when the commit it names is on mcp, so a tag
+          # cut from another branch cannot smuggle a build through.
+          version="${REF#refs/tags/orvex-v}"
+          if [ "$version" != "$REF" ]; then
+            # Finals only. A `.dev`/`rc` spelling is a PEP 440 pre-release that
+            # resolvers skip without --pre, so it must not reach a release.
+            if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Tag $REF is malformed. Release tags are orvex-vX.Y.Z, e.g. orvex-v0.10.1."
+              exit 1
+            fi
+            git fetch --quiet origin mcp
+            if ! git merge-base --is-ancestor "$SHA" origin/mcp; then
+              echo "::error::Tag $REF names $SHA, which is not on mcp. Binaries ship from mcp only."
+              exit 1
+            fi
+            # Versions must only ever climb: a reused or lowered one would
+            # publish a release that resolves as older than what is installed,
+            # so an upgrade would silently decline to move.
+            # `|| highest=` because both greps exit non-zero when they match
+            # nothing — the first release, and a re-push of the newest tag,
+            # are exactly those cases, and pipefail would abort the guard.
+            highest="$(git tag --list 'orvex-v*' \
+              | sed 's/^orvex-v//' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | grep -vx "$version" \
+              | sort -V | tail -1)" || highest=""
+            if [ -n "$highest" ] \
+              && [ "$(printf '%s\n%s\n' "$version" "$highest" | sort -V | tail -1)" != "$version" ]; then
+              echo "::error::orvex-v$version does not exceed the highest existing release (orvex-v$highest)."
+              exit 1
+            fi
+            echo "tag $REF is reachable from mcp; version $version > ${highest:-none}"
+            exit 0
+          fi
+          echo "::error::$REF is not mcp. Binaries ship from mcp only; re-run this workflow on mcp."
+          exit 1
+
+  build-linux:
+    # Gated to this fork; inert upstream and in other mirrors.
+    if: github.repository == 'orvexai/omnigent'
+    needs: guard
+    name: linux-x86_64
+    # This is the org's own self-hosted Linux pool; the repo's CI proves
+    # that the public-runners label resolves to an online runner.
+    runs-on: public-runners
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version-file: .python-version
+
+      # setup.py shells out to pnpm to build the SPA into
+      # omnigent/server/static/web-ui unless OMNIGENT_SKIP_WEB_UI=true.
+      # setup-node BEFORE pnpm/action-setup: its self-installer needs a Node
+      # binary. Same order the repo's other pnpm workflows use.
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        if: ${{ !inputs.skip_web_ui }}
+        with:
+          node-version: 22
+      # Must equal package.json's "packageManager" pin — action-setup v4 hard
+      # errors when a `version:` here disagrees with it.
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        if: ${{ !inputs.skip_web_ui }}
+        with:
+          version: 11.15.1
+          standalone: true
+
+      # The tag names the release version; stamp it across the lockstep before
+      # the build reads it. Deliberately not committed: pyproject's version is
+      # upstream's, so an in-tree edit would conflict on every rebase.
+      - name: Stamp the orvex release version
+        if: startsWith(github.ref, 'refs/tags/orvex-v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF#refs/tags/orvex-v}"
+          python -m pip install --quiet packaging
+          python scripts/update_versions.py pre-release --new-version "$version"
+          echo "stamped $version (upstream base was $(git show HEAD:pyproject.toml | grep -m1 '^version'))"
+
+      - name: Install omnigent + PyInstaller
+        shell: bash
+        env:
+          OMNIGENT_SKIP_WEB_UI: ${{ inputs.skip_web_ui && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # Install local SDK siblings explicitly because pip ignores [tool.uv.sources]. Keep installs
+          # non-editable: PyInstaller collects from site-packages, not path hooks --collect-all cannot walk.
+          python -m pip install ./sdks/python-client ./sdks/ui .
+          python -m pip install pyinstaller==6.11.1
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python -c "import omnigent.version as v; print(v.VERSION)")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building omnigent $version for linux-x86_64"
+
+      - name: Build executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --collect-all pulls omnigent's package data (alembic migrations,
+          #   the SPA bundle, bundled agent configs) plus every submodule the
+          #   CLI imports lazily.
+          # --copy-metadata is REQUIRED, not cosmetic: harness_plugins.py
+          #   discovers community harnesses through
+          #   importlib.metadata.entry_points(), which reads dist metadata that
+          #   PyInstaller otherwise drops — without it the harness registry
+          #   silently loses every plugin.
+          pyinstaller \
+            --name omnigent \
+            --onefile \
+            --console \
+            --noconfirm \
+            --clean \
+            --collect-all omnigent \
+            --copy-metadata omnigent \
+            --hidden-import omnigent.cli \
+            --collect-all alembic \
+            --collect-submodules uvicorn \
+            --collect-submodules passlib \
+            scripts/pyinstaller_entry.py
+
+      # A binary that imports but cannot run its own CLI is worse than a build
+      # failure, because it ships. Exercise the real entry point.
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=dist/omnigent
+          # Not `[ ... ] && bin=...`: under `set -e` the false branch returns
+          # non-zero and would abort the step on every non-Windows runner.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            bin=dist/omnigent.exe
+          fi
+          "$bin" --version
+          "$bin" --help > /dev/null
+          # --version/--help short-circuit before the app is constructed, so
+          # they prove only that argparse works. A binary missing the SPA
+          # bundle, alembic's migration scripts, or a uvicorn/passlib
+          # submodule passes both and ships, then dies on the user's first
+          # `omnigent server`. Boot the real server and require a healthy
+          # response.
+          data_dir="$(python -c 'import tempfile; print(tempfile.mkdtemp())')"
+          config_home="$(python -c 'import tempfile; print(tempfile.mkdtemp())')"
+          export OMNIGENT_DATA_DIR="$data_dir"
+          export OMNIGENT_CONFIG_HOME="$config_home"
+          "$bin" server --port 8765 > serve.log 2>&1 &
+          serve_pid=$!
+          set +e
+          python - "$serve_pid" <<'PY'
+          import os
+          import sys
+          import time
+          import urllib.request
+
+          pid = int(sys.argv[1])
+          healthy = False
+          for _ in range(60):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:8765/health", timeout=1) as response:
+                      healthy = 200 <= response.status < 300
+                      if healthy:
+                          break
+              except Exception:
+                  pass
+              try:
+                  os.kill(pid, 0)
+              except OSError:
+                  break
+              time.sleep(1)
+          raise SystemExit(0 if healthy else 1)
+          PY
+          health_status=$?
+          set -e
+          kill "$serve_pid" 2>/dev/null || true
+          if [ "$health_status" -ne 0 ]; then
+            echo "server failed to become healthy; log follows:" >&2
+            cat serve.log >&2
+            exit 1
+          fi
+          echo "smoke OK (CLI + server boot)"
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="omnigent-${{ steps.ver.outputs.version }}-linux-x86_64"
+          mkdir -p out
+          python - "$name" <<'PY'
+          import sys
+          import tarfile
+          from pathlib import Path
+
+          name = sys.argv[1]
+          with tarfile.open(Path("out") / f"{name}.tar.gz", "w:gz") as archive:
+              archive.add("dist/omnigent", arcname="omnigent")
+          PY
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: out/*
+          if-no-files-found: error
+
+      # Wheels ride along with the binary so the installer can pin a released
+      # version instead of building from a moving branch. Built here rather
+      # than in their own job because this one already has Node + pnpm and has
+      # just built the SPA into the tree, so packaging is nearly free.
+      - name: Build wheels
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The two SDK siblings are pinned `==` as path deps, so they must be
+          # built alongside or the app wheel cannot resolve them at install.
+          python -m pip wheel --no-deps --wheel-dir wheels \
+            ./sdks/python-client ./sdks/ui .
+          ls -la wheels
+
+      # A wheel missing the SPA still installs and still exits 0, and the loss
+      # only shows as an API-only page on the user's first `omnigent server`.
+      - name: Assert the web UI shipped in the wheel
+        if: ${{ !(inputs.skip_web_ui) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob
+          import sys
+          import zipfile
+
+          matches = glob.glob("wheels/omnigent-*.whl")
+          if not matches:
+              sys.exit("no omnigent wheel was produced")
+          with zipfile.ZipFile(matches[0]) as wheel:
+              bundled = [n for n in wheel.namelist() if "server/static/web-ui/" in n]
+          if not bundled:
+              sys.exit(f"{matches[0]} contains no web-ui bundle")
+          print(f"{matches[0]}: {len(bundled)} web-ui entries")
+          PY
+
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: omnigent-wheels
+          path: wheels/*.whl
+          if-no-files-found: error
+
+  assemble-macos:
+    if: github.repository == 'orvexai/omnigent'
+    needs: [guard, build-linux]
+    name: macos-${{ matrix.arch }}
+    runs-on: public-runners
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version-file: .python-version
+
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: omnigent-wheels
+          path: wheels
+
+      - name: Test bundle verifier
+        run: python .github/scripts/macos-bundle/verify_bundle.py --self-test
+
+      - name: Assemble and verify macOS bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          size_args=()
+          if [ "${{ inputs.skip_web_ui }}" != "true" ]; then
+            size_args+=(--min-archive-bytes 100000000 --max-archive-bytes 250000000)
+          fi
+          python .github/scripts/macos-bundle/assemble.py \
+            --arch "${{ matrix.arch }}" \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --wheels-dir wheels \
+            --pins .github/scripts/macos-bundle/interpreter.pins \
+            --output out \
+            --staging "$RUNNER_TEMP/omnigent-macos-${{ matrix.arch }}" \
+            ${{ inputs.skip_web_ui && '--skip-web-ui' || '' }} \
+            "${size_args[@]}"
+          bundle=$(find "$RUNNER_TEMP/omnigent-macos-${{ matrix.arch }}" -mindepth 1 -maxdepth 1 -type d -name 'omnigent-*' -print -quit)
+          python .github/scripts/macos-bundle/verify_bundle.py \
+            --bundle "$bundle" \
+            --arch "${{ matrix.arch }}" \
+            --wheels-dir wheels \
+            --pins .github/scripts/macos-bundle/interpreter.pins \
+            ${{ inputs.skip_web_ui && '--skip-web-ui' || '' }} \
+            --induced-failure-tests
+
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: omnigent-macos-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+
+  verify-macos:
+    if: github.repository == 'orvexai/omnigent'
+    needs: assemble-macos
+    name: macos-cross-arch
+    runs-on: public-runners
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version-file: .python-version
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: omnigent-macos-*
+          path: dl
+          merge-multiple: true
+
+      - name: Compare dependency manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t manifests < <(find dl -type f -name 'omnigent-*.requirements.txt' -print | sort)
+          if [ "${#manifests[@]}" -ne 2 ]; then
+            echo "expected two macOS manifests, found ${#manifests[@]}" >&2
+            printf '%s\n' "${manifests[@]}" >&2
+            exit 1
+          fi
+          python .github/scripts/macos-bundle/verify_bundle.py \
+            --manifest "${manifests[0]}" \
+            --manifest "${manifests[1]}"
+
+  publish:
+    # Tag pushes only: a manual run leaves the artifacts on the run and never
+    # creates or mutates a Release. The macOS jobs remain in `needs` only so
+    # download-artifact waits for their optional outputs; always() means their
+    # failure cannot hold the proven Linux release hostage. Their failed jobs
+    # stay visible in the run, and the collector attaches only what exists.
+    if: ${{ always() && needs.build-linux.result == 'success' && startsWith(github.ref, 'refs/tags/orvex-v') && github.repository == 'orvexai/omnigent' }}
+    needs: [build-linux, assemble-macos, verify-macos]
+    runs-on: public-runners
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the release + upload assets
+    steps:
+      # setup-python reads .python-version from the workspace, so the checkout
+      # is load-bearing here, not incidental — without it this job fails before
+      # it can assemble anything.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version-file: .python-version
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          path: dl
+
+      - name: Collect + checksum
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import shutil
+          from pathlib import Path
+
+          out = Path("out")
+          out.mkdir()
+          # Wheels ship beside the platform archives: the installer resolves a
+          # pinned release from them rather than building from a branch.
+          artifacts = sorted(
+              path for path in Path("dl").rglob("*")
+              if path.is_file()
+              and (
+                  path.name.endswith(".tar.gz")
+                  or path.suffix in {".zip", ".whl"}
+                  or (path.name.startswith("omnigent-") and path.name.endswith(".requirements.txt"))
+              )
+          )
+          for artifact in artifacts:
+              shutil.move(str(artifact), out / artifact.name)
+          checksums = []
+          for artifact in sorted(out.iterdir()):
+              if artifact.name == "SHA256SUMS":
+                  continue
+              digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+              checksums.append(f"{digest}  {artifact.name}")
+          (out / "SHA256SUMS").write_text("\n".join(checksums) + "\n")
+          PY
+          ls -la out
+
+      # Draft, not published: a human eyeballs the archives before these become
+      # the things users download.
+      - uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          draft: true
+          generate_release_notes: true
+          body: |
+            macOS archives contain CPython 3.12 and macOS-native dependencies and are assembled on Linux.
+            They are unsigned and not notarized. Browser downloads may require
+            `xattr -dr com.apple.quarantine <unpacked-directory>` after checksum verification.
+          files: out/*
