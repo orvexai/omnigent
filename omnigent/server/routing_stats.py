@@ -20,6 +20,10 @@ class RoutingStats:
     wrong_replica_total: int = 0
     elicitation_resolve_off_owner_total: int = 0
     hook_park_off_owner_total: int = 0
+    forward_attempted_total: int = 0
+    forward_succeeded_total: int = 0
+    forward_failed_total: int = 0
+    wrong_replica_returned_to_client_total: int = 0
 
     def record_wrong_replica(self) -> None:
         """Count a ``wrong_replica`` response."""
@@ -33,12 +37,32 @@ class RoutingStats:
         """Count a hook park that missed the local tunnel."""
         self.hook_park_off_owner_total += 1
 
+    def record_forward_attempted(self) -> None:
+        """Count a replay attempted by the owner-forwarding middleware."""
+        self.forward_attempted_total += 1
+
+    def record_forward_succeeded(self) -> None:
+        """Count a replay that received an upstream response."""
+        self.forward_succeeded_total += 1
+
+    def record_forward_failed(self) -> None:
+        """Count a replay that could not reach or read the owner response."""
+        self.forward_failed_total += 1
+
+    def record_forward_returned(self) -> None:
+        """Count a classified wrong-replica response returned to the caller."""
+        self.wrong_replica_returned_to_client_total += 1
+
     def snapshot(self) -> dict[str, int]:
         """Return only aggregate counters; never include routing identifiers."""
         return {
             "wrong_replica_total": self.wrong_replica_total,
             "elicitation_resolve_off_owner_total": self.elicitation_resolve_off_owner_total,
             "hook_park_off_owner_total": self.hook_park_off_owner_total,
+            "forward_attempted_total": self.forward_attempted_total,
+            "forward_succeeded_total": self.forward_succeeded_total,
+            "forward_failed_total": self.forward_failed_total,
+            "wrong_replica_returned_to_client_total": self.wrong_replica_returned_to_client_total,
         }
 
 
@@ -53,18 +77,22 @@ async def record_elicitation_resolution_if_off_owner(
     conversation: Any,
     runner_router: Any,
 ) -> None:
-    """Count an external elicitation resolution missing its local tunnel."""
+    """Count an elicitation resolution whose durable owner is remote.
+
+    A runner absent from this process is not necessarily on another pod; it
+    may be offline everywhere. Only a remote durable owner is an off-owner hit.
+    """
     stats = stats_for_request(request)
     runner_id = getattr(conversation, "runner_id", None)
     if stats is not None and runner_id and runner_router is not None:
         if not runner_router.runner_is_online(runner_id):
-            stats.record_elicitation_resolve_off_owner()
             owner = (
                 await asyncio.to_thread(_owner_for_request, request, runner_router, runner_id)
                 if _stage2_active(request, runner_router)
                 else None
             )
             if owner is not None:
+                stats.record_elicitation_resolve_off_owner()
                 raise OmnigentError(
                     "session elicitation is on another replica; retry",
                     code=ErrorCode.WRONG_REPLICA,
@@ -101,9 +129,9 @@ async def record_hook_park_if_off_owner(
         )
     runner_id = getattr(conversation, "runner_id", None)
     if runner_id and not runner_router.runner_is_online(runner_id):
-        stats.record_hook_park_off_owner()
         owner = _owner_for_request(request, runner_router, runner_id)
         if owner is not None:
+            stats.record_hook_park_off_owner()
             raise OmnigentError(
                 "session hook is on another replica; retry",
                 code=ErrorCode.WRONG_REPLICA,

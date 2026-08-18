@@ -35,10 +35,6 @@ class _DurableOwnerRouter(_Router):
         return "pod-b:8000" if runner_id == "runner-remote" else None
 
 
-def _request(stats: RoutingStats) -> SimpleNamespace:
-    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(routing_stats=stats)))
-
-
 def test_routing_stats_counter_only_counts_wrong_replica() -> None:
     stats = RoutingStats()
 
@@ -47,6 +43,10 @@ def test_routing_stats_counter_only_counts_wrong_replica() -> None:
         "wrong_replica_total": 1,
         "elicitation_resolve_off_owner_total": 0,
         "hook_park_off_owner_total": 0,
+        "forward_attempted_total": 0,
+        "forward_succeeded_total": 0,
+        "forward_failed_total": 0,
+        "wrong_replica_returned_to_client_total": 0,
     }
 
 
@@ -72,33 +72,69 @@ async def test_off_owner_elicitation_resolution_is_loud_and_does_not_tombstone()
 
 
 @pytest.mark.asyncio
-async def test_silent_site_counters_distinguish_local_and_absent_tunnels() -> None:
+async def test_offline_runner_is_not_counted_as_off_owner() -> None:
     stats = RoutingStats()
-    request = _request(stats)
-    local = _Conversation("runner-local")
-    router = _Router({"runner-local"})
-
-    await record_elicitation_resolution_if_off_owner(request, local, router)
-    await record_hook_park_if_off_owner(
-        request,
-        session_id="conv-local",
-        conversation_store=SimpleNamespace(),
-        runner_router=router,
-        conversation=local,
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(routing_stats=stats, pod_addr="pod-a:8000"))
     )
+    offline = _Conversation("runner-offline")
+    router = _DurableOwnerRouter(set())
+
+    with pytest.raises(OmnigentError) as elicitation_error:
+        await record_elicitation_resolution_if_off_owner(request, offline, router)
+    assert elicitation_error.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    with pytest.raises(OmnigentError) as hook_error:
+        await record_hook_park_if_off_owner(
+            request,
+            session_id="conv-offline",
+            conversation_store=SimpleNamespace(),
+            runner_router=router,
+            conversation=offline,
+        )
+    assert hook_error.value.code == ErrorCode.RUNNER_UNAVAILABLE
     assert stats.snapshot()["elicitation_resolve_off_owner_total"] == 0
     assert stats.snapshot()["hook_park_off_owner_total"] == 0
 
-    absent = _Conversation("runner-remote")
-    router = _Router(set())
-    await record_elicitation_resolution_if_off_owner(request, absent, router)
-    await record_hook_park_if_off_owner(
-        request,
-        session_id="conv-remote",
-        conversation_store=SimpleNamespace(),
-        runner_router=router,
-        conversation=absent,
+
+@pytest.mark.asyncio
+async def test_offline_hook_is_not_counted_as_off_owner() -> None:
+    stats = RoutingStats()
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(routing_stats=stats, pod_addr="pod-a:8000"))
     )
+    with pytest.raises(OmnigentError) as error:
+        await record_hook_park_if_off_owner(
+            request,
+            session_id="conv-offline",
+            conversation_store=SimpleNamespace(),
+            runner_router=_DurableOwnerRouter(set()),
+            conversation=_Conversation("runner-offline"),
+        )
+    assert error.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert stats.snapshot()["hook_park_off_owner_total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_remote_durable_owner_is_counted_for_both_silent_sites() -> None:
+    stats = RoutingStats()
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(routing_stats=stats, pod_addr="pod-a:8000"))
+    )
+    remote = _Conversation("runner-remote")
+    router = _DurableOwnerRouter(set())
+
+    with pytest.raises(OmnigentError) as elicitation_error:
+        await record_elicitation_resolution_if_off_owner(request, remote, router)
+    assert elicitation_error.value.code == ErrorCode.WRONG_REPLICA
+    with pytest.raises(OmnigentError) as hook_error:
+        await record_hook_park_if_off_owner(
+            request,
+            session_id="conv-remote",
+            conversation_store=SimpleNamespace(),
+            runner_router=router,
+            conversation=remote,
+        )
+    assert hook_error.value.code == ErrorCode.WRONG_REPLICA
     assert stats.snapshot()["elicitation_resolve_off_owner_total"] == 1
     assert stats.snapshot()["hook_park_off_owner_total"] == 1
 
