@@ -54,6 +54,7 @@ class ErrorCode:
         rather than 400 (the request is valid against a configured
         host) or 503 (retrying cannot succeed without user action —
         running ``omnigent setup`` on the host machine).
+    :cvar QUEUE_FULL: The runner's bounded message buffer is full (HTTP 429).
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -70,6 +71,7 @@ class ErrorCode:
     # Keep the string equal to frames.HARNESS_NOT_CONFIGURED_ERROR_CODE —
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
+    QUEUE_FULL = "queue_full"
 
 
 # Single source of truth for error code → HTTP status.
@@ -99,6 +101,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can't satisfy it until the user runs `omnigent setup` there —
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
+    ErrorCode.QUEUE_FULL: 429,
 }
 
 
