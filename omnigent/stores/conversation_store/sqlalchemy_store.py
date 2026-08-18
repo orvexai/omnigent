@@ -797,6 +797,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                 SqlConversationMetadata, (current_workspace_id(), conversation_id)
             )
 
+    def check_database_connectivity(self, *, timeout_ms: int = 500) -> None:
+        """Run the cheap database check used by the readiness probe.
+
+        PostgreSQL gets a server-side statement deadline; the caller also
+        applies an end-to-end deadline around this synchronous DB operation.
+        """
+        databases = [(self._session, self._engine, "readiness_check_operational")]
+        if self._conv_engine is not self._engine:
+            databases.append(
+                (self._conv_session, self._conv_engine, "readiness_check_conversation")
+            )
+        for session_maker, engine, query_name in databases:
+            with session_maker(query_name) as session:
+                if engine.dialect.name == "postgresql":
+                    session.execute(
+                        text("SET LOCAL statement_timeout = :timeout_ms"),
+                        {"timeout_ms": timeout_ms},
+                    )
+                session.execute(text("SELECT 1"))
+
     def _lock_conversation(self, session: Session, conversation_id: str) -> None:
         """
         Acquire a row-level lock on the conversation to serialize
