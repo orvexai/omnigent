@@ -181,6 +181,27 @@ def test_get_info_description_does_not_promise_stall_detection() -> None:
     assert "does not advance during a single long tool call" in description
 
 
+def test_get_info_description_documents_failure_and_send_semantics() -> None:
+    """The metadata contract distinguishes accepted launches from started ones."""
+    description = SysSessionGetInfoTool.description()
+
+    assert "last_task_error" in description
+    assert "accepted, not started" in description
+    assert "a correction does not reach the running turn" in description
+    assert "sys_cancel_task" in description
+
+
+def test_create_description_names_get_info_as_launch_confirmation() -> None:
+    """Create tells the caller where to confirm the asynchronous launch."""
+    from omnigent.tools.builtins.spawn import SysSessionCreateTool
+
+    description = SysSessionCreateTool.description()
+
+    assert "acceptance receipt" in description
+    assert "sys_session_get_info" in description
+    assert "last_task_error" in description
+
+
 def test_send_schema_description_is_async_in_both_modes() -> None:
     """
     Neither ``sys_session_send`` description promises the child's output.
@@ -198,6 +219,8 @@ def test_send_schema_description_is_async_in_both_modes() -> None:
         description = _build_sys_session_send_schema(sub_specs)["function"]["description"]
         assert "Returns the child's output" not in description, mode
         assert "sys_read_inbox" in description, mode
+        assert "provenance envelope" in description, mode
+        assert "1800 seconds" in description, mode
 
 
 def test_send_description_documents_the_async_handle_contract() -> None:
@@ -212,6 +235,9 @@ def test_send_description_documents_the_async_handle_contract() -> None:
 
     assert "Returns the child's output when its turn completes" not in description
     assert "sys_read_inbox" in description
+    assert "provenance envelope" in description
+    assert "not as a direct return value" in description
+    assert "1800 seconds" in description
 
 
 def test_send_schema_advertises_plain_string_and_purpose_object_args() -> None:

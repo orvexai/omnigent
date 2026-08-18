@@ -23,6 +23,7 @@ import asyncio
 import base64
 import binascii
 import dataclasses
+import html as _html
 import io
 import json
 import logging
@@ -956,6 +957,17 @@ class _SubagentLabel:
     title: str | None
 
 
+@dataclass(frozen=True)
+class _SessionTurnIdentity:
+    """Identity resolved from the sender's session snapshot."""
+
+    session_id: str
+    actor: str | None
+    agent_name: str | None
+    title: str | None
+    parent_session_id: str | None
+
+
 def _subagent_label(child: _JsonObject) -> _SubagentLabel:
     """
     Extract child identity fields from a child-session summary.
@@ -1137,21 +1149,80 @@ async def _session_turn_actor(
     *,
     server_client: httpx.AsyncClient,
     conversation_id: str,
-) -> str | None:
-    """Return the parent turn actor label for runner-originated callbacks."""
+) -> _SessionTurnIdentity:
+    """Resolve sender identity for runner-originated callbacks and messages.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The sender's session id.
+    :returns: Best-effort sender identity; unavailable fields are ``None``.
+    """
+    identity = _SessionTurnIdentity(
+        session_id=conversation_id,
+        actor=None,
+        agent_name=None,
+        title=None,
+        parent_session_id=None,
+    )
     try:
         resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
     except (httpx.HTTPError, RuntimeError):
-        return None
+        return identity
     if resp.status_code != 200:
-        return None
-    decoded: object = resp.json()
+        return identity
+    try:
+        decoded: object = resp.json()
+    except ValueError:
+        return identity
     payload = _string_object_dict(decoded)
-    labels = _string_object_dict(payload.get("labels")) if payload is not None else None
-    if labels is None:
-        return None
-    actor = labels.get(_TURN_ACTOR_LABEL)
-    return actor if isinstance(actor, str) and actor else None
+    if payload is None:
+        return identity
+    labels = _string_object_dict(payload.get("labels"))
+    actor = labels.get(_TURN_ACTOR_LABEL) if labels is not None else None
+    raw_agent_name = _optional_string(payload.get("agent_name"))
+    return _SessionTurnIdentity(
+        session_id=conversation_id,
+        actor=actor if isinstance(actor, str) and actor else None,
+        agent_name=public_agent_name(raw_agent_name),
+        title=title_without_closed_marker(_optional_string(payload.get("title"))) or None,
+        parent_session_id=_optional_string(payload.get("parent_session_id")),
+    )
+
+
+def _agent_message_envelope(
+    message: str,
+    sender: _SessionTurnIdentity,
+    relation: Literal["parent", "child", "peer"],
+) -> str:
+    """Wrap agent-originated text with sender provenance and reply routing.
+
+    :param message: Raw message text supplied by the sending agent.
+    :param sender: Best-effort identity of the sending session.
+    :param relation: The sender's relation to the receiver.
+    :returns: The provenance envelope containing the sanitised message.
+    """
+    # This is prompt framing, not authentication; verify ``from`` with
+    # sys_session_get_info when the sender's identity matters.
+    safe_message = re.sub(
+        r"</?omnigent-agent-message",
+        lambda match: "&lt;" + match.group(0)[1:],
+        message,
+        flags=re.IGNORECASE,
+    )
+    sender_agent = _html.escape(sender.agent_name or "unknown", quote=True)
+    sender_title = _html.escape(sender.title or "unknown", quote=True)
+    return (
+        f'<omnigent-agent-message from="{_html.escape(sender.session_id, quote=True)}" '
+        f'agent="{sender_agent}" title="{sender_title}" relation="{relation}">\n'
+        "This message came from an agent, not a human.\n"
+        f"Your final turn text is delivered back to that agent's inbox automatically "
+        f"— write it for {sender.session_id} ({sender.agent_name or 'unknown'}), "
+        "not for a person.\n"
+        "Do not call sys_session_send to reply to this message; ending your turn is the reply.\n"
+        f"To verify who sent this, call sys_session_get_info with "
+        f"session_id={sender.session_id}.\n"
+        f"Message:\n{safe_message}\n"
+        "</omnigent-agent-message>"
+    )
 
 
 async def _post_child_message_event(
@@ -1743,7 +1814,7 @@ async def _execute_subagent_tool(
                 "existing session. Re-send without 'cost_budget' to continue "
                 f"session {target_session_id!r}."
             )
-        dispatch_created_by = await _session_turn_actor(
+        dispatch_identity = await _session_turn_actor(
             server_client=server_client,
             conversation_id=conversation_id,
         )
@@ -1753,7 +1824,7 @@ async def _execute_subagent_tool(
             server_client=server_client,
             conversation_id=conversation_id,
             publish_event=publish_event,
-            created_by=dispatch_created_by,
+            sender_identity=dispatch_identity,
         )
 
     # Named mode: (agent, title) spawn-or-continue.
@@ -1774,7 +1845,7 @@ async def _execute_subagent_tool(
     if not _has_subagent(sub_agent_name, agent_spec):
         return f"Error: sub-agent {sub_agent_name!r} not found in agent spec"
 
-    dispatch_created_by = await _session_turn_actor(
+    dispatch_identity = await _session_turn_actor(
         server_client=server_client,
         conversation_id=conversation_id,
     )
@@ -2086,7 +2157,7 @@ async def _execute_subagent_tool(
         agent=str(sub_agent_name),
         title=session_name,
         wrapper_label=child_wrapper_label,
-        created_by=dispatch_created_by,
+        created_by=dispatch_identity.actor,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -2120,6 +2191,15 @@ async def _execute_subagent_tool(
         return copy_result.error
     message_content = copy_result.content
     assert message_content is not None
+    message_content = [
+        {
+            **content_item,
+            "text": _agent_message_envelope(content_item["text"], dispatch_identity, "parent"),
+        }
+        if content_item.get("type") == "input_text" and isinstance(content_item.get("text"), str)
+        else content_item
+        for content_item in message_content
+    ]
 
     # Send the user message as a separate event so the server's
     # post_event forwards it to the runner and starts the child
@@ -2129,7 +2209,7 @@ async def _execute_subagent_tool(
             server_client,
             child_session_id,
             content=message_content,
-            created_by=dispatch_created_by,
+            created_by=dispatch_identity.actor,
         )
     except httpx.HTTPError as exc:
         teardown_warning = await _teardown_failed_child(
@@ -2544,7 +2624,7 @@ async def _send_to_peer_session(
     server_client: httpx.AsyncClient,
     conversation_id: str,
     snap_data: _JsonObject,
-    created_by: str | None,
+    sender_identity: _SessionTurnIdentity,
 ) -> str:
     """
     Message a session that is not the caller's child, and await its reply.
@@ -2564,12 +2644,12 @@ async def _send_to_peer_session(
     can never be in the caller's spawn tree.
 
     :param target_session_id: The peer session id, e.g. ``"conv_abc123"``.
-    :param message: Text to deliver.
+    :param message: Text to deliver; it is wrapped in a provenance envelope.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's own session id — the inbox that
         receives the reply.
     :param snap_data: The peer's already-fetched session snapshot.
-    :param created_by: Human actor to attribute the message to.
+    :param sender_identity: Identity of the sending session.
     :returns: A JSON handle carrying ``work_id``, or a JSON/text error.
     """
     from omnigent.runner import app as _runner_app
@@ -2657,6 +2737,8 @@ async def _send_to_peer_session(
 
     # Anchor BEFORE posting so the poller can distinguish our reply.
     anchor_item_id = await _newest_item_id(target_session_id, server_client)
+    relation = "child" if target_session_id == sender_identity.parent_session_id else "peer"
+    wrapped_message = _agent_message_envelope(message, sender_identity, relation)
     agent_label = _optional_string(snap_data.get("agent_name")) or "agent"
     peer_title = title_without_closed_marker(_optional_string(snap_data.get("title"))) or None
     work_entry = _runner_app.register_subagent_work(
@@ -2665,14 +2747,14 @@ async def _send_to_peer_session(
         agent=agent_label,
         title=peer_title or "",
         wrapper_label=_session_wrapper_label(snap_data),
-        created_by=created_by,
+        created_by=sender_identity.actor,
     )
     try:
         msg_resp = await _post_child_message_event(
             server_client,
             target_session_id,
-            content=[{"type": "input_text", "text": message}],
-            created_by=created_by,
+            content=[{"type": "input_text", "text": wrapped_message}],
+            created_by=sender_identity.actor,
         )
     except httpx.HTTPError as exc:
         _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
@@ -2697,7 +2779,7 @@ async def _send_to_peer_session(
         child_session_id=target_session_id,
         work_id=work_entry.work_id,
         anchor_item_id=anchor_item_id,
-        sent_text=message,
+        sent_text=wrapped_message,
     )
     return json.dumps(
         {
@@ -2726,7 +2808,7 @@ async def _send_to_existing_session(
     server_client: httpx.AsyncClient,
     conversation_id: str,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
-    created_by: str | None = None,
+    sender_identity: _SessionTurnIdentity,
 ) -> str:
     """
     Post a message to an existing direct-child session, return a handle.
@@ -2744,10 +2826,12 @@ async def _send_to_existing_session(
 
     :param target_session_id: The existing child session id, e.g.
         ``"conv_abc123"``.
-    :param message: The user message text to post.
+    :param message: The user message text to post; it is wrapped in a
+        provenance envelope before posting.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's own session id — the required
         parent of the target.
+    :param sender_identity: Identity of the sending session.
     :returns: JSON handle on success; a JSON/text error otherwise.
     """
     from omnigent.runner import app as _runner_app
@@ -2779,7 +2863,7 @@ async def _send_to_existing_session(
             server_client=server_client,
             conversation_id=conversation_id,
             snap_data=snap_data,
-            created_by=created_by,
+            sender_identity=sender_identity,
         )
     if is_session_closed(snap_data.get("labels"), snap_data.get("title")):
         return json.dumps(
@@ -2832,7 +2916,7 @@ async def _send_to_existing_session(
         agent=agent_label,
         title=child_label or "",
         wrapper_label=_session_wrapper_label(snap_data),
-        created_by=created_by,
+        created_by=sender_identity.actor,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -2843,12 +2927,13 @@ async def _send_to_existing_session(
         publish_event=publish_event,
     )
 
+    wrapped_message = _agent_message_envelope(message, sender_identity, "parent")
     try:
         msg_resp = await _post_child_message_event(
             server_client,
             target_session_id,
-            content=[{"type": "input_text", "text": message}],
-            created_by=created_by,
+            content=[{"type": "input_text", "text": wrapped_message}],
+            created_by=sender_identity.actor,
         )
     except httpx.HTTPError as exc:
         _runner_app.unregister_child_session(target_session_id)
@@ -3012,6 +3097,7 @@ def _build_session_create_body(
     model: object = None,
     reasoning_effort: object = None,
     workspace: str | None = None,
+    sender_identity: _SessionTurnIdentity | None = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -3036,6 +3122,7 @@ def _build_session_create_body(
         boundary-checked by :func:`_validated_child_workspace`. Never pass a
         raw caller value: the server only validates this field when
         ``host_id`` is set, which this body never sends.
+    :param sender_identity: Resolved identity of the calling session.
     :returns: The JSON request body.
 
     Deliberately sends NO ``host_id``. A parented create always inherits the
@@ -3059,10 +3146,25 @@ def _build_session_create_body(
     if workspace:
         body["workspace"] = workspace
     if isinstance(message, str) and message:
+        sender = sender_identity or _SessionTurnIdentity(
+            session_id=conversation_id,
+            actor=None,
+            agent_name=None,
+            title=None,
+            parent_session_id=None,
+        )
         body["initial_items"] = [
             {
                 "type": "message",
-                "data": {"role": "user", "content": [{"type": "input_text", "text": message}]},
+                "data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": _agent_message_envelope(message, sender, "parent"),
+                        }
+                    ],
+                },
             }
         ]
     return body
@@ -3280,6 +3382,10 @@ async def _execute_session_create(
     )
     if limit_error is not None:
         return limit_error
+    sender_identity = await _session_turn_actor(
+        server_client=server_client,
+        conversation_id=conversation_id,
+    )
     body = _build_session_create_body(
         str(agent_id),
         conversation_id,
@@ -3288,6 +3394,7 @@ async def _execute_session_create(
         model=args.get("model"),
         reasoning_effort=reasoning_effort,
         workspace=checked_workspace[0],
+        sender_identity=sender_identity,
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -3327,9 +3434,7 @@ async def _execute_session_create(
         title=args.get("title"),
         publish_event=publish_event,
         starts_turn=bool(body.get("initial_items")),
-        created_by=await _session_turn_actor(
-            server_client=server_client, conversation_id=conversation_id
-        ),
+        created_by=sender_identity.actor,
     )
 
 
@@ -3378,6 +3483,8 @@ async def _post_child_first_message(
     child_session_id: str,
     message: str,
     server_client: httpx.AsyncClient,
+    *,
+    sender_identity: _SessionTurnIdentity,
 ) -> str | None:
     """
     Queue a bundle-created child's first user message.
@@ -3390,6 +3497,7 @@ async def _post_child_first_message(
         e.g. ``"conv_abc123"``.
     :param message: The first user message text.
     :param server_client: HTTP client pointed at the Omnigent server.
+    :param sender_identity: Identity of the sending session.
     :returns: ``None`` on success; a JSON error string (carrying the
         created ``conversation_id`` so the orchestrator can retry via
         ``sys_session_send``) on failure.
@@ -3401,7 +3509,12 @@ async def _post_child_first_message(
                 "type": "message",
                 "data": {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": message}],
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": _agent_message_envelope(message, sender_identity, "parent"),
+                        }
+                    ],
                 },
             },
             timeout=30.0,
@@ -3577,8 +3690,16 @@ async def _session_create_from_config_path(
         )
 
     message = args.get("message")
+    sender_identity = await _session_turn_actor(
+        server_client=server_client, conversation_id=conversation_id
+    )
     if isinstance(message, str) and message:
-        message_error = await _post_child_first_message(child_session_id, message, server_client)
+        message_error = await _post_child_first_message(
+            child_session_id,
+            message,
+            server_client,
+            sender_identity=sender_identity,
+        )
         if message_error is not None:
             return message_error
 
@@ -3595,9 +3716,7 @@ async def _session_create_from_config_path(
         title=args.get("title"),
         publish_event=publish_event,
         starts_turn=isinstance(message, str) and bool(message),
-        created_by=await _session_turn_actor(
-            server_client=server_client, conversation_id=conversation_id
-        ),
+        created_by=sender_identity.actor,
     )
 
 
@@ -5260,6 +5379,9 @@ async def _session_get_info_via_rest(
             # mean the session is stuck. Pair it with ``status`` and
             # ``runner_online`` before concluding anything.
             "last_activity_at": snap.get("updated_at"),
+            # A non-null value means the last launch or turn failed; the
+            # reason survives reload because it is persisted as session labels.
+            "last_task_error": snap.get("last_task_error"),
             "title": snap.get("title"),
             "agent_id": snap.get("agent_id"),
             # Present the public agent name: a native-UI wrapper session
@@ -5292,10 +5414,8 @@ async def _session_get_info_via_rest(
             # waiting on.
             "pending_elicitations": pending,
             "pending_elicitation_count": len(pending),
-            # Whether a message sent while this session is busy redirects
-            # the active turn or waits for it. Without this a caller
-            # cannot tell if a correction lands in seconds or minutes.
-            # ``None`` when the harness makes no declared claim.
+            # This reports the harness's declared capability; a send is refused
+            # while a dispatch from this surface is outstanding.
             "supports_midturn_steer": _session_supports_midturn_steer(snap),
         }
     )
