@@ -480,7 +480,7 @@ def test_session_send_schema_drops_named_mode_without_sub_agents() -> None:
         s for s in bare.get_tool_schemas() if s["function"]["name"] == "sys_session_send"
     )
     bare_params = bare_schema["function"]["parameters"]
-    assert set(bare_params["properties"]) == {"session_id", "args"}
+    assert set(bare_params["properties"]) == {"session_id", "args", "if_busy"}
 
     spec = AgentSpec(
         spec_version=1,
@@ -492,7 +492,13 @@ def test_session_send_schema_drops_named_mode_without_sub_agents() -> None:
         s for s in named.get_tool_schemas() if s["function"]["name"] == "sys_session_send"
     )
     named_params = named_schema["function"]["parameters"]
-    assert set(named_params["properties"]) == {"agent", "title", "session_id", "args"}
+    assert set(named_params["properties"]) == {
+        "agent",
+        "title",
+        "session_id",
+        "args",
+        "if_busy",
+    }
     # The enum carries exactly the declared sub-agent names.
     assert named_params["properties"]["agent"]["enum"] == ["researcher"]
 

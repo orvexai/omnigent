@@ -7189,7 +7189,13 @@ async def test_send_to_a_child_with_live_work_is_refused() -> None:
         ) as server_client:
             output = await execute_tool(
                 tool_name="sys_session_send",
-                arguments=json.dumps({"session_id": "conv_busy", "args": "second message"}),
+                arguments=json.dumps(
+                    {
+                        "session_id": "conv_busy",
+                        "args": "second message",
+                        "if_busy": "reject",
+                    }
+                ),
                 server_client=server_client,
                 conversation_id="conv_caller",
                 agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
@@ -8870,7 +8876,9 @@ async def test_sys_session_send_reaches_a_peer_session_and_awaits_its_reply() ->
         ) as server_client:
             output = await execute_tool(
                 tool_name="sys_session_send",
-                arguments=json.dumps({"session_id": "conv_other", "args": "hi"}),
+                arguments=json.dumps(
+                    {"session_id": "conv_other", "args": "hi", "if_busy": "reject"}
+                ),
                 server_client=server_client,
                 conversation_id="conv_caller",
                 agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),

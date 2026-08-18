@@ -187,7 +187,7 @@ def test_get_info_description_documents_failure_and_send_semantics() -> None:
 
     assert "last_task_error" in description
     assert "accepted, not started" in description
-    assert "a correction does not reach the running turn" in description
+    assert "can queue a child message" in description
     assert "sys_cancel_task" in description
 
 

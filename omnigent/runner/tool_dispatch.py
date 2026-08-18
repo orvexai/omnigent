@@ -36,7 +36,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from omnigent.json_types import JsonObject as _JsonObject
 
@@ -1268,6 +1268,167 @@ async def _post_child_message_event(
     )
 
 
+_SUBAGENT_INTERRUPT_CONFIRM_TIMEOUT_S = 30.0
+
+
+def _response_delivery(response: httpx.Response) -> str | None:
+    """Return an optional runner delivery verdict from a server response."""
+    try:
+        value = response.json().get("delivery")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return value if value in ("buffered", "accepted") else None
+
+
+def _message_post_error(
+    response: httpx.Response, *, session_id: str, target_label: str = "session"
+) -> str:
+    """Map typed runner refusals while retaining the established fallback."""
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        body = None
+    error_code = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error_code, dict):
+        error_code = error_code.get("code")
+    if error_code == "queue_full":
+        detail = body.get("detail") if isinstance(body, dict) else None
+        if isinstance(body, dict) and isinstance(body.get("error"), dict):
+            detail = body["error"].get("message") or detail
+        return json.dumps(
+            {
+                "error": "queue_full",
+                "conversation_id": session_id,
+                "message": detail or "session message buffer is full",
+            }
+        )
+    return (
+        f"Error: failed to send message to {target_label}: "
+        f"{response.status_code} {response.text[:200]}"
+    )
+
+
+async def _post_subagent_cancel_event(
+    entry: Any,
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient,
+) -> tuple[httpx.Response, str]:
+    """Post the harness-specific cancellation event for a dispatch."""
+    event_type = (
+        "stop_session"
+        if getattr(entry, "wrapper_label", None) == CLAUDE_NATIVE_WRAPPER_VALUE
+        else "interrupt"
+    )
+    data: _JsonObject = {}
+    response = await server_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": event_type, "data": data},
+        timeout=30.0,
+    )
+    return response, event_type
+
+
+async def _wait_for_subagent_terminal(
+    *,
+    session_id: str,
+    work_id: str | None,
+    server_client: httpx.AsyncClient,
+    runner_app: Any,
+) -> bool:
+    """Wait for a cancelled dispatch or target session to leave its turn."""
+    deadline = asyncio.get_running_loop().time() + _SUBAGENT_INTERRUPT_CONFIRM_TIMEOUT_S
+    while asyncio.get_running_loop().time() < deadline:
+        entry = runner_app.get_subagent_work(session_id)
+        if work_id is not None:
+            if entry is None or entry.work_id != work_id:
+                try:
+                    snapshot = await server_client.get(f"/v1/sessions/{session_id}", timeout=5.0)
+                    status = snapshot.json().get("status") if snapshot.status_code == 200 else None
+                    if status in ("idle", "failed", "cancelled", "completed"):
+                        return True
+                except (httpx.HTTPError, ValueError, TypeError):
+                    pass
+                await asyncio.sleep(0.1)
+                continue
+            if entry.status in ("completed", "failed", "cancelled"):
+                return True
+            try:
+                snapshot = await server_client.get(f"/v1/sessions/{session_id}", timeout=5.0)
+                status = snapshot.json().get("status") if snapshot.status_code == 200 else None
+                if status in ("idle", "failed", "cancelled", "completed"):
+                    return True
+            except (httpx.HTTPError, ValueError, TypeError):
+                pass
+        else:
+            try:
+                snapshot = await server_client.get(f"/v1/sessions/{session_id}", timeout=5.0)
+                status = snapshot.json().get("status") if snapshot.status_code == 200 else None
+                if status in ("idle", "failed", "cancelled", "completed"):
+                    return True
+            except (httpx.HTTPError, ValueError, TypeError):
+                pass
+        await asyncio.sleep(0.1)
+    return False
+
+
+async def _interrupt_before_send(
+    *,
+    target_session_id: str,
+    conversation_id: str,
+    snap_data: _JsonObject,
+    server_client: httpx.AsyncClient,
+    runner_app: Any,
+) -> tuple[str | None, str | None]:
+    """Cancel an authorized turn and confirm its terminal edge."""
+    entry = runner_app.get_subagent_work(target_session_id)
+    direct_child = _session_is_local_to_caller(target_session_id, conversation_id, snap_data)
+    if entry is None and not direct_child:
+        return None, json.dumps(
+            {"error": "cancel_not_authorized", "conversation_id": target_session_id}
+        )
+    if entry is not None and entry.parent_session_id != conversation_id and not direct_child:
+        return None, json.dumps(
+            {"error": "cancel_not_authorized", "conversation_id": target_session_id}
+        )
+    old_work_id = entry.work_id if entry is not None else None
+    cancel_entry = (
+        entry or type("CancelEntry", (), {"wrapper_label": _session_wrapper_label(snap_data)})()
+    )
+    event_type = "interrupt"
+    try:
+        response, event_type = await _post_subagent_cancel_event(
+            cancel_entry,
+            session_id=target_session_id,
+            server_client=server_client,
+        )
+    except httpx.HTTPError as exc:
+        return None, (f"Error: sys_session_send {event_type} failed: {type(exc).__name__}: {exc}")
+    if response.status_code >= 400:
+        return None, json.dumps(
+            {
+                "error": "interrupt_unconfirmed",
+                "conversation_id": target_session_id,
+                "message": f"cancellation returned {response.status_code}",
+            }
+        )
+    best_effort = getattr(cancel_entry, "wrapper_label", None) == CODEX_NATIVE_WRAPPER_VALUE
+    if not best_effort and not await _wait_for_subagent_terminal(
+        session_id=target_session_id,
+        work_id=old_work_id,
+        server_client=server_client,
+        runner_app=runner_app,
+    ):
+        return None, json.dumps(
+            {
+                "error": "interrupt_unconfirmed",
+                "conversation_id": target_session_id,
+                "message": "cancellation was not confirmed before the timeout",
+            }
+        )
+    return old_work_id, None
+
+
 def _subagent_model_from_args(args: _JsonObject) -> str | None:
     """
     Extract and validate the per-dispatch model from ``sys_session_send`` args.
@@ -1750,6 +1911,9 @@ async def _execute_subagent_tool(
         return "Error: sys_session_send requires server_client"
     if conversation_id is None:
         return "Error: sys_session_send requires conversation_id"
+    if_busy = args.get("if_busy")
+    if if_busy is not None and if_busy not in ("reject", "queue", "interrupt"):
+        return 'Error: sys_session_send invalid "if_busy"; expected reject, queue, or interrupt'
     if session_inbox is not None:
         _runner_app._session_inboxes_ref.setdefault(conversation_id, session_inbox)
     elif conversation_id not in _runner_app._session_inboxes_ref:
@@ -1825,6 +1989,7 @@ async def _execute_subagent_tool(
             conversation_id=conversation_id,
             publish_event=publish_event,
             sender_identity=dispatch_identity,
+            if_busy=if_busy,
         )
 
     # Named mode: (agent, title) spawn-or-continue.
@@ -1883,6 +2048,10 @@ async def _execute_subagent_tool(
     assert not isinstance(existing, str)
     created_child = False
     child_wrapper_label: str | None = None
+    busy_mode = if_busy or "queue"
+    cancelled_work_id: str | None = None
+    interrupt_confirmed = False
+    existing_work: Any = None
     if existing is not None:
         child_session_id = existing.get("id")
         if not isinstance(child_session_id, str) or not child_session_id:
@@ -1923,19 +2092,44 @@ async def _execute_subagent_tool(
             "running",
             "waiting",
         ):
-            return (
-                f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "already has a launching or running turn. Use a distinct task-based title "
-                "for independent parallel work; reuse this title only to continue the same "
-                "conversation after completion."
-            )
+            if busy_mode == "reject":
+                return (
+                    f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
+                    "already has a launching or running turn. Use a distinct task-based title "
+                    "for independent parallel work; reuse this title only to continue the same "
+                    "conversation after completion."
+                )
+            if busy_mode == "queue" and existing_work.parent_session_id != conversation_id:
+                return json.dumps(
+                    {
+                        "error": "session_busy_other_dispatcher",
+                        "conversation_id": child_session_id,
+                    }
+                )
+            if busy_mode == "interrupt":
+                cancelled_work_id, cancel_error = await _interrupt_before_send(
+                    target_session_id=child_session_id,
+                    conversation_id=conversation_id,
+                    snap_data=existing,
+                    server_client=server_client,
+                    runner_app=_runner_app,
+                )
+                if cancel_error is not None:
+                    return cancel_error
+                existing_work = None
+                interrupt_confirmed = True
         if existing.get("busy") is True:
-            return (
-                f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "is already running. Use a distinct task-based title for independent "
-                "parallel work; reuse this title only to continue the same conversation "
-                "after completion."
-            )
+            if busy_mode == "interrupt" and existing_work is None and not interrupt_confirmed:
+                cancelled_work_id, cancel_error = await _interrupt_before_send(
+                    target_session_id=child_session_id,
+                    conversation_id=conversation_id,
+                    snap_data=existing,
+                    server_client=server_client,
+                    runner_app=_runner_app,
+                )
+                if cancel_error is not None:
+                    return cancel_error
+                interrupt_confirmed = True
     else:
         if not session_name:
             # No title hint — auto-generate a structured session name
@@ -2151,22 +2345,41 @@ async def _execute_subagent_tool(
         tool=sub_agent_name,
         session_name=session_name,
     )
-    _runner_app.register_subagent_work(
-        parent_session_id=conversation_id,
-        child_session_id=child_session_id,
-        agent=str(sub_agent_name),
-        title=session_name,
-        wrapper_label=child_wrapper_label,
-        created_by=dispatch_identity.actor,
+    coalesced = existing_work is not None and existing_work.status in (
+        "launching",
+        "running",
+        "waiting",
     )
-    _publish_child_launching_update(
-        parent_session_id=conversation_id,
-        child_session_id=child_session_id,
-        title=f"{sub_agent_name}:{session_name}",
-        tool=str(sub_agent_name),
-        session_name=session_name,
-        publish_event=publish_event,
+    if coalesced and existing_work.queued_sends >= _runner_app._SUBAGENT_QUEUED_SEND_CAP:
+        return json.dumps(
+            {
+                "error": "queue_full",
+                "conversation_id": child_session_id,
+                "message": "this dispatch has reached its queued-send limit",
+            }
+        )
+    work_entry = (
+        existing_work
+        if coalesced
+        else _runner_app.register_subagent_work(
+            parent_session_id=conversation_id,
+            child_session_id=child_session_id,
+            agent=str(sub_agent_name),
+            title=session_name,
+            wrapper_label=child_wrapper_label,
+            created_by=dispatch_identity.actor,
+        )
     )
+    assert work_entry is not None
+    if not coalesced:
+        _publish_child_launching_update(
+            parent_session_id=conversation_id,
+            child_session_id=child_session_id,
+            title=f"{sub_agent_name}:{session_name}",
+            tool=str(sub_agent_name),
+            session_name=session_name,
+            publish_event=publish_event,
+        )
 
     # Copy any forwarded parent files into the child and build the
     # first-turn content (input_text plus a file block per copied id).
@@ -2212,27 +2425,84 @@ async def _execute_subagent_tool(
             created_by=dispatch_identity.actor,
         )
     except httpx.HTTPError as exc:
-        teardown_warning = await _teardown_failed_child(
-            server_client,
-            child_session_id,
-            created_child=created_child,
-        )
+        teardown_warning = None
+        if not coalesced:
+            teardown_warning = await _teardown_failed_child(
+                server_client,
+                child_session_id,
+                created_child=created_child,
+            )
         error = f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
         if teardown_warning is not None:
             return f"{error}\n{teardown_warning}"
         return error
     if msg_resp.status_code >= 400:
-        teardown_warning = await _teardown_failed_child(
-            server_client,
-            child_session_id,
-            created_child=created_child,
-        )
+        teardown_warning = None
+        if not coalesced:
+            teardown_warning = await _teardown_failed_child(
+                server_client,
+                child_session_id,
+                created_child=created_child,
+            )
+        if coalesced:
+            return _message_post_error(msg_resp, session_id=child_session_id, target_label="child")
         error = (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
         if teardown_warning is not None:
             return f"{error}\n{teardown_warning}"
         return error
+
+    denial = event_denial_reason(msg_resp)
+    if denial is not None:
+        if not coalesced:
+            await _teardown_failed_child(
+                server_client,
+                child_session_id,
+                created_child=created_child,
+            )
+        return json.dumps(
+            {
+                "error": "message_denied",
+                "conversation_id": child_session_id,
+                "message": f"the child refused the message: {denial}",
+            }
+        )
+
+    if coalesced and _response_delivery(msg_resp) in ("accepted", "buffered"):
+        current = _runner_app.get_subagent_work(child_session_id)
+        if (
+            current is None
+            or current.work_id != work_entry.work_id
+            or current.status in ("completed", "failed", "cancelled")
+        ):
+            work_entry = _runner_app.register_subagent_work(
+                parent_session_id=conversation_id,
+                child_session_id=child_session_id,
+                agent=str(sub_agent_name),
+                title=session_name,
+                wrapper_label=child_wrapper_label,
+                created_by=dispatch_identity.actor,
+            )
+            coalesced = False
+
+    wrapped_message = next(
+        (
+            item.get("text")
+            for item in message_content
+            if item.get("type") == "input_text" and isinstance(item.get("text"), str)
+        ),
+        None,
+    )
+    if (
+        _runner_app.note_subagent_work_send(
+            child_session_id,
+            work_id=work_entry.work_id,
+            sent_text=wrapped_message,
+        )
+        is None
+    ):
+        return json.dumps({"error": "dispatch_superseded", "conversation_id": child_session_id})
 
     # Return the structured handle mirrored from ``spawn.py``. The debug panel
     # parses this to discover child sessions in the sidebar.
@@ -2242,9 +2512,18 @@ async def _execute_subagent_tool(
             "handle_id": child_session_id,
             "conversation_id": child_session_id,
             "kind": "sub_agent",
+            "work_id": work_entry.work_id,
             "agent": sub_agent_name,
             "title": session_name,
-            "status": "launching",
+            "status": "queued" if coalesced else "launching",
+            **({"queued": True, "delivered": _response_delivery(msg_resp)} if coalesced else {}),
+            **({"cancelled_work_id": cancelled_work_id} if cancelled_work_id else {}),
+            **({"steered": True} if cancelled_work_id else {}),
+            **(
+                {"best_effort": True}
+                if cancelled_work_id and child_wrapper_label == CODEX_NATIVE_WRAPPER_VALUE
+                else {}
+            ),
             "message": (
                 f"[System: sub-agent {sub_agent_name} title {session_name!r} "
                 f"launching as task {child_session_id}. Result will appear in "
@@ -2625,6 +2904,7 @@ async def _send_to_peer_session(
     conversation_id: str,
     snap_data: _JsonObject,
     sender_identity: _SessionTurnIdentity,
+    if_busy: str | None = None,
 ) -> str:
     """
     Message a session that is not the caller's child, and await its reply.
@@ -2673,23 +2953,22 @@ async def _send_to_peer_session(
                 "message": "target session is closed and cannot accept input.",
             }
         )
-    # Refuse a busy peer rather than steering someone else's turn: the reply
-    # would merge into work this caller did not request, and the owning
-    # runner tracks one dispatch per session, so the real requester's result
-    # would be corrupted too.
+    busy_mode = if_busy or "reject"
+    cancelled_work_id: str | None = None
     status = _optional_string(snap_data.get("status"))
     if status in ("running", "waiting"):
-        return json.dumps(
-            {
-                "error": "session_busy",
-                "conversation_id": target_session_id,
-                "status": status,
-                "message": (
-                    "target session is mid-turn; wait for it to go idle before "
-                    "sending (poll sys_session_get_info)."
-                ),
-            }
-        )
+        if busy_mode == "reject":
+            return json.dumps(
+                {
+                    "error": "session_busy",
+                    "conversation_id": target_session_id,
+                    "status": status,
+                    "message": (
+                        "target session is mid-turn; wait for it to go idle before "
+                        "sending (poll sys_session_get_info)."
+                    ),
+                }
+            )
     target_runner = _optional_string(snap_data.get("runner_id"))
     if target_runner is None:
         return json.dumps(
@@ -2723,17 +3002,47 @@ async def _send_to_peer_session(
             }
         )
     existing = _runner_app.get_subagent_work(target_session_id)
-    if existing is not None and existing.status in ("launching", "running", "waiting"):
-        return json.dumps(
-            {
-                "error": "session_busy",
-                "conversation_id": target_session_id,
-                "message": (
-                    "a dispatch to this session is already outstanding; wait "
-                    "for its result before sending again."
-                ),
-            }
+    if status in ("running", "waiting") and busy_mode == "interrupt" and existing is None:
+        cancelled_work_id, cancel_error = await _interrupt_before_send(
+            target_session_id=target_session_id,
+            conversation_id=conversation_id,
+            snap_data=snap_data,
+            server_client=server_client,
+            runner_app=_runner_app,
         )
+        if cancel_error is not None:
+            return cancel_error
+    if existing is not None and existing.status in ("launching", "running", "waiting"):
+        if busy_mode == "reject":
+            return json.dumps(
+                {
+                    "error": "session_busy",
+                    "conversation_id": target_session_id,
+                    "message": (
+                        "a dispatch to this session is already outstanding; wait "
+                        "for its result before sending again."
+                    ),
+                }
+            )
+        if busy_mode == "queue":
+            if existing.parent_session_id != conversation_id:
+                return json.dumps(
+                    {
+                        "error": "session_busy_other_dispatcher",
+                        "conversation_id": target_session_id,
+                    }
+                )
+        else:
+            cancelled_work_id, cancel_error = await _interrupt_before_send(
+                target_session_id=target_session_id,
+                conversation_id=conversation_id,
+                snap_data=snap_data,
+                server_client=server_client,
+                runner_app=_runner_app,
+            )
+            if cancel_error is not None:
+                return cancel_error
+            existing = None
 
     # Anchor BEFORE posting so the poller can distinguish our reply.
     anchor_item_id = await _newest_item_id(target_session_id, server_client)
@@ -2741,14 +3050,32 @@ async def _send_to_peer_session(
     wrapped_message = _agent_message_envelope(message, sender_identity, relation)
     agent_label = _optional_string(snap_data.get("agent_name")) or "agent"
     peer_title = title_without_closed_marker(_optional_string(snap_data.get("title"))) or None
-    work_entry = _runner_app.register_subagent_work(
-        parent_session_id=conversation_id,
-        child_session_id=target_session_id,
-        agent=agent_label,
-        title=peer_title or "",
-        wrapper_label=_session_wrapper_label(snap_data),
-        created_by=sender_identity.actor,
+    coalesced = existing is not None and existing.status in ("launching", "running", "waiting")
+    if (
+        coalesced
+        and existing is not None
+        and existing.queued_sends >= _runner_app._SUBAGENT_QUEUED_SEND_CAP
+    ):
+        return json.dumps(
+            {
+                "error": "queue_full",
+                "conversation_id": target_session_id,
+                "message": "this dispatch has reached its queued-send limit",
+            }
+        )
+    work_entry = (
+        existing
+        if coalesced
+        else _runner_app.register_subagent_work(
+            parent_session_id=conversation_id,
+            child_session_id=target_session_id,
+            agent=agent_label,
+            title=peer_title or "",
+            wrapper_label=_session_wrapper_label(snap_data),
+            created_by=sender_identity.actor,
+        )
     )
+    assert work_entry is not None
     try:
         msg_resp = await _post_child_message_event(
             server_client,
@@ -2757,17 +3084,17 @@ async def _send_to_peer_session(
             created_by=sender_identity.actor,
         )
     except httpx.HTTPError as exc:
-        _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
+        if not coalesced:
+            _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
         return f"Error: failed to send message to session: {type(exc).__name__}: {exc}"
     if msg_resp.status_code >= 400:
-        _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
-        return (
-            f"Error: failed to send message to session: "
-            f"{msg_resp.status_code} {msg_resp.text[:200]}"
-        )
+        if not coalesced:
+            _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
+        return _message_post_error(msg_resp, session_id=target_session_id, target_label="session")
     denial = event_denial_reason(msg_resp)
     if denial is not None:
-        _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
+        if not coalesced:
+            _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
         return json.dumps(
             {
                 "error": "message_denied",
@@ -2775,12 +3102,42 @@ async def _send_to_peer_session(
                 "message": f"the target session refused the message: {denial}",
             }
         )
-    start_remote(
-        child_session_id=target_session_id,
+    if coalesced and _response_delivery(msg_resp) in ("accepted", "buffered"):
+        current = _runner_app.get_subagent_work(target_session_id)
+        if (
+            current is None
+            or current.work_id != work_entry.work_id
+            or current.status
+            in (
+                "completed",
+                "failed",
+                "cancelled",
+            )
+        ):
+            work_entry = _runner_app.register_subagent_work(
+                parent_session_id=conversation_id,
+                child_session_id=target_session_id,
+                agent=agent_label,
+                title=peer_title or "",
+                wrapper_label=_session_wrapper_label(snap_data),
+                created_by=sender_identity.actor,
+            )
+            coalesced = False
+    noted = _runner_app.note_subagent_work_send(
+        target_session_id,
         work_id=work_entry.work_id,
-        anchor_item_id=anchor_item_id,
         sent_text=wrapped_message,
+        anchor_item_id=anchor_item_id,
     )
+    if noted is None:
+        return json.dumps({"error": "dispatch_superseded", "conversation_id": target_session_id})
+    if not coalesced:
+        start_remote(
+            child_session_id=target_session_id,
+            work_id=work_entry.work_id,
+            anchor_item_id=anchor_item_id,
+            sent_text=wrapped_message,
+        )
     return json.dumps(
         {
             "task_id": target_session_id,
@@ -2791,7 +3148,16 @@ async def _send_to_peer_session(
             "agent": agent_label,
             "title": peer_title,
             "host_id": snap_data.get("host_id"),
-            "status": "launching",
+            "status": "queued" if coalesced else "launching",
+            **({"queued": True, "delivered": _response_delivery(msg_resp)} if coalesced else {}),
+            **({"cancelled_work_id": cancelled_work_id} if cancelled_work_id else {}),
+            **({"steered": True} if cancelled_work_id else {}),
+            **(
+                {"best_effort": True}
+                if cancelled_work_id
+                and _session_wrapper_label(snap_data) == CODEX_NATIVE_WRAPPER_VALUE
+                else {}
+            ),
             "message": (
                 f"[System: message delivered to session {target_session_id} "
                 f"({agent_label}). Its reply will appear in your inbox; call "
@@ -2809,6 +3175,7 @@ async def _send_to_existing_session(
     conversation_id: str,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     sender_identity: _SessionTurnIdentity,
+    if_busy: str | None = None,
 ) -> str:
     """
     Post a message to an existing direct-child session, return a handle.
@@ -2864,6 +3231,7 @@ async def _send_to_existing_session(
             conversation_id=conversation_id,
             snap_data=snap_data,
             sender_identity=sender_identity,
+            if_busy=if_busy,
         )
     if is_session_closed(snap_data.get("labels"), snap_data.get("title")):
         return json.dumps(
@@ -2885,24 +3253,53 @@ async def _send_to_existing_session(
         parsed = _ParsedTitle(agent=None, title=None)
     agent_label = parsed.agent or _optional_string(snap_data.get("agent_name")) or "agent"
     child_label = parsed.title if parsed.agent is not None else (raw_title or None)
-    # One outstanding dispatch per child, always — even on a harness that
-    # can steer. ``register_subagent_work`` is keyed by child session id and
-    # REPLACES the prior entry, so the registry cannot represent two live
-    # dispatches: a second send silently orphans the first work_id, and if
-    # the outgoing turn ends inside the message-POST window its output is
-    # delivered under the NEW dispatch's id while the second turn's real
-    # output is dropped by the ``delivered`` dedupe. Steering must wait for
-    # a registry that can hold both before the guard can relax.
+    busy_mode = if_busy or "queue"
+    cancelled_work_id: str | None = None
+    interrupt_confirmed = False
     existing_work = _runner_app.get_subagent_work(target_session_id)
     if existing_work is not None and existing_work.status in (
         "launching",
         "running",
         "waiting",
     ):
-        return (
-            f"Error: session {target_session_id!r} already has a launching or running turn; "
-            "wait for completion before sending again (use sys_cancel_task to interrupt it)"
-        )
+        if busy_mode == "reject":
+            return (
+                f"Error: session {target_session_id!r} already has a launching or running turn; "
+                "wait for completion before sending again (use sys_cancel_task to interrupt it)"
+            )
+        if busy_mode == "queue" and existing_work.parent_session_id != conversation_id:
+            return json.dumps(
+                {
+                    "error": "session_busy_other_dispatcher",
+                    "conversation_id": target_session_id,
+                }
+            )
+        if busy_mode == "interrupt":
+            cancelled_work_id, cancel_error = await _interrupt_before_send(
+                target_session_id=target_session_id,
+                conversation_id=conversation_id,
+                snap_data=snap_data,
+                server_client=server_client,
+                runner_app=_runner_app,
+            )
+            if cancel_error is not None:
+                return cancel_error
+            existing_work = None
+            interrupt_confirmed = True
+    if snap_data.get("busy") is True and (
+        existing_work is None or existing_work.status not in ("launching", "running", "waiting")
+    ):
+        if busy_mode == "interrupt" and not interrupt_confirmed:
+            cancelled_work_id, cancel_error = await _interrupt_before_send(
+                target_session_id=target_session_id,
+                conversation_id=conversation_id,
+                snap_data=snap_data,
+                server_client=server_client,
+                runner_app=_runner_app,
+            )
+            if cancel_error is not None:
+                return cancel_error
+            interrupt_confirmed = True
     _runner_app.register_child_session(
         target_session_id,
         parent_session_id=conversation_id,
@@ -2910,22 +3307,45 @@ async def _send_to_existing_session(
         tool=agent_label,
         session_name=child_label or "",
     )
-    work_entry = _runner_app.register_subagent_work(
-        parent_session_id=conversation_id,
-        child_session_id=target_session_id,
-        agent=agent_label,
-        title=child_label or "",
-        wrapper_label=_session_wrapper_label(snap_data),
-        created_by=sender_identity.actor,
+    coalesced = existing_work is not None and existing_work.status in (
+        "launching",
+        "running",
+        "waiting",
     )
-    _publish_child_launching_update(
-        parent_session_id=conversation_id,
-        child_session_id=target_session_id,
-        title=snap_data.get("title") or "",
-        tool=agent_label,
-        session_name=child_label or "",
-        publish_event=publish_event,
+    if (
+        coalesced
+        and existing_work is not None
+        and existing_work.queued_sends >= _runner_app._SUBAGENT_QUEUED_SEND_CAP
+    ):
+        return json.dumps(
+            {
+                "error": "queue_full",
+                "conversation_id": target_session_id,
+                "message": "this dispatch has reached its queued-send limit",
+            }
+        )
+    work_entry = (
+        existing_work
+        if coalesced
+        else _runner_app.register_subagent_work(
+            parent_session_id=conversation_id,
+            child_session_id=target_session_id,
+            agent=agent_label,
+            title=child_label or "",
+            wrapper_label=_session_wrapper_label(snap_data),
+            created_by=sender_identity.actor,
+        )
     )
+    assert work_entry is not None
+    if not coalesced:
+        _publish_child_launching_update(
+            parent_session_id=conversation_id,
+            child_session_id=target_session_id,
+            title=snap_data.get("title") or "",
+            tool=agent_label,
+            session_name=child_label or "",
+            publish_event=publish_event,
+        )
 
     wrapped_message = _agent_message_envelope(message, sender_identity, "parent")
     try:
@@ -2936,23 +3356,24 @@ async def _send_to_existing_session(
             created_by=sender_identity.actor,
         )
     except httpx.HTTPError as exc:
-        _runner_app.unregister_child_session(target_session_id)
-        _runner_app.unregister_subagent_work(target_session_id)
+        if not coalesced:
+            _runner_app.unregister_child_session(target_session_id)
+            _runner_app.unregister_subagent_work(target_session_id)
         return f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
     if msg_resp.status_code >= 400:
-        _runner_app.unregister_child_session(target_session_id)
-        _runner_app.unregister_subagent_work(target_session_id)
-        return (
-            f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
-        )
+        if not coalesced:
+            _runner_app.unregister_child_session(target_session_id)
+            _runner_app.unregister_subagent_work(target_session_id)
+        return _message_post_error(msg_resp, session_id=target_session_id, target_label="child")
     denial = event_denial_reason(msg_resp)
     if denial is not None:
         # A policy denial answers 202, so the status check above misses it.
         # Without this the child never starts a turn while its work entry
         # stays "launching" forever — the child becomes permanently
         # un-sendable and the parent's turns end as "waiting".
-        _runner_app.unregister_child_session(target_session_id)
-        _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
+        if not coalesced:
+            _runner_app.unregister_child_session(target_session_id)
+            _runner_app.unregister_subagent_work(target_session_id, work_id=work_entry.work_id)
         return json.dumps(
             {
                 "error": "message_denied",
@@ -2961,6 +3382,37 @@ async def _send_to_existing_session(
             }
         )
 
+    if coalesced and _response_delivery(msg_resp) in ("accepted", "buffered"):
+        current = _runner_app.get_subagent_work(target_session_id)
+        if (
+            current is None
+            or current.work_id != work_entry.work_id
+            or current.status
+            in (
+                "completed",
+                "failed",
+                "cancelled",
+            )
+        ):
+            work_entry = _runner_app.register_subagent_work(
+                parent_session_id=conversation_id,
+                child_session_id=target_session_id,
+                agent=agent_label,
+                title=child_label or "",
+                wrapper_label=_session_wrapper_label(snap_data),
+                created_by=sender_identity.actor,
+            )
+            coalesced = False
+
+    if (
+        _runner_app.note_subagent_work_send(
+            target_session_id,
+            work_id=work_entry.work_id,
+            sent_text=wrapped_message,
+        )
+        is None
+    ):
+        return json.dumps({"error": "dispatch_superseded", "conversation_id": target_session_id})
     return json.dumps(
         {
             "task_id": target_session_id,
@@ -2974,7 +3426,16 @@ async def _send_to_existing_session(
             "kind": "sub_agent",
             "agent": agent_label,
             "title": child_label,
-            "status": "launching",
+            "status": "queued" if coalesced else "launching",
+            **({"queued": True, "delivered": _response_delivery(msg_resp)} if coalesced else {}),
+            **({"cancelled_work_id": cancelled_work_id} if cancelled_work_id else {}),
+            **({"steered": True} if cancelled_work_id else {}),
+            **(
+                {"best_effort": True}
+                if cancelled_work_id
+                and _session_wrapper_label(snap_data) == CODEX_NATIVE_WRAPPER_VALUE
+                else {}
+            ),
             "message": (
                 f"[System: sub-agent {agent_label} title {child_label!r} "
                 f"launching as task {target_session_id}. Result will appear in "
@@ -8854,18 +9315,12 @@ async def _cancel_subagent_task(
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
 
-    # claude-native is the only harness with a runner-side hard-stop; every
-    # other harness 204 no-ops on stop_session, so route them to interrupt.
-    event_type = (
-        "stop_session" if entry.wrapper_label == CLAUDE_NATIVE_WRAPPER_VALUE else "interrupt"
-    )
-
+    event_type = "interrupt"
     try:
-        resp = await server_client.post(
-            f"/v1/sessions/{task_id}/events",
-            # Bare control events 422 on servers that require body.data.
-            json={"type": event_type, "data": {}},
-            timeout=30.0,
+        resp, event_type = await _post_subagent_cancel_event(
+            entry,
+            session_id=str(task_id),
+            server_client=server_client,
         )
     except httpx.HTTPError as exc:
         return f"Error: sys_cancel_task {event_type} failed: {type(exc).__name__}: {exc}"

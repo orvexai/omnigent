@@ -129,14 +129,17 @@ async def _post_native_idle(
     seed_parent_inbox: bool,
     register_work: bool,
     output: str = "review complete: LGTM",
+    buffered: int = 0,
+    status: str = "idle",
 ) -> tuple[int, list[dict[str, Any]]]:
-    """POST a native ``external_session_status: idle`` and return (http, inbox items).
+    """POST a native terminal status and return (http, inbox items).
 
     Models the forwarder reporting a finished native sub-agent turn.
     ``register_work`` seeds the in-memory work entry (the healthy case); leaving
     it ``False`` models a reconnect-wiped map or a ``sys_session_create`` child
     the dispatch never registered. ``seed_parent_inbox`` controls whether the
-    parent's inbox queue is present on this runner.
+    parent's inbox queue is present on this runner. ``buffered`` seeds messages
+    behind an active native turn so the idle gate can be observed directly.
     """
     if seed_parent_inbox:
         runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
@@ -163,13 +166,19 @@ async def _post_native_idle(
         spec_resolver=_resolver,
         server_client=_SnapshotServerClient(child_body),  # type: ignore[arg-type]
     )
+    if buffered:
+        app.state.active_turns[CHILD_SESSION_ID] = None
+        app.state.session_message_buffers[CHILD_SESSION_ID] = [
+            {"type": "message", "content": [{"type": "input_text", "text": f"queued-{i}"}]}
+            for i in range(buffered)
+        ]
 
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{CHILD_SESSION_ID}/events",
             json={
                 "type": "external_session_status",
-                "data": {"status": "idle", "output": output},
+                "data": {"status": status, "output": output},
             },
         )
 
@@ -178,7 +187,61 @@ async def _post_native_idle(
     if inbox is not None:
         while not inbox.empty():
             items.append(inbox.get_nowait())
+    app.state.active_turns.pop(CHILD_SESSION_ID, None)
+    app.state.session_message_buffers.pop(CHILD_SESSION_ID, None)
     return resp.status_code, items
+
+
+@pytest.mark.asyncio
+async def test_native_failed_status_reports_discarded_buffer_count(
+    _clean_subagent_registry: None,
+) -> None:
+    """A failed native turn reports queued messages discarded by the failure."""
+    http, items = await _post_native_idle(
+        child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        seed_parent_inbox=True,
+        register_work=True,
+        output="native worker failed",
+        buffered=3,
+        status="failed",
+    )
+    assert http == 204
+    assert len(items) == 1
+    assert items[0]["status"] == "failed"
+    assert "Buffered message(s) discarded: 3." in items[0]["output"]
+
+
+@pytest.mark.asyncio
+async def test_native_idle_with_buffer_does_not_terminalize_twice(
+    _clean_subagent_registry: None,
+) -> None:
+    """A native idle edge waits for a queued continuation before delivering."""
+    http, items = await _post_native_idle(
+        child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        seed_parent_inbox=True,
+        register_work=True,
+        buffered=1,
+    )
+    entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+    assert http == 204
+    assert items == []
+    assert entry is not None
+    assert entry.status == "launching"
+
+
+@pytest.mark.asyncio
+async def test_native_idle_with_empty_buffer_terminalizes_once(
+    _clean_subagent_registry: None,
+) -> None:
+    """An empty native buffer keeps the original completion path intact."""
+    http, items = await _post_native_idle(
+        child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        seed_parent_inbox=True,
+        register_work=True,
+    )
+    assert http == 204
+    assert len(items) == 1
+    assert items[0]["status"] == "completed"
 
 
 @pytest.mark.asyncio

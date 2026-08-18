@@ -124,7 +124,9 @@ class SysSessionSendTool(Tool):
             "access — your own children, and also peer sessions on other "
             "machines (find them with sys_session_list). That is how you "
             "talk to an agent on another host: message its session. A "
-            "peer must be idle; its reply arrives in your inbox like a "
+            "peer defaults to idle-only delivery; pass if_busy='queue' or "
+            "'interrupt' to choose an explicit busy-session policy. Its reply "
+            "arrives in your inbox like a "
             "child's. Provide exactly one "
             "of (agent + title) or session_id, always with args. "
             "The text is delivered wrapped in a provenance envelope naming "
@@ -133,6 +135,13 @@ class SysSessionSendTool(Tool):
             "return value. A peer-reply poll can time out after 1800 seconds "
             "and place a timeout notice in your inbox while the peer continues "
             "working. "
+            "Queued messages are in-memory and per-runner: a runner restart "
+            "loses them without an error to the caller. queue guarantees "
+            "delivery and eventual processing, not mid-turn absorption; "
+            "mid-turn absorption is a harness property described by "
+            "supports_midturn_steer. Two queue sends coalesce into one "
+            "work_id and one inbox result. A call that previously failed as "
+            "busy may now succeed, so busy refusal is not a mutex signal. "
             "Returns a handle immediately, not the child's output: the "
             "turn runs asynchronously and its result is delivered to "
             "your inbox — poll sys_read_inbox to collect it, or "
@@ -141,7 +150,8 @@ class SysSessionSendTool(Tool):
             "sys_session_send tool_calls in the same response with a "
             "distinct task-based title for each independent session — "
             "they dispatch concurrently. Reusing a title continues the "
-            "same session and cannot run another turn concurrently. "
+            "same session; busy sends default to queue for children and can "
+            "explicitly reject, queue, or interrupt. "
             "To attach previously-uploaded files, "
             "pass their file ids via the object args form's 'file_ids' "
             "list on the first named (agent, title) send only; file_ids "
@@ -261,12 +271,21 @@ def _build_sys_session_send_schema(
             "Targets ANY session you can access — your own children, and "
             "peer sessions on other machines (find them with "
             "sys_session_list). That is how you talk to an agent on "
-            "another host. A peer must be idle. The text is delivered "
+            "another host. Busy peers default to rejection; pass if_busy to "
+            "choose queue or interrupt. The text is delivered "
             "wrapped in a provenance envelope naming "
             "the sending session, and the receiver's reply returns through "
             "sys_read_inbox, not as a direct return value. A peer-reply poll "
             "can time out after 1800 seconds and place a timeout notice in "
-            "your inbox while the peer continues working. Returns a handle "
+            "your inbox while the peer continues working. "
+            "Queued messages are in-memory and per-runner: a runner restart "
+            "loses them without an error to the caller. queue guarantees "
+            "delivery and eventual processing, not mid-turn absorption; "
+            "mid-turn absorption is a harness property described by "
+            "supports_midturn_steer. Two queue sends coalesce into one "
+            "work_id and one inbox result. A call that previously failed as "
+            "busy may now succeed, so busy refusal is not a mutex signal. "
+            "Returns a handle "
             "immediately, not the child's output: the turn runs "
             "asynchronously and its result is delivered to your inbox "
             "— poll sys_read_inbox to collect it, or sys_cancel_task "
@@ -338,6 +357,14 @@ def _build_sys_session_send_schema(
                 "type": "object",
                 "properties": {
                     **named_mode_properties,
+                    "if_busy": {
+                        "type": "string",
+                        "enum": ["reject", "queue", "interrupt"],
+                        "description": (
+                            "What to do when the target is busy. Omitted defaults to "
+                            "queue for a child and reject for a peer; interrupt is never implicit."
+                        ),
+                    },
                     "session_id": {
                         "type": "string",
                         "description": (
@@ -678,10 +705,9 @@ class SysSessionGetInfoTool(Tool):
             "handle means accepted, not started: poll this tool and treat "
             "a non-null last_task_error as terminal for that launch rather "
             "than continuing to poll. The supports_midturn_steer flag "
-            "describes the harness's declared behavior; this MCP send path "
-            "refuses a send while a dispatch from this surface is outstanding, "
-            "so a correction does not reach the running turn. Use "
-            "sys_cancel_task followed by a fresh send to redirect it. "
+            "describes the harness's declared mid-turn behavior; sys_session_send "
+            "can queue a child message or explicitly interrupt the caller's dispatch; "
+            "use sys_cancel_task to stop a running dispatch. "
             "Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "
