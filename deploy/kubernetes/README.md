@@ -329,8 +329,14 @@ kubectl logs -n omnigent deploy/omnigent          # server logs
 
 # Port-forward the Service and open the app locally:
 kubectl port-forward -n omnigent svc/omnigent 8000:80
-# → http://localhost:8000   (health check: curl localhost:8000/health → {"status":"ok"})
+# → http://localhost:8000   (liveness: curl localhost:8000/health; readiness: curl localhost:8000/ready)
 ```
+
+The base Deployment keeps liveness on `GET /health` (initial delay 90s,
+period 30s, failure threshold 5) and uses `GET /ready` for database-backed
+readiness (initial delay 3s, period 2s, failure threshold 3).
+The application-side readiness deadline defaults to 2s and can be tuned with
+`OMNIGENT_READINESS_TIMEOUT_SECONDS`.
 
 The first boot runs database migrations before the server starts listening; the
 pod may restart once if the liveness probe fires during that window (see

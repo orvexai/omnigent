@@ -265,8 +265,10 @@ def _create_engine(db_uri: str) -> Engine:
     pool_recycle = (
         _LAKEBASE_POOL_RECYCLE_SECONDS if token_provider else _SERVER_POOL_RECYCLE_SECONDS
     )
+    connect_args = {"connect_timeout": 3} if db_uri.startswith("postgresql") else {}
     engine = create_engine(
         db_uri,
+        connect_args=connect_args,
         # Verify connections are alive before checking them out
         # from the pool. Prevents "server has gone away" errors
         # after idle periods.
@@ -276,11 +278,9 @@ def _create_engine(db_uri: str) -> Engine:
         # connections; in Lakebase token mode the shorter window also keeps
         # each connection's OAuth token refreshed ahead of its ~1h expiry.
         pool_recycle=pool_recycle,
-        # Aligned with the AnyIO thread limiter in
-        # ``server/app.py:_lifespan``. Every DB call runs via
-        # ``asyncio.to_thread``, so connections beyond the thread
-        # token count just sit idle. Overflow covers boot-time
-        # bursts (e.g. migrations). Lakebase per-instance cap: 1000.
+        # Sized for ordinary application concurrency; readiness has its own
+        # executor and does not consume this pool's shared worker capacity.
+        # Lakebase per-instance cap: 1000.
         pool_size=200,
         max_overflow=20,
         # Bound the wait when the pool is exhausted instead of

@@ -39,16 +39,18 @@ spec:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 20
+            initialDelaySeconds: 90
             periodSeconds: 30
             timeoutSeconds: 5
+            failureThreshold: 5
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            timeoutSeconds: 5
+            initialDelaySeconds: 3
+            periodSeconds: 2
+            timeoutSeconds: 3
+            failureThreshold: 3
       volumes:
         - name: artifacts
           persistentVolumeClaim:

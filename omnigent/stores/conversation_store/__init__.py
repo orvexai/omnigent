@@ -325,6 +325,10 @@ class ConversationStore(ABC):
         self.storage_location = storage_location
         self.conversation_storage_location = conversation_storage_location
 
+    def check_database_connectivity(self, *, timeout_ms: int = 2000) -> None:
+        """Check that the backing database can execute a trivial query."""
+        raise NotImplementedError("database connectivity check is not implemented")
+
     @abstractmethod
     def create_conversation(
         self,

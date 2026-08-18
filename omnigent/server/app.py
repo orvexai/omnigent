@@ -9,7 +9,9 @@ import tarfile
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
+from functools import partial
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -153,6 +155,30 @@ def _server_version() -> str:
     return VERSION
 
 
+def _readiness_timeout_seconds() -> float:
+    """Resolve the readiness database deadline from the environment."""
+    raw = os.environ.get(_READINESS_TIMEOUT_ENV)
+    if raw is None:
+        return _READINESS_DEFAULT_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        _logger.warning(
+            "%s must be a positive number; using %.1fs",
+            _READINESS_TIMEOUT_ENV,
+            _READINESS_DEFAULT_TIMEOUT_SECONDS,
+        )
+        return _READINESS_DEFAULT_TIMEOUT_SECONDS
+    if value <= 0:
+        _logger.warning(
+            "%s must be positive; using %.1fs",
+            _READINESS_TIMEOUT_ENV,
+            _READINESS_DEFAULT_TIMEOUT_SECONDS,
+        )
+        return _READINESS_DEFAULT_TIMEOUT_SECONDS
+    return value
+
+
 def _register_web_mimetypes() -> None:
     """Pin Content-Type for web UI assets regardless of the OS MIME registry.
 
@@ -193,7 +219,11 @@ _API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.ht
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
-_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1", ".well-known"})
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "ready", "v1", ".well-known"})
+_READINESS_CACHE_TTL_SECONDS = 1.0
+_READINESS_DEFAULT_TIMEOUT_SECONDS = 2.0
+_READINESS_TIMEOUT_ENV = "OMNIGENT_READINESS_TIMEOUT_SECONDS"
+_READINESS_EXECUTOR_MAX_WORKERS = 1
 
 # Envelope version of GET /.well-known/omnigent.json (see the route for the
 # full contract). Bump ONLY for a change a client cannot absorb by ignoring
@@ -1113,6 +1143,11 @@ def create_app(
     _mcp_pool = ServerMcpPool()
     server_metrics = ServerPerformanceMetrics()
     server_metrics_otel = ServerMetricsOtelPublisher()
+    readiness_executor = ThreadPoolExecutor(
+        max_workers=_READINESS_EXECUTOR_MAX_WORKERS,
+        thread_name_prefix="omnigent-readiness",
+    )
+    readiness_timeout_seconds = _readiness_timeout_seconds()
 
     @asynccontextmanager
     async def _lifespan(
@@ -1138,8 +1173,8 @@ def create_app(
         :param app_inst: The FastAPI app, used to attach
             per-AP state via ``app_inst.state.*``.
         """
-        # Bump AnyIO default thread limiter from 40 → 200; every
-        # ``asyncio.to_thread`` and FastAPI sync route grabs one.
+        # Keep FastAPI's synchronous-route limiter large enough for DB bursts.
+        # ``asyncio.to_thread`` uses the loop executor, not this AnyIO limiter.
         from anyio import to_thread as _to_thread
 
         _to_thread.current_default_thread_limiter().total_tokens = 200
@@ -1339,6 +1374,7 @@ def create_app(
             # endpoint. Best-effort — individual close failures are logged
             # inside shutdown_all().
             await _mcp_pool.shutdown_all()
+            readiness_executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
     from omnigent.runtime import telemetry
@@ -1874,6 +1910,55 @@ def create_app(
                 for sid in batch_ids
             }
         return result
+
+    readiness_cache: tuple[float, bool] | None = None
+    readiness_lock = asyncio.Lock()
+
+    @app.get("/ready")
+    async def readiness() -> Response:
+        """Report whether the conversation databases can serve requests.
+
+        This deliberately checks only the databases. Process liveness remains
+        the job of ``/health``; optional services do not gate traffic.
+        """
+        nonlocal readiness_cache
+        now = time.monotonic()
+        if readiness_cache is not None and now - readiness_cache[0] < _READINESS_CACHE_TTL_SECONDS:
+            reachable = readiness_cache[1]
+        else:
+            async with readiness_lock:
+                now = time.monotonic()
+                if (
+                    readiness_cache is not None
+                    and now - readiness_cache[0] < _READINESS_CACHE_TTL_SECONDS
+                ):
+                    reachable = readiness_cache[1]
+                else:
+                    check = partial(
+                        conversation_store.check_database_connectivity,
+                        timeout_ms=int(readiness_timeout_seconds * 1000),
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.get_running_loop().run_in_executor(
+                                readiness_executor,
+                                check,
+                            ),
+                            timeout=readiness_timeout_seconds,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — readiness fails closed
+                        _logger.warning("Readiness database check failed: %s", exc)
+                        reachable = False
+                    else:
+                        reachable = True
+                    readiness_cache = (time.monotonic(), reachable)
+
+        if not reachable:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "unready", "dependency": "database"},
+            )
+        return JSONResponse(status_code=200, content={"status": "ok"})
 
     @app.get("/api/version")
     async def version() -> dict[str, str]:

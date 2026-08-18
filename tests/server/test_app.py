@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -37,6 +38,125 @@ async def test_health_returns_ok(client: httpx.AsyncClient) -> None:
     # Exact shape — a regression that changes the key name or value
     # would break health-check integrations that parse this response.
     assert resp.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_readiness_returns_ok_when_database_is_reachable(
+    client: httpx.AsyncClient,
+) -> None:
+    """Readiness succeeds through the real store connectivity check."""
+    resp = await client.get("/ready")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_readiness_returns_ok_and_pins_database_timeout(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Readiness checks the database and forwards the configured deadline."""
+    calls: list[tuple[int, str]] = []
+
+    def check_database(_store: SqlAlchemyConversationStore, *, timeout_ms: int) -> None:
+        calls.append((timeout_ms, threading.current_thread().name))
+
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        "check_database_connectivity",
+        check_database,
+    )
+
+    resp = await client.get("/ready")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+    assert calls == [(2000, "omnigent-readiness_0")]
+
+
+@pytest.mark.asyncio
+async def test_readiness_fails_when_database_is_unreachable_but_health_stays_live(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable database makes /ready fail while /health stays live."""
+    wired = _build_liveness_app(db_uri, tmp_path)
+
+    def fail_connect(*_args: object, **_kwargs: object) -> None:
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(wired.conversation_store._engine, "connect", fail_connect)
+    transport = httpx.ASGITransport(app=wired.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        readiness = await client.get("/ready")
+        health = await client.get("/health")
+
+    assert readiness.status_code == 503
+    assert readiness.json() == {"status": "unready", "dependency": "database"}
+    assert health.status_code == 200
+    assert health.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_readiness_cache_collapses_concurrent_checks(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent cache misses run one database check."""
+    checks = 0
+
+    def check_database(_store: SqlAlchemyConversationStore, *, timeout_ms: int) -> None:
+        nonlocal checks
+        assert timeout_ms == 2000
+        checks += 1
+
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        "check_database_connectivity",
+        check_database,
+    )
+
+    responses = await asyncio.gather(*(client.get("/ready") for _ in range(8)))
+
+    assert [response.status_code for response in responses] == [200] * 8
+    assert checks == 1
+
+
+@pytest.mark.asyncio
+async def test_readiness_cache_expiry_runs_database_check_again(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired readiness result is not latched forever."""
+    clock = [0.0]
+    checks = 0
+
+    def check_database(_store: SqlAlchemyConversationStore, *, timeout_ms: int) -> None:
+        nonlocal checks
+        assert timeout_ms == 2000
+        checks += 1
+
+    monkeypatch.setattr(server_app.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        "check_database_connectivity",
+        check_database,
+    )
+
+    first = await client.get("/ready")
+    clock[0] = 1.01
+    second = await client.get("/ready")
+
+    assert first.status_code == second.status_code == 200
+    assert checks == 2
+
+
+def test_readiness_timeout_is_env_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operators can tune the readiness deadline without changing code."""
+    monkeypatch.setenv(server_app._READINESS_TIMEOUT_ENV, "0.25")
+    assert server_app._readiness_timeout_seconds() == 0.25
 
 
 @pytest.mark.asyncio

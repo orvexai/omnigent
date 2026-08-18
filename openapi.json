@@ -7445,6 +7445,23 @@
         ]
       }
     },
+    "/ready": {
+      "get": {
+        "description": "Report whether the conversation databases can serve requests.\n\nThis deliberately checks only the databases. Process liveness remains\nthe job of `/health`; optional services do not gate traffic.",
+        "operationId": "readiness_ready_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Readiness"
+      }
+    },
     "/v1/agents": {
       "get": {
         "description": "List built-in agents with cursor-based pagination.\n\nReturns only built-in agents \u2014 `agent_store.list()` filters\n`session_id IS NULL` \u2014 so session-scoped agents never appear.\n\n**Returns:** A `PaginatedList` of built-in agents.",
