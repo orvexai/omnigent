@@ -437,6 +437,45 @@ def _build_alembic_config(db_uri: str) -> Config:
     return config
 
 
+_MIGRATION_LOCK_KEY = 734_891_203
+
+
+@contextmanager
+def _migration_lock(engine: Engine) -> Iterator[None]:
+    """Serialize schema changes on PostgreSQL using a dedicated connection.
+
+    SQLite and MySQL have no equivalent lock requirement here and use a
+    no-op context.
+
+    :param engine: Engine for the database being migrated.
+    """
+    if engine.dialect.name != "postgresql":
+        yield
+        return
+
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as lock_connection:
+        acquired = lock_connection.execute(
+            text("SELECT pg_try_advisory_lock(:lock_key)"),
+            {"lock_key": _MIGRATION_LOCK_KEY},
+        ).scalar()
+        if not acquired:
+            _logger.warning(
+                "Waiting for the migration advisory lock, held by another process "
+                "(Job or another server pod); this deploy will proceed once it releases."
+            )
+            lock_connection.execute(
+                text("SELECT pg_advisory_lock(:lock_key)"),
+                {"lock_key": _MIGRATION_LOCK_KEY},
+            )
+        try:
+            yield
+        finally:
+            lock_connection.execute(
+                text("SELECT pg_advisory_unlock(:lock_key)"),
+                {"lock_key": _MIGRATION_LOCK_KEY},
+            )
+
+
 def _run_migrations(engine: Engine, db_uri: str) -> None:
     """
     Bring the database schema up to head.
@@ -470,17 +509,12 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     # outside any transaction so Alembic owns transaction demarcation:
     # a migration with an autocommit_block (CREATE INDEX CONCURRENTLY)
     # cannot suspend an externally-begun transaction.
-    with query_name_scope("omnigent.database.run_migrations"):
+    with query_name_scope("omnigent.database.run_migrations"), _migration_lock(engine):
         with engine.connect() as connection:
             config.attributes["connection"] = connection
             command.upgrade(config, "head")
-        # Belt-and-suspenders: if a future migration is added but a
-        # caller forgets to wire it into the chain, ``create_all`` will
-        # at least create any missing tables from ORM metadata so the
-        # server still boots. Cannot rescue missing COLUMNS on existing
-        # tables — those need a real migration, which is why the
-        # short-circuit above was removed. Both bases are created because
-        # in single-DB mode this engine hosts the AP tables too.
+        # Keep metadata creation under the same lock: checkfirst is an
+        # inspect-then-CREATE sequence and is not safe across callers.
         for base in (OmnigentBase, ConversationBase):
             base.metadata.create_all(bind=engine, checkfirst=True)
 
@@ -563,6 +597,20 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     if current is None:
         _run_migrations(engine, db_uri)
         return
+
+    from alembic.script import ScriptDirectory
+    from alembic.util.exc import CommandError
+
+    script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
+    try:
+        script.get_revision(current)
+    except CommandError as exc:
+        raise RuntimeError(
+            f"Database revision {current!r} is ahead of this code: "
+            "rollback-across-a-migration is not supported. "
+            "Roll forward to a version that includes this revision, or restore "
+            "the database from a backup."
+        ) from exc
 
     if current != head:
         _logger.warning(

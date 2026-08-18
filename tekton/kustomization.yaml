@@ -21,5 +21,6 @@ namespace: tekton-pipelines
 
 resources:
   - rollout-rbac.yaml
+  - migrate-rbac.yaml
   - omnigent-app-build-pipeline.yaml
   - trigger.yaml
