@@ -27,7 +27,6 @@ from __future__ import annotations
 import errno
 import json
 import os
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -50,8 +49,9 @@ from omnigent.inner.bwrap_sandbox import (
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
+from tests._capabilities import probe_bwrap
 
-BWRAP_AVAILABLE = shutil.which("bwrap") is not None
+_BWRAP_BASE = probe_bwrap(network=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1505,7 +1505,8 @@ def test_s5_read_paths_dedup_skips_paths_under_cwd(tmp_path: Path) -> None:
 
 
 pytestmark_bwrap = pytest.mark.skipif(
-    not BWRAP_AVAILABLE, reason="bwrap not installed on this host"
+    not _BWRAP_BASE.available,
+    reason=f"bwrap namespace unavailable: {_BWRAP_BASE.reason}",
 )
 
 

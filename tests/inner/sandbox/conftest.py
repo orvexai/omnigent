@@ -41,8 +41,10 @@ from typing import Any
 import pytest
 
 from omnigent.inner.datamodel import CredentialProxySpec, OSEnvSandboxSpec
+from tests._capabilities import probe_bwrap
 
-_BWRAP_AVAILABLE = shutil.which("bwrap") is not None
+_BWRAP_BASE = probe_bwrap(network=False)
+_BWRAP_NETWORK = probe_bwrap(network=True)
 _SANDBOX_EXEC_AVAILABLE = shutil.which("sandbox-exec") is not None
 
 
@@ -69,8 +71,8 @@ def _repo_root_for_pythonpath() -> str:
             "linux_bwrap",
             id="linux_bwrap",
             marks=pytest.mark.skipif(
-                not (sys.platform.startswith("linux") and _BWRAP_AVAILABLE),
-                reason="linux_bwrap requires Linux + bwrap on PATH",
+                not (sys.platform.startswith("linux") and _BWRAP_BASE.available),
+                reason=f"linux_bwrap unavailable: {_BWRAP_BASE.reason}",
             ),
         ),
         pytest.param(
@@ -132,6 +134,10 @@ def active_sandbox_spec_factory(
         egress_allow_private_destinations: bool = False,
         credential_proxy: CredentialProxySpec | None = None,
     ) -> OSEnvSandboxSpec:
+        needs_network_namespace = not allow_network or egress_rules is not None
+        if active_sandbox_type == "linux_bwrap" and needs_network_namespace:
+            if not _BWRAP_NETWORK.available:
+                pytest.skip(f"linux_bwrap network namespace unavailable: {_BWRAP_NETWORK.reason}")
         read_paths = [repo_root]
         if extra_read_paths:
             read_paths.extend(extra_read_paths)

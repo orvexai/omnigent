@@ -18,8 +18,10 @@ import pytest
 
 from omnigent.inner.bwrap_sandbox import _dotfile_and_symlink_mask_args
 from omnigent.inner.sandbox import SandboxPolicy
+from tests._capabilities import probe_bwrap_mounts
 
 _BWRAP = shutil.which("bwrap")
+_BWRAP_MOUNTS = probe_bwrap_mounts()
 
 
 def _mask_args_for(tmp_path: pathlib.Path) -> list[str]:
@@ -60,7 +62,10 @@ def test_no_mask_targets_a_symlink(tmp_path: pathlib.Path) -> None:
     assert not offenders, f"mask targets a symlink, which aborts bwrap: {offenders}"
 
 
-@pytest.mark.skipif(_BWRAP is None, reason="bwrap not installed")
+@pytest.mark.skipif(
+    not _BWRAP_MOUNTS.available,
+    reason=f"bwrap mount operations unavailable: {_BWRAP_MOUNTS.reason}",
+)
 def test_skipping_symlink_masks_does_not_leak_the_target(tmp_path: pathlib.Path) -> None:
     """Skipping the symlink mask must not expose a masked target's content."""
     secret = tmp_path / ".env"
@@ -96,7 +101,10 @@ def test_skipping_symlink_masks_does_not_leak_the_target(tmp_path: pathlib.Path)
     assert "AWSKEY" not in done.stdout
 
 
-@pytest.mark.skipif(_BWRAP is None, reason="bwrap not installed")
+@pytest.mark.skipif(
+    not _BWRAP_MOUNTS.available,
+    reason=f"bwrap mount operations unavailable: {_BWRAP_MOUNTS.reason}",
+)
 def test_bwrap_rejects_a_bind_onto_a_symlink(tmp_path: pathlib.Path) -> None:
     """Pin the bwrap behavior the emitter has to respect."""
     plain = tmp_path / "plain"

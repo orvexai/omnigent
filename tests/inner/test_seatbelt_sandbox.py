@@ -1253,6 +1253,8 @@ def test_ensure_executable_visible_two_hop_proxy_finds_cpython_install_root(
     import uuid
 
     home = Path.home()
+    if home.parent.as_posix() not in _UNSAFE_WIDEN_ANCESTORS:
+        pytest.skip("two-hop fallback requires HOME below an unsafe widening ancestor")
 
     # Layer 1 — CPython install root (the real target).  Lives under HOME
     # so topmost ancestor is in _UNSAFE_WIDEN_ANCESTORS and the narrow-

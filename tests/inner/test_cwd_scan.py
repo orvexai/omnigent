@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner._cwd_scan import MaskedEntry, merge_scan_roots, scan_cwd_mask_entries
+from tests._capabilities import probe_restricted_read
 
 # The walker contract says ``safe_roots`` should include cwd plus the
 # backend-specific exposed mounts. For these decision-level tests we
@@ -766,6 +767,8 @@ def test_unreadable_subdirectory_is_skipped_silently(tmp_path: Path) -> None:
     and the inaccessibility itself doesn't leak the content the
     sandbox is trying to hide.
     """
+    if not probe_restricted_read(tmp_path):
+        pytest.skip("filesystem permission bits do not deny reads on this host")
     sub = tmp_path / "locked"
     sub.mkdir()
     (sub / ".env").write_text("masked-if-readable")

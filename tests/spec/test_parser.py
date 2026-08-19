@@ -734,6 +734,8 @@ def test_discover_host_skills_skips_unreadable_skill_file(
     symlink under ``~/.claude/skills/`` must not see the whole
     REPL launch abort.
     """
+    from tests._capabilities import probe_restricted_read
+
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
@@ -759,6 +761,8 @@ def test_discover_host_skills_skips_unreadable_skill_file(
     (good_dir / "SKILL.md").write_text("---\nname: good\ndescription: y\n---\nContent.")
 
     try:
+        if not probe_restricted_read(bad_dir):
+            pytest.skip("filesystem permission bits do not deny reads on this host")
         with caplog.at_level("WARNING", logger="omnigent.spec.parser"):
             result = discover_host_skills(agent_root, "all")
     finally:

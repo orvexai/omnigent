@@ -1727,10 +1727,14 @@ async def test_unwritable_target_reports_an_error_not_a_crash(
     """An ordinary OS permission denial must surface as a filesystem error. The
     in-process route bypasses the helper subprocess, which is what normally
     converts a raised OSError into an error payload."""
+    from tests._capabilities import probe_restricted_write
+
     locked = tmp_path / "locked"
     locked.mkdir()
     locked.chmod(0o500)  # read+execute only: no new entries
     try:
+        if not probe_restricted_write(tmp_path):
+            pytest.skip("filesystem permission bits do not deny writes on this host")
         base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
         url = f"{base}/%2F{str(locked / 'nope.txt').lstrip('/')}"
 
