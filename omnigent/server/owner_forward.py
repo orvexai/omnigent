@@ -11,6 +11,10 @@ import asyncio
 import ipaddress
 import json
 import os
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Coroutine
 
 import httpx
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -200,8 +204,8 @@ class OwnerForwardMiddleware:
         if self._pod_addr is not None:
             headers.append((_FORWARDED_BY_HEADER, self._pod_addr.encode("ascii")))
 
+        response_started = False
         try:
-            response_started = False
             async with self._client.stream(
                 scope["method"],
                 owner_url,
@@ -276,9 +280,11 @@ class OwnerForwardMiddleware:
 
     async def _pipe_response(self, response: httpx.Response, receive: Receive, send: Send) -> None:
         """Pipe response bytes while closing the upstream on client disconnect."""
-        disconnect_task = asyncio.create_task(receive())
+        disconnect_task = asyncio.create_task(cast("Coroutine[Any, Any, Message]", receive()))
         response_iterator = response.aiter_raw()
-        read_task = asyncio.create_task(response_iterator.__anext__())
+        read_task = asyncio.create_task(
+            cast("Coroutine[Any, Any, bytes]", response_iterator.__anext__())
+        )
         try:
             while True:
                 done, _ = await asyncio.wait(
@@ -290,7 +296,9 @@ class OwnerForwardMiddleware:
                     if message["type"] == "http.disconnect":
                         read_task.cancel()
                         return
-                    disconnect_task = asyncio.create_task(receive())
+                    disconnect_task = asyncio.create_task(
+                        cast("Coroutine[Any, Any, Message]", receive())
+                    )
                     continue
 
                 try:
@@ -299,7 +307,9 @@ class OwnerForwardMiddleware:
                     await send({"type": "http.response.body", "body": b"", "more_body": False})
                     return
                 await send({"type": "http.response.body", "body": chunk, "more_body": True})
-                read_task = asyncio.create_task(response_iterator.__anext__())
+                read_task = asyncio.create_task(
+                    cast("Coroutine[Any, Any, bytes]", response_iterator.__anext__())
+                )
         finally:
             for task in (disconnect_task, read_task):
                 if not task.done():
