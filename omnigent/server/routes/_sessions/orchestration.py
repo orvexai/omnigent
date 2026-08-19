@@ -2540,6 +2540,8 @@ async def _publish_runner_recovered_status_impl(
             last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
         if last_error is None or last_error.get("code") != "runner_disconnected":
             return
+    # Intentional: the chokepoint emits the recovery edge without null
+    # response metadata, matching every other status publication.
     _publish_status(session_id, "idle", origin="reconciliation")
     await _persist_session_status_error_labels(session_id, None, conversation_store)
 
@@ -2594,6 +2596,11 @@ async def _mark_runner_sessions_offline_impl(
         live = _session_status_cache.get(conv.id)
         interrupted = live in ("running", "waiting")
         dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
+        if live is None and not dead_on_arrival:
+            _logger.info(
+                "Offline reconciliation has no local status for session=%s; declining verdict",
+                conv.id,
+            )
         if not interrupted and not dead_on_arrival:
             continue
         _publish_status(conv.id, "failed", error)
@@ -9119,6 +9126,8 @@ async def _get_session_snapshot(
                 if resp.status_code == 200:
                     raw = resp.json().get("status", "idle")
                     if raw in ("idle", "running", "waiting", "failed"):
+                        # Intentional: this read emits one status edge, which
+                        # narrows the cold-cache false-negative window.
                         _publish_status(session_id, raw, origin="reconciliation")
                         status = _session_status_from_cache(session_id)
             except (httpx.HTTPError, ConnectionError):

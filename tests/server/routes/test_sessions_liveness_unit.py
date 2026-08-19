@@ -47,14 +47,17 @@ def two_pod_status_cache() -> Iterator[Any]:
 
 def test_two_pod_status_cache_fixture_isolation(two_pod_status_cache: Any) -> None:
     """The fixture models a cold cache on pod B rather than a patched alias."""
-    from omnigent.server.routes._sessions import common
+    from omnigent.server.routes._sessions import common, helpers, orchestration
+
+    assert common._session_status_cache is helpers._session_status_cache
+    assert common._session_status_cache is orchestration._session_status_cache
 
     with two_pod_status_cache.enter_pod("a"):
-        common._session_status_cache["fixture-meta-session"] = "running"
+        helpers._publish_status("fixture-meta-session", "running")
 
     with two_pod_status_cache.enter_pod("b"):
-        assert "fixture-meta-session" not in common._session_status_cache
-        assert common._session_status_cache == {}
+        assert "fixture-meta-session" not in orchestration._session_status_cache
+        assert orchestration._session_status_cache == {}
 
 
 def test_reconciliation_publish_does_not_complete_scheduled_run(
@@ -106,6 +109,7 @@ async def test_recovery_clears_failed_status_without_scheduled_completion(
 ) -> None:
     from omnigent.server import session_live_state
     from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions import orchestration
 
     session_id = "recovery-origin-session"
     scheduled_calls: list[tuple[Any, ...]] = []
@@ -114,11 +118,11 @@ async def test_recovery_clears_failed_status_without_scheduled_completion(
         "persist_scheduled_run_completion",
         lambda *args, **kwargs: scheduled_calls.append((*args, *kwargs.values())),
     )
-    monkeypatch.setattr(
-        sessions,
-        "_persist_session_status_error_labels",
-        lambda *args, **kwargs: None,
-    )
+
+    async def no_persist_error(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(orchestration, "_persist_session_status_error_labels", no_persist_error)
     conversation = SimpleNamespace(labels={}, live_status="failed")
 
     with two_pod_status_cache.enter_pod("a"):
@@ -201,6 +205,7 @@ async def test_relay_cache_miss_declines_without_store_read(
     two_pod_status_cache: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from omnigent.server.routes import sessions
     from omnigent.server.routes._sessions import orchestration
 
     class RaisingStore:
@@ -224,9 +229,11 @@ async def test_relay_cache_miss_declines_without_store_read(
     monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
     events: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        orchestration.session_stream,
-        "publish",
-        lambda session_id, payload: events.append({"id": session_id, **payload}),
+        sessions,
+        "session_stream",
+        SimpleNamespace(
+            publish=lambda session_id, payload: events.append({"id": session_id, **payload})
+        ),
     )
     store = RaisingStore()
     session_id = "relay-cache-miss"
@@ -266,10 +273,14 @@ async def _run_offline_reconciliation(
 
     events: list[dict[str, Any]] = []
     persisted_errors: list[Any] = []
+    from omnigent.server.routes import sessions
+
     monkeypatch.setattr(
-        orchestration.session_stream,
-        "publish",
-        lambda session_id, payload: events.append({"id": session_id, **payload}),
+        sessions,
+        "session_stream",
+        SimpleNamespace(
+            publish=lambda session_id, payload: events.append({"id": session_id, **payload})
+        ),
     )
     monkeypatch.setattr(session_live_state, "persist_live_status", lambda *args: None)
     monkeypatch.setattr(
@@ -308,6 +319,35 @@ async def test_offline_verdict_idle_cache_does_not_fail_row_running(
         assert orchestration._session_status_cache.get(session_id) == "idle"
     assert events == []
     assert persisted == []
+
+
+def test_status_publisher_drops_invalid_status_before_side_effects(
+    two_pod_status_cache: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions
+
+    persisted: list[tuple[Any, ...]] = []
+    events: list[Any] = []
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_live_status",
+        lambda *args: persisted.append(args),
+    )
+    monkeypatch.setattr(
+        sessions,
+        "session_stream",
+        SimpleNamespace(publish=lambda *args: events.append(args)),
+    )
+
+    session_id = "invalid-status-publisher"
+    with two_pod_status_cache.enter_pod("a"):
+        sessions._publish_status(session_id, "bogus")
+        assert session_id not in two_pod_status_cache.cache
+
+    assert persisted == []
+    assert events == []
 
 
 @pytest.mark.asyncio

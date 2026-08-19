@@ -3732,6 +3732,9 @@ def _publish_status(
     :param response_id: Optional response id for terminal-backed status
         edges, e.g. ``"codex_turn_abc123"``.
     """
+    if status not in ("idle", "running", "waiting", "failed"):
+        _logger.warning("Ignoring invalid session status=%r for %s", status, session_id)
+        return
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
     # follow-on quiescence signal. This matters for claude-native: the
