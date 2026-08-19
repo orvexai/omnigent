@@ -818,6 +818,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             host_registry=deps.host_registry,
             conversation_store=deps.conversation_store,
             permission_store=deps.permission_store,
+            pod_addr=None,  # Background dispatch has no ASGI forward path.
         )
 
         attempt = await _launch_runner_on_host(

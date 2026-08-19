@@ -2845,6 +2845,7 @@ def create_app(
                 conversation_store,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
+                pod_addr=pod_addr,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
                 feature_flags=resolved_feature_flags,

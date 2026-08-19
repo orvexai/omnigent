@@ -50,10 +50,10 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import resolve_host_launch
+from omnigent.server.routes._host_launch import classify_host_absent, resolve_host_launch
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.host_store import Host, HostStore, host_is_live
+from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -79,37 +79,6 @@ _MODEL_OPTIONS_TIMEOUT_S = 15.0
 # headroom) keeps a genuine slow install from timing out at the server while
 # the host is still succeeding — a "504 but actually installed" outcome.
 _INSTALL_HARNESS_TIMEOUT_S = 420.0
-
-
-def _host_absent_error(host: Host) -> OmnigentError:
-    """Classify a "host not on this replica" miss for a host-scoped route.
-
-    Every ``/v1/hosts/{id}/*`` route reaches the host over its live tunnel in
-    the local (this-replica) ``HostRegistry``. When replicas are sharded by
-    host, a request keyed to ``host_id`` can land on a replica that doesn't
-    hold the tunnel — the same wrong-replica case ``RunnerRouter`` handles for
-    runner dispatch (see ``_runner_absent_code``). Tell the two apart using the
-    host record the caller already loaded:
-
-    - still **live** (online + fresh heartbeat) → up on some replica, just not
-      here → :data:`~ErrorCode.WRONG_REPLICA` (400) so the client re-addresses
-      WITHOUT the key.
-    - otherwise → genuinely offline → ``CONFLICT`` (409).
-
-    :param host: The host's persistent record (owner-checked by the caller).
-    :returns: The ``OmnigentError`` to raise; the global handler maps its code
-        to the HTTP status and the ``{"error": {"code": ...}}`` body the
-        client's re-address matches on.
-    """
-    if host.owner_addr is not None:
-        return OmnigentError(
-            "host is on another replica",
-            code=ErrorCode.WRONG_REPLICA,
-            owner_addr=host.owner_addr,
-        )
-    if host_is_live(host):
-        return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
-    return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
 
 
 async def _proxy_model_options(
@@ -553,6 +522,7 @@ def create_hosts_router(
     *,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    pod_addr: str | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     feature_flags: FeatureFlags | None = None,
@@ -570,6 +540,8 @@ def create_hosts_router(
     :param permission_store: Session permission store, used to verify
         the caller owns the session a runner is launched for. ``None``
         disables the session-owner check (single-user/local).
+    :param pod_addr: This replica's dialable address, used to suppress
+        self-directed or unwired forwarding instructions.
     :param agent_store: Agent store used to resolve a session's agent
         for workspace-boundary validation on runner launch (W6). When
         ``None`` (non-production wiring), the boundary check is skipped;
@@ -702,7 +674,7 @@ def create_hosts_router(
             raise HTTPException(status_code=403, detail="not your host")
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host)
+            raise classify_host_absent(host, pod_addr=pod_addr)
 
         result = await _proxy_model_options(
             host_registry=host_registry,
@@ -755,6 +727,7 @@ def create_hosts_router(
             host_registry=host_registry,
             conversation_store=conversation_store,
             permission_store=permission_store,
+            pod_addr=pod_addr,
         )
         conn = target.conn
 
@@ -1127,7 +1100,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host)
+            raise classify_host_absent(host, pod_addr=pod_addr)
 
         result = await _proxy_list_dir(
             host_registry=host_registry,
@@ -1218,7 +1191,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host)
+            raise classify_host_absent(host, pod_addr=pod_addr)
 
         result = await _proxy_create_dir(
             host_registry=host_registry,
@@ -1306,7 +1279,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host)
+            raise classify_host_absent(host, pod_addr=pod_addr)
 
         # Coalesce concurrent installs of the same harness FAMILY onto one
         # in-flight request so a double-click (or `codex` + `codex-native`, which
@@ -1422,7 +1395,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host)
+            raise classify_host_absent(host, pod_addr=pod_addr)
 
         frame = HostStoreSecretFrame(
             request_id=secrets.token_hex(8),
@@ -1502,7 +1475,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host)
+            raise classify_host_absent(host, pod_addr=pod_addr)
 
         result = await _proxy_detect_credentials(host_registry=host_registry, host_conn=conn)
         return {
@@ -1558,7 +1531,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host)
+            raise classify_host_absent(host, pod_addr=pod_addr)
 
         try:
             worktrees = await list_worktrees_on_host(

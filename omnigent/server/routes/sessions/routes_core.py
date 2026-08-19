@@ -507,6 +507,7 @@ def register_core_routes(
                     host_registry=host_registry,
                     conversation_store=conversation_store,
                     permission_store=permission_store,
+                    pod_addr=getattr(request.app.state, "pod_addr", None),
                 )
                 conn = target.conn
                 binding_token = secrets.token_urlsafe(32)

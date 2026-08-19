@@ -47,6 +47,36 @@ class HostLaunchTarget:
     conv: Conversation
 
 
+def classify_host_absent(
+    host: Host,
+    *,
+    pod_addr: str | None = None,
+    now: int | None = None,
+) -> OmnigentError:
+    """Classify a host-registry miss using liveness before ownership.
+
+    A stale or offline row is always ``CONFLICT`` without an owner address.
+    A live row is ``WRONG_REPLICA``; its address is attached only when this
+    pod has an identity and the address belongs to another pod. This pure
+    helper performs no I/O or clock read beyond ``host_is_live``.
+    """
+    if not host_is_live(host, now=now):
+        return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
+    if host.owner_addr is not None and pod_addr is not None and host.owner_addr != pod_addr:
+        return OmnigentError(
+            "host is on another replica",
+            code=ErrorCode.WRONG_REPLICA,
+            owner_addr=host.owner_addr,
+        )
+    return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
+
+
+# Session-create validation, orchestration, and event routes intentionally keep
+# their distinct error contracts; managed-host relaunch freshness is a follow-up.
+# A relaunch may refresh a stale owner until its first tunnel connect overwrites it;
+# that residual register-to-connect window is bounded by one TTL.
+
+
 def resolve_host_owner(
     *,
     user_id: str | None,
@@ -89,6 +119,8 @@ def resolve_host_launch(
     host_registry: HostRegistry,
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
+    pod_addr: str | None = None,
+    now: int | None = None,
 ) -> HostLaunchTarget:
     """
     Resolve and authorize a host runner launch.
@@ -111,6 +143,9 @@ def resolve_host_launch(
         session-access check for sub-agent parent delegation).
     :param permission_store: Session permission store, or ``None`` to
         skip the session-owner check (auth disabled).
+    :param pod_addr: This replica's dialable address, or ``None`` when
+        forwarding is unwired.
+    :param now: Optional shared liveness reference time for classification.
     :returns: A :class:`HostLaunchTarget` with the validated host,
         connection, and conversation.
     :raises HTTPException: 404 if the host or session is missing (or the
@@ -129,19 +164,7 @@ def resolve_host_launch(
 
     conn = host_registry.get(host_id)
     if conn is None:
-        # The host's tunnel isn't on this replica. If the store shows it still
-        # live (online + fresh heartbeat), it's up on another replica — a
-        # wrong-replica landing — so surface WRONG_REPLICA (400, distinct code)
-        # and let the client re-address keyless. Otherwise it's genuinely
-        # offline → CONFLICT (409). Mirrors RunnerRouter._runner_absent_code
-        # and hosts._host_absent_error.
-        if host_is_live(host):
-            raise OmnigentError(
-                "host is on another replica",
-                code=ErrorCode.WRONG_REPLICA,
-                owner_addr=host.owner_addr,
-            )
-        raise OmnigentError("host is offline", code=ErrorCode.CONFLICT)
+        raise classify_host_absent(host, pod_addr=pod_addr, now=now)
 
     conv = conversation_store.get_conversation(session_id)
     if conv is None:
