@@ -17,7 +17,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.stores.conversation_store import pinned_label_key
 
 
-def _child(labels: dict[str, str]) -> Conversation:
+def _child(labels: dict[str, str], *, sub_agent_name: str | None = None) -> Conversation:
     """A minimal sub-agent conversation carrying the given labels."""
     return Conversation(
         id="conv_child",
@@ -26,6 +26,7 @@ def _child(labels: dict[str, str]) -> Conversation:
         root_conversation_id="conv_parent",
         title="tool:child-task",
         agent_id="ag_test",
+        sub_agent_name=sub_agent_name,
         labels=labels,
     )
 
@@ -44,3 +45,15 @@ def test_child_summary_strips_per_user_pin_keys() -> None:
     assert not any(k.startswith("omnigent.pinned") for k in summary.labels)
     # Unrelated labels are preserved.
     assert summary.labels.get("omni_project") == "Moonshot"
+
+
+def test_child_summary_projects_durable_sub_agent_name() -> None:
+    """The child wire summary exposes the conversation's durable binding."""
+    summary = _child_session_summary_from_conversation(
+        _child({}, sub_agent_name="Plan"),
+        "conv_parent",
+        None,
+    )
+
+    assert summary.agent_name == "Plan"
+    assert summary.sub_agent_name == "Plan"

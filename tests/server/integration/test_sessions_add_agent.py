@@ -2,7 +2,7 @@
 
 A separately-registered agent is attached as a child of an existing
 session via ``POST /v1/sessions`` (``parent_session_id`` set, arbitrary
-``agent_id``, no ``sub_agent_name``). Tests run against the in-process
+``agent_id``, no request ``sub_agent_name``). Tests run against the in-process
 ASGI ``client`` with no runner bound, so they cover the persistence-layer
 primitive (child row, parent link, seeded history, scoping) without an
 LLM. Runner execution of a heterogeneous Codex child is an e2e concern
@@ -120,8 +120,10 @@ async def test_add_agent_attaches_arbitrary_agent_as_child(
     assert child["parent_session_id"] == parent["id"]
     assert child["agent_id"] == reviewer["id"]
     assert child["id"] != parent["id"]
-    # None means the child resolves its own bundle, not a parent sub-spec.
-    assert child["sub_agent_name"] is None
+    # The durable binding records the attached agent, so child discovery
+    # does not depend on parsing the title. It is not a parent sub-spec
+    # name, so spec resolution still falls back to the child's own bundle.
+    assert child["sub_agent_name"] == "codex-reviewer"
 
 
 async def test_added_child_appears_in_parent_child_sessions(
@@ -208,10 +210,12 @@ async def test_add_agent_child_preserves_body_terminal_launch_args(
     """
     User-added child sessions keep validated body ``terminal_launch_args``.
 
-    Add Agent children set ``parent_session_id`` but leave
-    ``sub_agent_name`` null, so they resolve their own bound agent rather
-    than a parent sub-spec. They must therefore follow the ordinary
+    Add Agent children set ``parent_session_id`` but send no
+    ``sub_agent_name``, so they resolve their own bound agent rather than
+    a parent sub-spec. They must therefore follow the ordinary
     create-session launch-arg path, not the named-sub-agent derived path.
+    The stored binding is the attached agent's own name; only the request
+    field selects the derived path.
     """
     parent = await _create_parent_session(client, agent_name="parent-coder-cn-args")
     cc = await create_test_agent(client, name="claude-native-ui")
@@ -226,7 +230,7 @@ async def test_add_agent_child_preserves_body_terminal_launch_args(
     )
     assert add.status_code == 201, add.text
     child = add.json()
-    assert child["sub_agent_name"] is None
+    assert child["sub_agent_name"] == "claude-native-ui"
     assert child["terminal_launch_args"] == launch_args
 
     snap = await client.get(f"/v1/sessions/{child['id']}")
