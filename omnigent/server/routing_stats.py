@@ -80,7 +80,9 @@ async def record_elicitation_resolution_if_off_owner(
     """Count an elicitation resolution whose durable owner is remote.
 
     A runner absent from this process is not necessarily on another pod; it
-    may be offline everywhere. Only a remote durable owner is an off-owner hit.
+    may be offline everywhere. Only a remote durable owner is an off-owner hit,
+    and only that case is refused: the caller is reporting what its harness
+    already did, so there is nothing for a live runner to do here.
     """
     stats = stats_for_request(request)
     runner_id = getattr(conversation, "runner_id", None)
@@ -97,11 +99,6 @@ async def record_elicitation_resolution_if_off_owner(
                     "session elicitation is on another replica; retry",
                     code=ErrorCode.WRONG_REPLICA,
                     owner_addr=owner,
-                )
-            if _stage2_active(request, runner_router):
-                raise OmnigentError(
-                    "session elicitation runner is unavailable; retry",
-                    code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
 
 
@@ -136,11 +133,6 @@ async def record_hook_park_if_off_owner(
                 "session hook is on another replica; retry",
                 code=ErrorCode.WRONG_REPLICA,
                 owner_addr=owner,
-            )
-        if _stage2_active(request, runner_router):
-            raise OmnigentError(
-                "session hook runner is unavailable; retry",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
             )
 
 

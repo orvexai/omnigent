@@ -73,6 +73,13 @@ async def test_off_owner_elicitation_resolution_is_loud_and_does_not_tombstone()
 
 @pytest.mark.asyncio
 async def test_offline_runner_is_not_counted_as_off_owner() -> None:
+    """A runner offline everywhere is not an off-owner hit, and not refused.
+
+    Both sites report what the harness already did. With no remote owner
+    to forward to there is nothing a live runner would add, so refusing
+    would only lose the report — on a single-replica deployment that is
+    the ONLY branch these guards can reach.
+    """
     stats = RoutingStats()
     request = SimpleNamespace(
         app=SimpleNamespace(state=SimpleNamespace(routing_stats=stats, pod_addr="pod-a:8000"))
@@ -80,37 +87,32 @@ async def test_offline_runner_is_not_counted_as_off_owner() -> None:
     offline = _Conversation("runner-offline")
     router = _DurableOwnerRouter(set())
 
-    with pytest.raises(OmnigentError) as elicitation_error:
-        await record_elicitation_resolution_if_off_owner(request, offline, router)
-    assert elicitation_error.value.code == ErrorCode.RUNNER_UNAVAILABLE
-    with pytest.raises(OmnigentError) as hook_error:
-        await record_hook_park_if_off_owner(
-            request,
-            session_id="conv-offline",
-            conversation_store=SimpleNamespace(),
-            runner_router=router,
-            conversation=offline,
-        )
-    assert hook_error.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    await record_elicitation_resolution_if_off_owner(request, offline, router)
+    await record_hook_park_if_off_owner(
+        request,
+        session_id="conv-offline",
+        conversation_store=SimpleNamespace(),
+        runner_router=router,
+        conversation=offline,
+    )
     assert stats.snapshot()["elicitation_resolve_off_owner_total"] == 0
     assert stats.snapshot()["hook_park_off_owner_total"] == 0
 
 
 @pytest.mark.asyncio
 async def test_offline_hook_is_not_counted_as_off_owner() -> None:
+    """A hook park with no remote owner passes through uncounted."""
     stats = RoutingStats()
     request = SimpleNamespace(
         app=SimpleNamespace(state=SimpleNamespace(routing_stats=stats, pod_addr="pod-a:8000"))
     )
-    with pytest.raises(OmnigentError) as error:
-        await record_hook_park_if_off_owner(
-            request,
-            session_id="conv-offline",
-            conversation_store=SimpleNamespace(),
-            runner_router=_DurableOwnerRouter(set()),
-            conversation=_Conversation("runner-offline"),
-        )
-    assert error.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    await record_hook_park_if_off_owner(
+        request,
+        session_id="conv-offline",
+        conversation_store=SimpleNamespace(),
+        runner_router=_DurableOwnerRouter(set()),
+        conversation=_Conversation("runner-offline"),
+    )
     assert stats.snapshot()["hook_park_off_owner_total"] == 0
 
 
