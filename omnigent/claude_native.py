@@ -22,6 +22,7 @@ import subprocess
 import sys
 import uuid
 
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.runtime.tool_result_replay import (
@@ -37,6 +38,14 @@ from omnigent.runtime.tool_result_replay import (
 if sys.platform != "win32":
     import termios
     import tty
+else:
+    # ctypes-driven equivalent of termios/tty raw mode for the Windows
+    # console (see ``_enter_raw_mode``/``_restore_terminal`` below) — used
+    # by the WebSocket relay attach path (the same-machine direct-tmux-attach
+    # fast path never reaches this; it hands the real console straight to
+    # ``tmux attach``, which manages raw mode itself via msys2).
+    import ctypes
+    import msvcrt
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -141,6 +150,14 @@ from omnigent.terminals.ws_bridge import (
 _logger = logging.getLogger(__name__)
 
 _TermiosAttrs: TypeAlias = list[int | list[bytes | int]]
+#: Saved raw-mode state: POSIX termios attrs, or a Windows console mode DWORD.
+_RawModeState: TypeAlias = "_TermiosAttrs | int"
+
+# Win32 console input mode bits cleared to enter raw mode (winbase.h):
+# ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT. Clearing
+# ENABLE_PROCESSED_INPUT stops the console from handling Ctrl-C itself so
+# raw bytes (including 0x03) reach the relay instead of raising SIGINT.
+_WIN_CONSOLE_RAW_MASK = 0x0004 | 0x0002 | 0x0001
 _SignalHandler: TypeAlias = (
     Callable[[int, FrameType | None], object] | int | signal.Handlers | None
 )
@@ -2722,7 +2739,11 @@ def _can_attach_direct_tmux(prepared: PreparedClaudeTerminal) -> bool:
         prepared.tmux_socket is not None
         and prepared.tmux_target is not None
         and prepared.tmux_socket.exists()
-        and shutil.which("tmux") is not None
+        # Not ``shutil.which``: an msys2 tmux that a launching shell can see is
+        # still missed when PATH was snapshotted without it, and falling back to
+        # the WebSocket relay for a same-machine session routes every keystroke
+        # through the remote server.
+        and resolve_cli_binary("tmux", env_var="OMNIGENT_TMUX_PATH") is not None
     )
 
 
@@ -2760,11 +2781,14 @@ async def _attach_direct_tmux(
     env.pop("TMUX", None)
     startup_profiler.mark("starting tmux attach subprocess", detail=f"target={tmux_target}")
     process = await asyncio.create_subprocess_exec(
-        "tmux",
+        # Resolve rather than rely on PATH, and give tmux a POSIX null config:
+        # on Windows ``os.devnull`` is ``nul``, which msys2 tmux reports as
+        # "nul: No such file or directory" on every attach.
+        resolve_cli_binary("tmux", env_var="OMNIGENT_TMUX_PATH") or "tmux",
         "-S",
         str(socket_path),
         "-f",
-        os.devnull,
+        "/dev/null" if IS_WINDOWS else os.devnull,
         "attach",
         "-t",
         tmux_target,
@@ -4814,7 +4838,9 @@ def _preflight_local_tools(command: str) -> None:
             f"Claude Code CLI command {command!r} was not found on local PATH. "
             "--server selects the Omnigent server only; Claude still runs locally."
         )
-    if shutil.which("tmux") is None:
+    # Same resolver the attach path uses, so an OMNIGENT_TMUX_PATH override is
+    # not rejected here before the code that would honour it ever runs.
+    if resolve_cli_binary("tmux", env_var="OMNIGENT_TMUX_PATH") is None:
         raise click.ClickException(
             "tmux was not found on local PATH. The native Claude wrapper "
             "launches Claude through the local runner's tmux terminal."
@@ -5438,38 +5464,69 @@ async def _send_resize(ws: _WebSocketClient, stdin_fd: int) -> None:
         size detection.
     :returns: None.
     """
-    size = os.get_terminal_size(stdin_fd) if os.isatty(stdin_fd) else os.terminal_size((80, 24))
+    size = os.terminal_size((80, 24))
+    if os.isatty(stdin_fd):
+        # ``isatty`` is true for both a real console and a pipe wearing a
+        # tty-like face (mintty/MSYS2) — only the former has a size the
+        # Win32/ioctl call underneath can read; fall back to the default
+        # rather than propagate on the latter.
+        with contextlib.suppress(OSError):
+            size = os.get_terminal_size(stdin_fd)
     await ws.send(json.dumps({"type": "resize", "cols": size.columns, "rows": size.lines}))
 
 
-def _enter_raw_mode(fd: int) -> _TermiosAttrs | None:
+def _enter_raw_mode(fd: int) -> _RawModeState | None:
     """
     Put *fd* into raw mode when it is a TTY.
 
     :param fd: File descriptor to update.
-    :returns: Previous termios attributes, or ``None`` when *fd* is
-        not a TTY.
+    :returns: Previous termios attributes (POSIX) or console mode
+        (Windows), or ``None`` when *fd* is not a TTY.
     """
     if not os.isatty(fd):
         return None
+    if sys.platform == "win32":
+        # ``fd`` may be a real Win32 console (conhost/Windows Terminal) or a
+        # pipe wearing a tty-like face (mintty/MSYS2, the default Git-Bash
+        # terminal): ``os.isatty`` reports both as a tty, but only the
+        # former has a console handle ``GetConsoleMode`` accepts.
+        # ``get_osfhandle``/``GetConsoleMode`` raise/fail with WinError 6
+        # ("the handle is invalid") on the latter — degrade to "no raw mode
+        # available" there rather than propagate, since mintty already
+        # manages its own raw input handling.
+        try:
+            handle = msvcrt.get_osfhandle(fd)
+            old_mode = ctypes.c_uint32()
+            if not ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(old_mode)):
+                return None
+            ctypes.windll.kernel32.SetConsoleMode(handle, old_mode.value & ~_WIN_CONSOLE_RAW_MASK)
+        except OSError:
+            return None
+        return old_mode.value
     old_attrs = cast(_TermiosAttrs, termios.tcgetattr(fd))
     tty.setraw(fd)
     return old_attrs
 
 
-def _restore_terminal(fd: int, old_attrs: _TermiosAttrs | None) -> None:
+def _restore_terminal(fd: int, old_attrs: _RawModeState | None) -> None:
     """
-    Restore termios attributes saved by :func:`_enter_raw_mode`.
+    Restore terminal state saved by :func:`_enter_raw_mode`.
 
     :param fd: File descriptor to restore.
-    :param old_attrs: Attributes returned from
-        :func:`_enter_raw_mode`.
+    :param old_attrs: State returned from :func:`_enter_raw_mode`.
     :returns: None.
     """
     if old_attrs is None:
         return
+    if sys.platform == "win32":
+        with contextlib.suppress(OSError):
+            handle = msvcrt.get_osfhandle(fd)
+            ctypes.windll.kernel32.SetConsoleMode(handle, cast(int, old_attrs))
+        return
     with contextlib.suppress(termios.error, OSError):
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        # ``_RawModeState`` unions the POSIX attribute list with the Windows
+        # console mode int; only the list reaches this branch.
+        termios.tcsetattr(fd, termios.TCSADRAIN, cast(_TermiosAttrs, old_attrs))
 
 
 @dataclass
@@ -5515,11 +5572,18 @@ def _install_attach_signal_handlers(
         resize_tasks.add(task)
         task.add_done_callback(resize_tasks.discard)
 
-    for sig, handler in {
-        signal.SIGWINCH: _resize,
+    handlers: dict[signal.Signals, Callable[[], None]] = {
         signal.SIGTERM: lambda: _request_stop(signal.SIGTERM),
-        signal.SIGHUP: lambda: _request_stop(signal.SIGHUP),
-    }.items():
+    }
+    # SIGWINCH/SIGHUP don't exist on Windows (no controlling-terminal
+    # resize signal, no hangup signal); resize there instead goes through
+    # a poll loop the caller drives via ``_send_resize`` directly.
+    if hasattr(signal, "SIGWINCH"):
+        handlers[signal.SIGWINCH] = _resize
+    if hasattr(signal, "SIGHUP"):
+        handlers[signal.SIGHUP] = lambda: _request_stop(signal.SIGHUP)
+
+    for sig, handler in handlers.items():
         previous[sig] = cast(_SignalHandler, signal.getsignal(sig))
         try:
             loop.add_signal_handler(sig, handler)

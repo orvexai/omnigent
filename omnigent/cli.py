@@ -3071,6 +3071,14 @@ def _build_host_daemon_env(
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key.startswith(daemon_env_prefixes)
         }
+    if IS_WINDOWS:
+        # Force UTF-8 I/O regardless of whether the launching shell happened
+        # to have it set. Without this, connection-status messages containing
+        # "✓"/"↑" raise UnicodeEncodeError against the legacy console code
+        # page and the tunnel dies in an infinite reconnect loop (see the
+        # PYTHONUTF8 allowlist comment in host/connect.py — that only
+        # preserves an existing value, it doesn't guarantee one).
+        env["PYTHONUTF8"] = "1"
     return env
 
 

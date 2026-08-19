@@ -20,7 +20,7 @@ import logging
 import os
 import shutil
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
 
@@ -45,6 +45,11 @@ def _cli_fallback_dirs() -> tuple[Path, ...]:
         Path("/opt/homebrew/bin"),
         home / ".npm-global" / "bin",
     ]
+    if os.name == "nt":
+        # msys2's default install root ships tmux; a native Windows Python
+        # daemon has no POSIX PATH entries of its own, so probe it directly
+        # rather than requiring the user to add it to the system PATH.
+        dirs.append(Path("C:/msys64/usr/bin"))
     # nvm keeps global bins per Node version; newest first so a current install
     # wins over a stale one. Sort by parsed numeric version (so v10 > v9, not
     # the lexicographic order in which "v10" < "v9").
@@ -114,9 +119,14 @@ def resolve_cli_binary(
     if on_path is not None:
         return on_path
     for directory in _cli_fallback_dirs():
-        candidate = directory / name
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
+        # ``shutil.which`` rather than probing ``directory / name`` directly: it
+        # applies PATHEXT, without which a Windows install is invisible here —
+        # msys2 ships ``tmux.exe``, so ``directory / "tmux"`` never exists and
+        # the whole ladder silently returns nothing. On POSIX this is equivalent
+        # to the previous is-file-and-executable check.
+        found = shutil.which(name, path=str(directory))
+        if found is not None:
+            return found
     return None
 
 
@@ -164,6 +174,58 @@ WINDOWS_ENV_PASSTHROUGH: tuple[str, ...] = (
     "APPDATA",
     "LOCALAPPDATA",
 )
+
+
+def to_posix_path(path: str | Path) -> str:
+    """
+    Render a Windows path in the POSIX form an msys2/Cygwin program expects.
+
+    ``C:\\Users\\me\\x`` becomes ``/c/Users/me/x``. A path that is already
+    POSIX comes back with separators normalized only, so this is safe to
+    apply unconditionally.
+
+    Needed wherever a path is handed to *tmux itself* on Windows: tmux is an
+    msys2 binary that does not recognize ``C:\\...`` as absolute, and silently
+    resolves it against its own cwd instead — e.g. ``load-buffer`` reported
+    ``No such file or directory: /home/me/repo/C:\\Users\\...\\paste.bin``.
+    Arguments consumed by the *pane's* program (a native Windows ``claude.exe``
+    or ``codex.exe``) must keep their Windows form.
+
+    :param path: The path to convert, e.g. ``Path("C:/Temp/paste.bin")``.
+    :returns: A POSIX-style path string.
+    """
+    drive, rest = os.path.splitdrive(str(path))
+    if len(drive) == 2 and drive[1] == ":":
+        return f"/{drive[0].lower()}{rest.replace(os.sep, '/')}"
+    return str(path).replace(os.sep, "/")
+
+
+def tmux_spawn_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """
+    Build the environment for spawning msys2 ``tmux``, with globbing disabled.
+
+    Cygwin reconstructs a child's argv from the Windows command line and
+    brace-expands unquoted arguments, so a tmux format specifier such as
+    ``#{pane_dead}`` reaches tmux as the literal ``#pane_dead``. tmux then
+    echoes that string back instead of the value, and every liveness probe
+    silently reads "alive" — a dead pane is never detected. ``MSYS=noglob``
+    turns that expansion off. (A format containing a space happens to survive
+    unmangled, which is why only some probes were affected.)
+
+    Appended to any existing ``MSYS`` value rather than replacing it: that
+    variable also carries unrelated settings such as ``winsymlinks``. No-op
+    off Windows, so callers can apply it unconditionally.
+
+    :param env: Base environment; defaults to :data:`os.environ`.
+    :returns: A copy of *env* safe for spawning tmux.
+    """
+    base = dict(os.environ if env is None else env)
+    if not IS_WINDOWS:
+        return base
+    existing = base.get("MSYS", "").strip()
+    if "noglob" not in existing.split():
+        base["MSYS"] = f"{existing} noglob".strip()
+    return base
 
 
 def default_shell_argv(command: str) -> list[str]:

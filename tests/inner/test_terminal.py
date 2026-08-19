@@ -294,9 +294,10 @@ async def test_is_alive_false_when_pane_dead(
         *cmd: str,
         stdout: object,
         stderr: object,
+        env: dict[str, str] | None = None,
     ) -> _ProcessWithStdout:
         """Capture argv and report a dead pane (``#{pane_dead}`` -> ``1``)."""
-        del stdout, stderr
+        del stdout, stderr, env
         captured.append(list(cmd))
         return _ProcessWithStdout(stdout=b"1\n", returncode=0)
 
@@ -340,9 +341,10 @@ async def test_is_alive_true_when_pane_live(
         *cmd: str,
         stdout: object,
         stderr: object,
+        env: dict[str, str] | None = None,
     ) -> _ProcessWithStdout:
         """Report a live pane (``#{pane_dead}`` -> ``0``)."""
-        del cmd, stdout, stderr
+        del cmd, stdout, stderr, env
         return _ProcessWithStdout(stdout=b"0\n", returncode=0)
 
     monkeypatch.setattr(
@@ -620,9 +622,16 @@ async def test_launch_does_not_force_terminal_feature_patterns(
     Leaving that option alone keeps unsupported terminals on their
     legacy key encoding.
 
+    Pinned to the POSIX branch: Windows asserts exactly one feature
+    (``*:sync``) because mintty implements DECSET 2026 but answers the
+    capability probe with "not recognised", so negotiation there can never
+    succeed — see :func:`_tmux_input_option_commands` and
+    :func:`test_launch_forces_only_sync_feature_on_windows`.
+
     :param tmp_path: Temporary directory used for the fake tmux socket.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", False)
     captured: list[list[str]] = []
 
     async def fake_create_subprocess_exec(
@@ -667,6 +676,74 @@ async def test_launch_does_not_force_terminal_feature_patterns(
     # mean the terminal-feature assertion below may not cover the full setup argv.
     assert len(captured) == 1
     assert "terminal-features" not in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_launch_forces_only_sync_feature_on_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Windows asserts ``*:sync`` — and nothing else — as a documented exception.
+
+    mintty implements synchronized output (DECSET 2026) but answers the
+    capability probe with status 0, so tmux's negotiation can never enable
+    it and repaints tear. Asserting the feature is the only route to it
+    there. The rest of the negotiate-don't-assert rule still holds, so this
+    pins that exactly one feature is forced, that it is appended (``-ga``)
+    rather than replacing tmux's built-in entries, and that extended keys
+    are still left to negotiation.
+
+    :param tmp_path: Temporary directory used for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    captured: list[list[str]] = []
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+        env: dict[str, str],
+    ) -> _SuccessfulProcess:
+        """
+        Capture the tmux argv and return a successful process.
+
+        :param cmd: Tmux command argv.
+        :param stdout: Captured stdout redirection.
+        :param stderr: Captured stderr redirection.
+        :param env: Environment passed to the subprocess.
+        :returns: A successful fake process.
+        """
+        del stdout, stderr, env
+        captured.append(list(cmd))
+        return _SuccessfulProcess()
+
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=fake_create_subprocess_exec,
+            subprocess=terminal_mod.asyncio.subprocess,
+        ),
+    )
+
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+
+    await instance.launch(cwd=tmp_path)
+
+    assert len(captured) == 1
+    cmd = captured[0]
+    # ``-ga`` appends; a plain ``-g`` here would replace tmux's built-in
+    # entries and silently drop clipboard/cstyle/focus/title.
+    assert contains_subsequence(cmd, ["set-option", "-ga", "terminal-features", "*:sync"])
+    # Exactly one forced feature — the rest stay negotiated.
+    assert cmd.count("terminal-features") == 1
 
 
 @pytest.mark.asyncio
@@ -1057,6 +1134,7 @@ async def test_send_chunks_long_literal_text_under_tmux_command_cap(
         *cmd: str,
         stdout: object,
         stderr: object,
+        env: dict[str, str] | None = None,
     ) -> _SuccessfulProcess:
         """
         Capture the tmux argv and return a successful process.
@@ -1064,9 +1142,10 @@ async def test_send_chunks_long_literal_text_under_tmux_command_cap(
         :param cmd: Tmux command argv.
         :param stdout: Captured stdout redirection.
         :param stderr: Captured stderr redirection.
+        :param env: Environment passed to the subprocess.
         :returns: A successful fake process.
         """
-        del stdout, stderr
+        del stdout, stderr, env
         captured.append(list(cmd))
         return _SuccessfulProcess()
 
@@ -1294,6 +1373,9 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
 
     monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
     monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    # Pin the resolved binary: the reaper spawns whatever ``_tmux_binary``
+    # returns, which is an absolute path wherever tmux is actually installed.
+    monkeypatch.setattr(terminal_mod, "_tmux_binary", lambda: "tmux")
     monkeypatch.setattr(
         terminal_mod,
         "subprocess",

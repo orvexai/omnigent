@@ -9,7 +9,6 @@ import logging
 import os
 import re
 import secrets
-import shutil
 import socket
 import time
 import uuid
@@ -24,6 +23,7 @@ import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_resume_hint
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
@@ -1497,7 +1497,7 @@ def _direct_tmux_unavailable_reason(prepared: PreparedCodexTerminal) -> str | No
         return "the terminal resource did not include a tmux target."
     if not prepared.tmux_socket.exists():
         return f"tmux socket {prepared.tmux_socket} is not reachable from this CLI process."
-    if shutil.which("tmux") is None:
+    if resolve_cli_binary("tmux", env_var="OMNIGENT_TMUX_PATH") is None:
         return "tmux is not available on PATH."
     return None
 
@@ -1518,11 +1518,14 @@ async def _attach_direct_tmux(socket_path: Path, tmux_target: str) -> None:
     env = dict(os.environ)
     env.pop("TMUX", None)
     process = await asyncio.create_subprocess_exec(
-        "tmux",
+        # Resolve rather than rely on PATH, and give tmux a POSIX null config:
+        # on Windows ``os.devnull`` is ``nul``, which msys2 tmux reports as
+        # "nul: No such file or directory" on every attach.
+        resolve_cli_binary("tmux", env_var="OMNIGENT_TMUX_PATH") or "tmux",
         "-S",
         str(socket_path),
         "-f",
-        os.devnull,
+        "/dev/null" if IS_WINDOWS else os.devnull,
         "attach",
         "-t",
         tmux_target,
@@ -2785,7 +2788,9 @@ def _preflight_local_tools() -> None:
     :returns: None.
     :raises click.ClickException: If required tools are missing.
     """
-    if shutil.which("tmux") is None:
+    # Same resolver the attach path uses, so an OMNIGENT_TMUX_PATH override is
+    # not rejected here before the code that would honour it ever runs.
+    if resolve_cli_binary("tmux", env_var="OMNIGENT_TMUX_PATH") is None:
         raise click.ClickException(
             "tmux was not found on local PATH. The native Codex wrapper "
             "attaches to the runner-owned Codex tmux terminal."

@@ -361,6 +361,11 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "TERM",
         "TERMINFO",
         "TERMINFO_DIRS",
+        # Explicit paths to the msys2 binaries the native terminals drive on
+        # Windows. Resolution happens in the RUNNER, so without these the
+        # override is inert there and only an on-PATH tmux works.
+        "OMNIGENT_TMUX_PATH",
+        "OMNIGENT_SCRIPT_PATH",
         "LANG",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",

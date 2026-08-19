@@ -1220,7 +1220,11 @@ def _forget_dispatch_task(
             return
         exc = task.exception()
         if exc is not None:
-            _logger.warning("runner tunnel dispatch %s failed: %s", req_id, exc)
+            # ``%r`` not ``%s``: several transport exceptions (timeouts,
+            # stream-end) carry an empty message, so ``%s`` logged a bare
+            # "failed: " naming neither the error nor its type — matching the
+            # sibling ws-attach handler above.
+            _logger.warning("runner tunnel dispatch %s failed: %r", req_id, exc)
 
     return _callback
 

@@ -21,7 +21,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias
 
-from omnigent._platform import IS_WINDOWS
+from omnigent._platform import (
+    IS_WINDOWS,
+    resolve_cli_binary,
+    tmux_spawn_env,
+    to_posix_path,
+)
 from omnigent.runner.identity import strip_runner_auth_secrets
 
 from . import _proc
@@ -53,7 +58,10 @@ TerminalResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 logger = logging.getLogger(__name__)
 
-_TMUX_CONFIG_PATH = os.devnull
+# tmux resolves this itself, and on Windows tmux is an msys2/Cygwin binary that
+# speaks POSIX paths — ``os.devnull`` there is ``nul``, which it reports as
+# "nul: No such file or directory" on every invocation.
+_TMUX_CONFIG_PATH = "/dev/null" if IS_WINDOWS else os.devnull
 _TMUX_CONVERSATION_LINK_OPTION = "@omnigent-conversation-link"
 
 # Web-terminal attach transports. ``pty`` forks a full ``tmux attach`` client
@@ -304,10 +312,16 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
     0`` prevents pasted ANSI escape bytes from accumulating tmux's
     default delay.
 
+    Terminal features are deliberately NOT forced by pattern — claiming a
+    capability from a ``TERM`` name match rather than negotiation is what
+    :func:`test_launch_does_not_force_terminal_feature_patterns` guards.
+    Windows is the one documented exception (see below), because there
+    negotiation provably cannot succeed.
+
     :param scrollback: Tmux history limit, e.g. ``10000``.
     :returns: Tmux commands configuring pane input and scrollback.
     """
-    return [
+    commands = [
         ["set-option", "-g", "history-limit", str(scrollback)],
         ["set-option", "-sq", "extended-keys", "on"],
         ["set-option", "-sq", "extended-keys-format", "csi-u"],
@@ -315,6 +329,22 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
         ["set-option", "-g", "focus-events", "on"],
         ["set-option", "-g", "escape-time", "0"],
     ]
+    if IS_WINDOWS:
+        # Synchronized output (DECSET 2026) makes a TUI's repaints atomic;
+        # without it a busy agent visibly tears and the cursor walks around
+        # mid-frame. tmux normally negotiates this, and we do not override
+        # that on POSIX. On Windows the terminal is msys2's mintty, which
+        # *implements* 2026 but answers the DECRPM probe with status 0
+        # ("not recognised") because its ``get_mode`` has no case for it —
+        # so tmux's negotiation can never succeed, on any tmux version, and
+        # tmux's built-in feature list carries no ``sync`` entry either.
+        # Asserting it here is the only way to get it, and the risk the
+        # negotiate-don't-assert rule protects against does not apply: a
+        # terminal without 2026 ignores the sequence as an unknown DECSET.
+        # ``-ga`` appends — plain ``-g`` would replace tmux's built-in
+        # entries and lose clipboard/cstyle/focus/title.
+        commands.append(["set-option", "-ga", "terminal-features", "*:sync"])
+    return commands
 
 
 def _tmux_lockdown_commands() -> list[list[str]]:
@@ -711,9 +741,24 @@ def _apply_utf8_locale_default(env: dict[str, str]) -> None:
     env["LC_ALL"] = "C.UTF-8"
 
 
+def _tmux_binary() -> str | None:
+    """Resolve the ``tmux`` binary, surviving the daemon's frozen ``PATH``.
+
+    The host daemon snapshots ``PATH`` at spawn and never refreshes it (see
+    :func:`omnigent._platform.resolve_cli_binary`), so a ``tmux`` that only a
+    later-opened shell's PATH sees (e.g. msys2's ``usr/bin`` on Windows) would
+    otherwise be invisible here. Checked, in order: ``OMNIGENT_TMUX_PATH``,
+    ``PATH``, then the same global-install fallback ladder other CLIs use.
+
+    :returns: An absolute path (or ``"tmux"`` if only bare-name resolution
+        succeeded) or ``None`` when tmux isn't found anywhere.
+    """
+    return resolve_cli_binary("tmux", env_var="OMNIGENT_TMUX_PATH")
+
+
 def _tmux_available() -> bool:
     """Check if tmux is installed."""
-    return shutil.which("tmux") is not None
+    return _tmux_binary() is not None
 
 
 def _process_alive(pid: int) -> bool:
@@ -794,12 +839,13 @@ def reap_orphaned_terminals() -> int:
         if socket_path.exists():
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 subprocess.run(
-                    ["tmux", "-S", str(socket_path), "kill-server"],
+                    [_tmux_binary() or "tmux", "-S", str(socket_path), "kill-server"],
                     # kill-server on an already-dead server exits non-zero;
                     # that is the common case for half-torn-down orphans.
                     check=False,
                     capture_output=True,
                     timeout=_REAP_KILL_TIMEOUT_S,
+                    env=tmux_spawn_env(),
                 )
         shutil.rmtree(entry, ignore_errors=True)
         reaped += 1
@@ -1088,7 +1134,7 @@ class TerminalInstance:
         :returns: Base argv for subprocess calls, e.g.
             ``["tmux", "-S", "/tmp/.../tmux.sock", "-f", "/dev/null"]``.
         """
-        return ["tmux", "-S", str(self.socket_path), "-f", _TMUX_CONFIG_PATH]
+        return [_tmux_binary() or "tmux", "-S", str(self.socket_path), "-f", _TMUX_CONFIG_PATH]
 
     async def set_conversation_link(self, conversation_link: str | None) -> None:
         """
@@ -1180,6 +1226,20 @@ class TerminalInstance:
         inner_str = " ".join(_shell_quote(c) for c in inner_cmd)
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
+        if IS_WINDOWS:
+            # The command crosses a Windows->Cygwin argv boundary: Python builds
+            # the child command line with MSVC quoting rules, but msys2's
+            # ``tmux.exe`` re-parses it with Cygwin's, which collapses ``\\`` to
+            # ``\``. Plain paths survive that, but a payload carrying escaped
+            # backslashes does not — e.g. the claude-native ``--mcp-config``
+            # JSON arrived with its ``C:\\...`` escapes flattened, became
+            # invalid JSON, and Claude then treated the whole argument as a
+            # filename and exited immediately (pane dead within one poll).
+            # Writing the command to a file keeps it off that boundary
+            # entirely; only the simple script path is passed as an argument.
+            script = self.private_dir / "launch.sh"
+            script.write_text(f"{inner_str}\n", encoding="utf-8", newline="\n")
+            inner_str = f"exec bash {_shell_quote(_to_posix_path(script))}"
 
         option_commands = [
             *_tmux_managed_option_commands(
@@ -1231,7 +1291,10 @@ class TerminalInstance:
                         "-y",
                         "24",
                         "-c",
-                        effective_cwd,
+                        # msys2 tmux resolves this itself and only understands
+                        # POSIX paths; handed ``C:\...`` it silently fails to
+                        # chdir and starts the pane in $HOME instead.
+                        _to_posix_path(Path(effective_cwd)) if IS_WINDOWS else effective_cwd,
                         inner_str,
                     ],
                     *pane_died_hook,
@@ -1243,7 +1306,10 @@ class TerminalInstance:
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
-            env=env,
+            # ``env`` becomes the pane's environment; wrap it so the tmux
+            # client itself also gets ``MSYS=noglob`` and the option/format
+            # arguments in ``cmd`` survive Cygwin's argv brace expansion.
+            env=tmux_spawn_env(env),
         )
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
@@ -1677,12 +1743,26 @@ class TerminalInstance:
                 return
             snapshot = self._capture_pane_for_idle_or_none()
             if snapshot is None:
+                # A spurious exit here silently tears the terminal down, so
+                # record which branch fired. Status only — the frame itself is
+                # already retained by ``_remember_pane_snapshot`` and can carry
+                # prompts, file contents or credentials, so it is not logged.
+                logger.debug(
+                    "terminal watcher exit (capture-pane failed; tmux server gone) for %s:%s",
+                    self.name,
+                    self.session_key,
+                )
                 self.running = False
                 if on_exit is not None:
                     self._fire_watch_callback(on_exit, "exit")
                 return
             self._remember_pane_snapshot(snapshot)
             if self._pane_is_dead():
+                logger.debug(
+                    "terminal watcher exit (pane_dead) for %s:%s",
+                    self.name,
+                    self.session_key,
+                )
                 # The inner CLI exited but remain-on-exit kept the server, so
                 # capture-pane still succeeds (the snapshot above is the final
                 # frame, now remembered for diagnostics). Report the exit
@@ -1869,6 +1949,7 @@ class TerminalInstance:
                 "#{pane_dead}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
+                env=tmux_spawn_env(),
             )
             stdout, _ = await proc.communicate()
             # rc != 0 → session/server gone; a "1" line → the pane process
@@ -1908,6 +1989,7 @@ class TerminalInstance:
             *args,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            env=tmux_spawn_env(),
         )
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
@@ -1920,6 +2002,7 @@ class TerminalInstance:
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=tmux_spawn_env(),
         )
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
@@ -1941,7 +2024,12 @@ class TerminalInstance:
         :raises RuntimeError: When the tmux subprocess exits
             non-zero (typically because the server has gone away).
         """
-        proc = subprocess.run([*self._tmux_base_cmd(), *args], capture_output=True, check=False)
+        proc = subprocess.run(
+            [*self._tmux_base_cmd(), *args],
+            capture_output=True,
+            check=False,
+            env=tmux_spawn_env(),
+        )
         if proc.returncode != 0:
             raise RuntimeError(
                 f"tmux command failed: {' '.join(args)}: {proc.stderr.decode().strip()}"
@@ -1957,6 +2045,11 @@ def _shell_quote(s: str) -> str:
     if re.match(r"^[a-zA-Z0-9_./:@=-]+$", s):
         return s
     return "'" + s.replace("'", "'\\''") + "'"
+
+
+#: Re-exported for the terminal module's callers; defined in the leaf platform
+#: module so the native bridges can share it without importing this one.
+_to_posix_path = to_posix_path
 
 
 @dataclass(frozen=True)
@@ -2014,14 +2107,9 @@ def create_terminal_instance(
     :returns: A :class:`TerminalCreateResult` carrying the new instance
         and the resolved cwd to pass to ``launch()``.
     """
-    if IS_WINDOWS:
-        raise RuntimeError(
-            "Native terminal harnesses (tmux/PTY) are not supported on Windows. "
-            "Run an SDK-based harness via `omnigent run <agent.yaml>` (e.g. the "
-            "claude-sdk, cursor, copilot, or codex harness) or use the web UI."
-        )
     if not _tmux_available():
-        raise RuntimeError("tmux is not installed or not on PATH")
+        hint = " (install msys2, then `pacman -S tmux`)" if IS_WINDOWS else ""
+        raise RuntimeError(f"tmux is not installed or not on PATH{hint}")
 
     # Create the instance's private directory.
     private_dir = Path(tempfile.mkdtemp(prefix=_TERMINAL_DIR_PREFIX))

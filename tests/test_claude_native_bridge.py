@@ -25,6 +25,7 @@ from omnigent import claude_native_bridge, native_cost_popup
 from omnigent.claude_native_bridge import (
     _build_tools,
     _claude_prompt_rendered,
+    _draft_in_input_box,
     _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
     _JsonlRecord,
@@ -59,6 +60,24 @@ from omnigent.inner.datamodel import (
     OSEnvSandboxSpec,
 )
 from omnigent.reasoning_effort import CLAUDE_EFFORTS
+
+
+def _read_tmux_path_arg(arg: str) -> bytes:
+    """
+    Read a file the way tmux would, given the path the harness passed it.
+
+    On Windows the harness hands ``load-buffer`` a POSIX path (``/c/Users/…``)
+    because msys2 tmux treats ``C:\\…`` as relative and resolves it against the
+    pane's cwd. A fake standing in for tmux therefore receives that form and
+    has to map it back before opening the file.
+
+    :param arg: The path argument as passed to tmux.
+    :returns: The file's bytes.
+    """
+    path = Path(arg)
+    if not path.exists() and len(arg) > 3 and arg[0] == "/" and arg[2] == "/":
+        path = Path(f"{arg[1]}:/{arg[3:]}")
+    return path.read_bytes()
 
 
 @pytest.fixture(autouse=True)
@@ -3187,7 +3206,7 @@ def test_inject_user_message_pastes_content_then_submits(
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "load-buffer" in cmd:
-            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+            loaded_payloads.append(_read_tmux_path_arg(cmd[-1]))
         if "paste-buffer" in cmd:
             tui["pane"] = "❯ [Pasted text #1 +2 lines]"
         if cmd[-1] == "Enter":
@@ -3299,7 +3318,7 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "load-buffer" in cmd:
-            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+            loaded_payloads.append(_read_tmux_path_arg(cmd[-1]))
         if "paste-buffer" in cmd:
             tui["pane"] = "❯ [Pasted text #1 +2 lines]"
         if cmd[-1] == "Enter":
@@ -6132,6 +6151,66 @@ def test_claude_prompt_rendered_ignores_unframed_glyph_deep_in_tail() -> None:
         ]
     )
     assert _claude_prompt_rendered(pane) is False
+
+
+def test_claude_prompt_rendered_accepts_ascii_caret_in_framed_input_box() -> None:
+    """
+    Claude Code 2.1.x draws the composer caret as ASCII ``>``, not ``❯``.
+
+    Matching only ``❯`` left the gate permanently "not ready" against those
+    builds, so every injected message was dropped after the readiness
+    timeout. The ASCII caret must be honoured when it is framed by the input
+    box's closing rule.
+    """
+    pane = "\n".join(
+        [
+            "● some earlier answer",
+            "─" * 60,
+            ">  ",
+            "─" * 60,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+@pytest.mark.parametrize(
+    ("label", "pane"),
+    [
+        ("markdown quote", "As the docs say:\n> use --flag\nDone."),
+        ("arrow in output", "step one\nfoo -> bar\nstep three"),
+        ("html in output", "rendered:\n<div>hello</div>\ndone"),
+        ("shell prompt echo", "ran a command\nC:\\Users\\me>\nfinished"),
+    ],
+)
+def test_claude_prompt_rendered_ignores_unframed_ascii_caret(label: str, pane: str) -> None:
+    """
+    A bare ``>`` in ordinary output must not read as the composer.
+
+    Unlike ``❯``, ``>`` occurs constantly in normal terminal output. Trusting
+    it on position alone (near the bottom of the pane) made the gate report
+    ready with no input box mounted, so a message would be typed into
+    whatever surface was actually showing. The ASCII spelling is therefore
+    only honoured with a box rule beneath it.
+
+    :param label: Human-readable case name.
+    :param pane: Captured pane text containing a non-caret ``>``.
+    """
+    del label
+    assert _claude_prompt_rendered(pane) is False
+
+
+def test_draft_in_input_box_survives_a_redirect_in_the_message() -> None:
+    """
+    A ``>`` inside the user's own draft must not be mistaken for the caret.
+
+    ``_draft_in_input_box`` splits the caret line to read back the pending
+    draft. Splitting at the LAST ``>`` on the line meant any message
+    containing ``>``, ``->`` or ``>=`` reported the draft as absent, which
+    silently skips the submit-verification retry that guards the paste race.
+    """
+    pane = "\n".join(["─" * 60, "❯ run: cat a > b please", "─" * 60])
+    assert _draft_in_input_box(pane, "run: cat a > b please") is True
 
 
 def test_claude_prompt_rendered_ignores_custom_api_key_menu() -> None:

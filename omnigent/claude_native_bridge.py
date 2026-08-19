@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib import error, request
 
-from omnigent._platform import stable_user_id
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary, stable_user_id, to_posix_path
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
@@ -139,10 +139,24 @@ _TMUX_SEND_TIMEOUT_S = 5.0
 # The glyph persists while Claude is busy responding, so its presence
 # means "input box mounted" (not "idle"), which is what injection needs.
 _CLAUDE_PROMPT_GLYPH = "❯"
-# Matches a selected numbered menu row (``❯ 2. No (recommended)``): the glyph
+# Claude Code renders the composer caret as ``❯`` in older builds and a plain
+# ASCII ``>`` in 2.1.x (verified: the caret captures as U+003E U+00A0). Matching
+# only ``❯`` version-locks the readiness gate — the input box never "renders",
+# every injection times out, and the message is silently dropped.
+#
+# The two spellings cannot be trusted equally. ``❯`` is rare enough that its
+# presence near the bottom of a pane is itself evidence of the composer. ``>``
+# is ordinary text — markdown quotes, ``->``, ``<div>``, a shell prompt — so it
+# is only ever accepted at the start of a line AND with an input-box rule
+# beneath it. Treating them alike made the gate fire on quoted output and made
+# ``_draft_in_input_box`` split on a ``>`` inside the user's own message.
+_CLAUDE_PROMPT_GLYPH_ASCII = ">"
+# Matches a selected numbered menu row (``❯ 2. No (recommended)``): the caret
 # followed by a numbered choice, which the chat input never renders. Used to
 # exclude startup menus from the readiness scan (see ``_is_selected_menu_row``).
-_SELECTED_MENU_ROW_RE = re.compile(rf"{_CLAUDE_PROMPT_GLYPH}\s*\d+\.\s")
+_SELECTED_MENU_ROW_RE = re.compile(
+    rf"[{re.escape(_CLAUDE_PROMPT_GLYPH + _CLAUDE_PROMPT_GLYPH_ASCII)}]\s*\d+\.\s"
+)
 # Box-drawing glyphs Claude Code's input-box frame is made of. A line of
 # these below ``❯`` marks the live input box (see ``_is_box_rule``),
 # distinguishing it from a bare prompt echoed into scrollback.
@@ -3005,7 +3019,16 @@ def inject_user_message(
         paste_file.write(_paste_payload_bytes(injected_text + "\n"))
         paste_path = paste_file.name
     try:
-        _run_tmux(info["socket_path"], "load-buffer", "-b", "omnigent-paste", paste_path)
+        # ``load-buffer`` is read by tmux itself, so on Windows the path must be
+        # POSIX: msys2 tmux treats ``C:\...`` as relative and resolves it against
+        # the pane's cwd ("No such file or directory: /home/me/repo/C:\Users\...").
+        _run_tmux(
+            info["socket_path"],
+            "load-buffer",
+            "-b",
+            "omnigent-paste",
+            to_posix_path(paste_path) if IS_WINDOWS else paste_path,
+        )
         _run_tmux(
             info["socket_path"],
             "paste-buffer",
@@ -3511,7 +3534,8 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     """
     import subprocess
 
-    cmd = ["tmux", "-S", socket_path, *args]
+    tmux = resolve_cli_binary("tmux", env_var="OMNIGENT_TMUX_PATH") or "tmux"
+    cmd = [tmux, "-S", socket_path, *args]
     try:
         proc = subprocess.run(
             cmd,
@@ -3544,7 +3568,15 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
 
     try:
         proc = subprocess.run(
-            ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"],
+            [
+                resolve_cli_binary("tmux", env_var="OMNIGENT_TMUX_PATH") or "tmux",
+                "-S",
+                socket_path,
+                "capture-pane",
+                "-t",
+                tmux_target,
+                "-p",
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -3667,6 +3699,38 @@ def _blocking_startup_prompt(pane: str) -> str | None:
     return None
 
 
+def _split_at_prompt_caret(line: str) -> str | None:
+    """
+    Return the text after the composer caret in *line*, or ``None``.
+
+    The ``❯`` spelling is matched anywhere on the line and at its FIRST
+    occurrence, so a ``>`` inside the user's own draft (``cat a > b``) cannot
+    shadow the real caret. The ASCII spelling is only honoured at the start of
+    the line, where the composer renders it — anywhere else it is ordinary
+    text.
+
+    :param line: A single captured pane line.
+    :returns: The remainder after the caret, or ``None`` when absent.
+    """
+    idx = line.find(_CLAUDE_PROMPT_GLYPH)
+    if idx != -1:
+        return line[idx + len(_CLAUDE_PROMPT_GLYPH) :]
+    stripped = line.lstrip()
+    if stripped.startswith(_CLAUDE_PROMPT_GLYPH_ASCII):
+        return stripped[len(_CLAUDE_PROMPT_GLYPH_ASCII) :]
+    return None
+
+
+def _has_prompt_caret(line: str) -> bool:
+    """
+    Return whether *line* carries Claude Code's composer caret.
+
+    :param line: A single captured pane line.
+    :returns: ``True`` when either caret spelling appears in caret position.
+    """
+    return _split_at_prompt_caret(line) is not None
+
+
 def _claude_prompt_rendered(pane: str) -> bool:
     """
     Return whether Claude Code's input prompt is rendered in a pane.
@@ -3696,20 +3760,25 @@ def _claude_prompt_rendered(pane: str) -> bool:
     tail_start = max(0, len(non_empty) - _PROMPT_SCAN_TAIL_LINES)
     for idx in range(tail_start, len(non_empty)):
         line = non_empty[idx]
+        # Tail window: the ``❯`` spelling ONLY. The window is a positional
+        # heuristic, not a structural one — it is safe for a glyph this rare,
+        # but admitting ASCII ``>`` here fires on any quoted line, arrow or
+        # shell prompt that happens to land near the bottom.
         if _CLAUDE_PROMPT_GLYPH not in line:
             continue
         if not _is_selected_menu_row(line) or any(
             _is_box_rule(rule) for rule in non_empty[idx + 1 :]
         ):
             return True
-    # Above that window, trust the glyph only when a box rule sits below
-    # it — the live input box's closing frame, absent from scrollback.
-    # The footer height scales with concurrent subagents (a fan-out of
-    # ``○ Explore …`` rows), so no fixed window can bound it; the box rule
-    # is a reliable structural signal at any depth, and `capture-pane -p`
-    # returns only the visible pane, so this stays within one screen.
+    # Anywhere in the pane, trust a caret only when a box rule sits below it —
+    # the live input box's closing frame, absent from scrollback. This is what
+    # admits the ASCII ``>`` spelling safely, and it also reaches a ``❯`` pushed
+    # above the tail window by a tall running-turn footer (the footer scales
+    # with concurrent subagents, so no fixed window can bound it). The box rule
+    # is reliable at any depth, and ``capture-pane -p`` returns only the visible
+    # pane, so this stays within one screen.
     for idx, line in enumerate(non_empty):
-        if _CLAUDE_PROMPT_GLYPH not in line:
+        if not _has_prompt_caret(line) or _is_selected_menu_row(line):
             continue
         if any(_is_box_rule(rule) for rule in non_empty[idx + 1 :]):
             return True
@@ -3798,10 +3867,10 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
         only the paste placeholder is then considered.
     :returns: ``True`` when the draft is still sitting in the input box.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
+    glyph_lines = [line for line in pane.splitlines() if _has_prompt_caret(line)]
     if not glyph_lines:
         return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
+    tail = _split_at_prompt_caret(glyph_lines[-1]) or ""
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
     return bool(needle) and needle in tail

@@ -51,7 +51,7 @@ import contextlib
 import json
 import logging
 import re
-import shutil
+import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
@@ -68,6 +68,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 # backlog forms, and the forwarder collapses thousands of tiny per-line frames
 # into a few large ones. ``_coalesce_limit_after_input`` keeps the frame right
 # after a keystroke small so the echo stays on xterm's synchronous paint path.
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,
@@ -76,6 +77,56 @@ from omnigent.terminals.ws_bridge import (
     _forward_pty_to_ws,
     _monotonic,
 )
+
+
+def _tmux_binary() -> str | None:
+    """Resolve ``tmux`` the way the rest of the terminal stack does.
+
+    ``shutil.which`` alone misses a tmux that only a later-opened shell's PATH
+    sees — the runner daemon snapshots ``PATH`` at spawn — which on Windows
+    (msys2 tmux) meant the web terminal closed with "tmux not found" while the
+    pane itself was running fine.
+
+    :returns: Path to the tmux binary, or ``None`` when it cannot be found.
+    """
+    return resolve_cli_binary("tmux", env_var="OMNIGENT_TMUX_PATH")
+
+
+async def _kill_process_tree(pid: int) -> None:
+    """Terminate *pid* and its descendants (Windows).
+
+    ``Popen.terminate`` reaches only the direct child, which is not enough when
+    that child is a ``script`` pty wrapper whose grandchild holds the tmux
+    attachment. Must be called while the parent is still alive, otherwise the
+    grandchild is already orphaned and no longer enumerable from this pid.
+
+    :param pid: Process id of the direct child.
+    :returns: None. Best-effort; failures are ignored.
+    """
+    with contextlib.suppress(Exception):
+        proc = await asyncio.create_subprocess_exec(
+            "taskkill",
+            "/F",
+            "/T",
+            "/PID",
+            str(pid),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+
+
+def _script_binary() -> str | None:
+    """Resolve msys2's ``script``, used to give the control client a pty.
+
+    Windows only — see the call site for why the control client needs one, and
+    why a screen-scraping bridge (winpty) is not a substitute.
+
+    :returns: Path to the script binary, or ``None`` when it is not installed.
+    """
+    return resolve_cli_binary("script", env_var="OMNIGENT_SCRIPT_PATH")
+
 
 _logger = logging.getLogger(__name__)
 
@@ -195,7 +246,7 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
     :returns: The captured bytes to write into xterm, or ``None`` on failure
         (the caller proceeds without a seed rather than aborting the attach).
     """
-    tmux = shutil.which("tmux")
+    tmux = _tmux_binary()
     if tmux is None:
         return None
     meta = await _capture_pane_metadata(tmux, socket_path, tmux_target)
@@ -430,7 +481,7 @@ async def bridge_tmux_control_to_websocket(
     if on_client_interaction is not None:
         on_client_interaction()
 
-    tmux = shutil.which("tmux")
+    tmux = _tmux_binary()
     if tmux is None:
         _logger.error("tmux not found on PATH; cannot control-attach target=%s", tmux_target)
         with contextlib.suppress(RuntimeError):
@@ -449,6 +500,49 @@ async def bridge_tmux_control_to_websocket(
     if read_only:
         argv.append("-r")
     argv += ["-t", tmux_target]
+
+    if IS_WINDOWS:
+        # tmux is an msys2/Cygwin binary, and its *interactive* control client
+        # cannot use native Windows pipes for stdio: it attaches to the server
+        # fine (it shows up in ``list-clients``) but neither direction carries a
+        # byte, so the browser gets the one-shot seed above and then freezes.
+        # Short-lived tmux commands are unaffected, which is why capture/send
+        # elsewhere work. A pty fixes both directions.
+        #
+        # ``script`` and not ``winpty``: winpty bridges by scraping a Windows
+        # console screen buffer and re-synthesizing output, so it hard-wraps at
+        # the console width — measured, that split long ``%output`` lines at 81
+        # chars and corrupted the protocol. ``script`` allocates a real Cygwin
+        # pty and passes bytes through unwrapped (same payload measured clean at
+        # 332 chars/line). Any screen-scraping shim has this flaw at some width,
+        # so this is a correctness choice, not a preference.
+        script = _script_binary()
+        if script is None:
+            _logger.error(
+                "script not found; the web terminal needs it on Windows to give "
+                "the tmux control client a pty. Install it with `pacman -S util-linux` "
+                "in msys2, or set OMNIGENT_SCRIPT_PATH. target=%s",
+                tmux_target,
+            )
+            with contextlib.suppress(RuntimeError):
+                await websocket.close(
+                    code=WS_CLOSE_INTERNAL_ERROR,
+                    # WebSocket close reasons are capped at 123 bytes.
+                    reason="script not found - install with: pacman -S util-linux",
+                )
+            return
+        # ``-q`` silences the transcript banner, ``-e`` returns the child's exit
+        # status, and ``/dev/null`` discards the typescript we don't want. The
+        # command crosses into an msys2 shell as one string, so quote each arg
+        # POSIX-style; single backslashes in Windows paths survive that intact.
+        #
+        # ``stty -echo`` because a pty echoes everything we write back at us:
+        # measured, a third of the inbound stream was our own ``send-keys``
+        # commands coming back to be parsed and discarded. ``exec`` then replaces
+        # the shell with tmux instead of leaving it in the middle, which keeps
+        # the process chain (and therefore teardown) one level shallower.
+        inner = "stty -echo; exec " + " ".join(shlex.quote(a) for a in argv)
+        argv = [script, "-qec", inner, "/dev/null"]
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -653,10 +747,30 @@ async def bridge_tmux_control_to_websocket(
             on_client_interaction()
         # Detach the control client: an empty command line detaches cleanly.
         await _send_command(b"\n")
-        with contextlib.suppress(ProcessLookupError):
-            proc.terminate()
+        # Then close stdin. A control client also exits on EOF, and on Windows
+        # that is the only teardown that reliably reaches it: the client runs
+        # under a ``script`` pty wrapper, so terminating our direct child kills
+        # ``script`` but NOT the tmux grandchild forked onto the pty. That
+        # grandchild stays attached, and because every re-attach adds another
+        # one, ``window-size latest`` then resizes the window per stale client
+        # and the pane repaints at a different width each time (overlapping
+        # frames in the browser). Closing stdin unwinds the whole chain.
+        with contextlib.suppress(Exception):
+            if not stdin.is_closing():
+                stdin.close()
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(proc.wait(), timeout=2.0)
+        if proc.returncode is None and IS_WINDOWS:
+            # Still up: reap the tree while the parent exists, so the tmux
+            # grandchild is included. Killing the parent first would orphan it.
+            await _kill_process_tree(proc.pid)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.terminate()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()

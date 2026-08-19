@@ -153,8 +153,9 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 <details>
 <summary>Windows (native)</summary>
 
-Omnigent runs natively on Windows in a degraded mode. The `install_oss.sh`
-bootstrap is POSIX-only, so install with `uv` directly:
+Omnigent runs natively on Windows. The `install_oss.sh` bootstrap is
+POSIX-only, so install with `uv` directly (native Windows Python — see the
+note below about msys2's):
 
 ```powershell
 uv tool install --python 3.12 omnigent
@@ -162,18 +163,47 @@ uv tool install --python 3.12 omnigent
 uv tool install --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 ```
 
-What works on Windows: `omnigent server`, the web UI, and the SDK-based
-harnesses (`omnigent run <agent.yaml>` with the claude-sdk / cursor / codex
-harnesses). Agents run under a Windows **Job Object** for process-tree
-containment.
+That is enough for `omnigent server`, the web UI, and the SDK-based harnesses
+(`omnigent run <agent.yaml>` with the claude-sdk / cursor / codex harnesses).
+Agents run under a Windows **Job Object** for process-tree containment.
 
-What is **not** available on Windows (use Linux/macOS, or WSL, for these):
+**For the native `omnigent claude` / `omnigent codex` wrappers** and the web
+terminal view, install [msys2](https://www.msys2.org/) and add its `tmux`:
 
-- the native `omnigent claude` / `omnigent codex` / `omnigent cursor`
-  tmux/PTY terminal wrappers (run an SDK harness or the web UI instead);
-- `bwrap`/`seatbelt` filesystem & network sandboxing and the L7 egress proxy
-  — the Job Object backend contains the process tree and enforces resource
-  limits but does **not** isolate the filesystem or network.
+```bash
+# in an msys2 shell
+pacman -S tmux         # the terminal multiplexer the wrappers drive
+pacman -S util-linux   # provides `script`, needed by the web terminal view
+```
+
+Then make sure `C:\msys64\usr\bin` is on the `PATH` the Omnigent host sees, or
+point at the binaries explicitly:
+
+```
+OMNIGENT_TMUX_PATH=C:\msys64\usr\bin\tmux.exe
+OMNIGENT_SCRIPT_PATH=C:\msys64\usr\bin\script.exe
+```
+
+Run `omnigent` itself on **native Windows Python** (the `uv` install above),
+not msys2's Python: several dependencies (`pydantic-core`, `tiktoken`,
+`watchfiles`) are Rust extensions that do not build under Cygwin in practice —
+`pip` fails with `Unsupported platform: x86_64-cygwin`. Only tmux needs to
+come from msys2.
+
+Why `script` is required for the web terminal: tmux's interactive control
+client cannot use Windows pipes for its stdio, so Omnigent runs it under a
+Cygwin pty. Without `script` the terminal view fails with an explicit
+"install with: pacman -S util-linux" message rather than hanging.
+
+The other native wrappers (`cursor`, `goose`, `hermes`, `kimi`, `kiro`,
+`qwen`, `opencode`, `pi`, `antigravity`) are **not** covered: they still pass
+Windows paths to `tmux load-buffer`, so message injection does not work for
+them there.
+
+What is still **not** available on Windows (use Linux/macOS for these):
+`bwrap`/`seatbelt` filesystem & network sandboxing and the L7 egress proxy —
+the Job Object backend contains the process tree and enforces resource limits
+but does **not** isolate the filesystem or network.
 
 </details>
 
