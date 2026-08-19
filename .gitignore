@@ -30,7 +30,8 @@ omnigent/_build_info.py
 # The .*/ rule above would otherwise exclude everything under .claude/.
 !.claude/
 .claude/*
-!.claude/skills/
+# Upstream tracks .claude/skills/; this fork does not. Local agent tooling
+# lives there and is never committed — see docs/ORVEX_REPO_LAYOUT.md.
 
 # Local helper scripts
 run-ap-chat.sh
@@ -86,3 +87,6 @@ omnigent/server/static/web-ui/
 # DAB local state directory (created by `databricks bundle deploy`).
 deploy/databricks/.databricks/
 web/package-lock.json
+
+# Local agent tooling — see docs/ORVEX_REPO_LAYOUT.md
+_bmad/
