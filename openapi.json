@@ -487,7 +487,7 @@
                 "type": "null"
               }
             ],
-            "description": "Agent type recorded on the latest task, e.g. `\"researcher\"`. Mirrors the `tool` prefix in `title` and is provided alongside it because the title is a denormalized string while `agent_name` is the durable per-task value.",
+            "description": "Backward-compatible alias for the durable `sub_agent_name` binding, e.g. `\"researcher\"`.",
             "title": "Agent Name"
           },
           "busy": {
@@ -623,6 +623,18 @@
             ],
             "description": "Sub-agent instance name, the suffix of `title` after the first `\":\"`, e.g. `\"auth\"`. `None` if `title` is `None` or missing a colon.",
             "title": "Session Name"
+          },
+          "sub_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Durable sub-agent binding persisted on the child conversation, e.g. `\"researcher\"`. Unlike the denormalized `title` prefix, this remains available for native sub-agent titles such as `\"Plan:<internal-id>\"`.",
+            "title": "Sub Agent Name"
           },
           "task_summary": {
             "anyOf": [

@@ -750,11 +750,12 @@ class ChildSessionSummary(BaseModel):
         e.g. ``"ag_abc123"``. ``None`` if the child has no tasks
         yet (rare — ``_spawn_one`` creates a task atomically with
         the conversation).
-    :param agent_name: Agent type recorded on the latest task,
-        e.g. ``"researcher"``. Mirrors the ``tool`` prefix in
-        ``title`` and is provided alongside it because the title
-        is a denormalized string while ``agent_name`` is the
-        durable per-task value.
+    :param agent_name: Backward-compatible alias for the durable
+        ``sub_agent_name`` binding, e.g. ``"researcher"``.
+    :param sub_agent_name: Durable sub-agent binding persisted on
+        the child conversation, e.g. ``"researcher"``. Unlike the
+        denormalized ``title`` prefix, this remains available for
+        native sub-agent titles such as ``"Plan:<internal-id>"``.
     :param current_task_id: Latest task id for the child
         (newest by ``created_at``), e.g. ``"task_abc123"``.
         ``None`` if no tasks exist.
@@ -816,6 +817,7 @@ class ChildSessionSummary(BaseModel):
     updated_at: int
     agent_id: str | None = None
     agent_name: str | None = None
+    sub_agent_name: str | None = None
     current_task_id: str | None = None
     current_task_status: str | None = None
     busy: bool = False
