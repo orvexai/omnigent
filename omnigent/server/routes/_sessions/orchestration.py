@@ -5884,7 +5884,7 @@ async def _relay_runner_stream_once(
                     if evt_type == "session.status":
                         status = event.get("status", "")
                         if status:
-                            if status not in _SESSION_STATUS_VALUES:
+                            if not isinstance(status, str) or status not in _SESSION_STATUS_VALUES:
                                 _logger.warning(
                                     "Ignoring invalid runner session status=%r for %s",
                                     status,
@@ -9133,7 +9133,7 @@ async def _get_session_snapshot(
                 )
                 if resp.status_code == 200:
                     raw = resp.json().get("status", "idle")
-                    if raw in _SESSION_STATUS_VALUES:
+                    if isinstance(raw, str) and raw in _SESSION_STATUS_VALUES:
                         # Intentional: this read emits one status edge, which
                         # narrows the cold-cache false-negative window.
                         _publish_status(session_id, raw, origin="reconciliation")

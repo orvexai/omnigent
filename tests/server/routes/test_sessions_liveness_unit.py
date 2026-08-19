@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -140,12 +141,17 @@ async def test_recovery_clears_failed_status_without_scheduled_completion(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("runner_status", "expected_cache"),
-    [("bogus", None), ("launching", "launching")],
+    [
+        ("bogus", None),
+        (["bogus"], None),
+        ({"a": 1}, None),
+        ("launching", "launching"),
+    ],
 )
 async def test_snapshot_validates_runner_status_at_ingress(
     two_pod_status_cache: Any,
     monkeypatch: pytest.MonkeyPatch,
-    runner_status: str,
+    runner_status: object,
     expected_cache: str | None,
 ) -> None:
     from omnigent.server import session_live_state
@@ -155,7 +161,7 @@ async def test_snapshot_validates_runner_status_at_ingress(
     class FakeResponse:
         status_code = 200
 
-        def json(self) -> dict[str, str]:
+        def json(self) -> dict[str, object]:
             return {"status": runner_status}
 
     class FakeRunnerClient:
@@ -187,8 +193,18 @@ async def test_snapshot_validates_runner_status_at_ingress(
 
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
     monkeypatch.setattr("omnigent.runtime.get_runner_client", FakeRunnerClient)
-    monkeypatch.setattr(session_live_state, "persist_live_status", lambda *args: None)
-    monkeypatch.setattr(sessions, "session_stream", SimpleNamespace(publish=lambda *args: None))
+    persisted: list[tuple[Any, ...]] = []
+    events: list[Any] = []
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_live_status",
+        lambda *args: persisted.append(args),
+    )
+    monkeypatch.setattr(
+        sessions,
+        "session_stream",
+        SimpleNamespace(publish=lambda *args: events.append(args)),
+    )
     monkeypatch.setattr(orchestration, "_fetch_runner_skills", empty_runner_skills)
     monkeypatch.setattr(orchestration, "_fetch_model_options", empty_model_options)
     monkeypatch.setattr(orchestration, "load_session_usage", lambda *args: None)
@@ -210,6 +226,12 @@ async def test_snapshot_validates_runner_status_at_ingress(
         assert two_pod_status_cache.cache.get(session_id) == expected_cache
         if expected_cache is None:
             assert two_pod_status_cache.cache == {}
+    if expected_cache is None:
+        assert persisted == []
+        assert events == []
+    else:
+        assert persisted
+        assert events[0][1]["status"] == expected_cache
 
 
 @pytest.mark.asyncio
@@ -406,13 +428,18 @@ def test_status_publisher_accepts_launching_status(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("runner_status", "expected_cache"),
-    [("bogus", None), ("launching", "launching")],
+    [
+        ("bogus", None),
+        (["bogus"], None),
+        ({"a": 1}, None),
+        ("launching", "launching"),
+    ],
 )
 async def test_relay_validates_runner_status_at_ingress(
     two_pod_status_cache: Any,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    runner_status: str,
+    runner_status: object,
     expected_cache: str | None,
 ) -> None:
     from omnigent.server import session_live_state
@@ -428,7 +455,9 @@ async def test_relay_validates_runner_status_at_ingress(
 
         async def aiter_text(self) -> Any:
             yield 'data: {"type": "session.heartbeat"}\n\n'
-            yield f'data: {{"type": "session.status", "status": "{runner_status}"}}\n\n'
+            yield (
+                f'data: {{"type": "session.status", "status": {json.dumps(runner_status)}}}\n\n'
+            )
             yield "data: [DONE]\n\n"
 
     class FakeRunnerClient:
@@ -468,7 +497,7 @@ async def test_relay_validates_runner_status_at_ingress(
         assert persisted
         assert events[0][1]["status"] == expected_cache
     if expected_cache is None:
-        assert f"Ignoring invalid runner session status='{runner_status}'" in caplog.text
+        assert f"Ignoring invalid runner session status={runner_status!r}" in caplog.text
     else:
         assert f"Ignoring invalid runner session status='{runner_status}'" not in caplog.text
 
