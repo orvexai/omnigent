@@ -62,6 +62,28 @@ from omnigent.inner.datamodel import (
 from omnigent.reasoning_effort import CLAUDE_EFFORTS
 
 
+def _hook_body(command: str) -> str:
+    """
+    Return a hook's effective shell body, following the Windows indirection.
+
+    On Windows the body is written to a script file and the registered command
+    is a bare ``bash <posix path>`` (see ``_shell_hook_command``), because a
+    hook command reaches the shell word-split with its double-quoted spans
+    unprotected. Assertions about what the hook *does* therefore have to read
+    the script. On POSIX the command is the body and this is a no-op.
+
+    :param command: The registered hook command.
+    :returns: The shell body the hook will run.
+    """
+    if not command.startswith("bash /"):
+        return command
+    raw = command.split(" ", 1)[1]
+    path = Path(raw)
+    if not path.exists() and len(raw) > 3 and raw[0] == "/" and raw[2] == "/":
+        path = Path(f"{raw[1]}:/{raw[3:]}")
+    return path.read_text(encoding="utf-8")
+
+
 def _read_tmux_path_arg(arg: str) -> bytes:
     """
     Read a file the way tmux would, given the path the harness passed it.
@@ -2955,7 +2977,7 @@ def test_augment_claude_args_registers_permission_command_hook(
     # statusLine is now intentionally injected (it's the only place
     # Claude Code surfaces ``context_window`` on stdin); ensure it
     # captures to the raw file our forwarder normalizes.
-    assert "context_raw.json" in settings["statusLine"]["command"]
+    assert "context_raw.json" in _hook_body(settings["statusLine"]["command"])
 
 
 def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
@@ -2981,7 +3003,7 @@ def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
     )
     settings = _load_invocation_settings(args)
     entries = settings["hooks"]["UserPromptSubmit"]
-    commands = [h["command"] for entry in entries for h in entry["hooks"]]
+    commands = [_hook_body(h["command"]) for entry in entries for h in entry["hooks"]]
     # The forwarder status hook stays; the policy hook is appended.
     assert any("evaluate-policy" in command for command in commands), (
         f"UserPromptSubmit must carry the evaluate-policy hook; got {commands!r}."
@@ -3009,7 +3031,7 @@ def test_augment_claude_args_omits_user_prompt_submit_policy_hook_without_server
     )
     settings = _load_invocation_settings(args)
     entries = settings["hooks"]["UserPromptSubmit"]
-    commands = [h["command"] for entry in entries for h in entry["hooks"]]
+    commands = [_hook_body(h["command"]) for entry in entries for h in entry["hooks"]]
     assert all("evaluate-policy" not in command for command in commands)
 
 
@@ -3033,7 +3055,7 @@ def test_augment_claude_args_keeps_permission_hook_without_launch_session_id(
     session_start_command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     assert "--conversation-url" not in session_start_command
     assert "companyAnnouncements" not in settings
-    assert "context_raw.json" in settings["statusLine"]["command"]
+    assert "context_raw.json" in _hook_body(settings["statusLine"]["command"])
 
 
 def test_mcp_server_initialize_omits_blocked_channel_capability(
@@ -7770,7 +7792,7 @@ def test_statusline_shell_command_captures_and_chains(
     )
     args = augment_claude_args((), bridge_dir=tmp_path)
     settings = _load_invocation_settings(args)
-    command = settings["statusLine"]["command"]
+    command = _hook_body(settings["statusLine"]["command"])
     assert "python" not in command, f"statusLine path must not spawn python: {command}"
 
     payload = json.dumps(

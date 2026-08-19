@@ -1410,9 +1410,11 @@ def build_hook_settings(
     deltas_quoted = shlex.quote(str(bridge_dir / MESSAGE_DELTAS_FILE))
     message_display_hook = {
         "type": "command",
-        "command": (
+        "command": _shell_hook_command(
+            bridge_dir,
+            "message_display_hook.sh",
             "p=$(cat | tr -d '\\r\\n'); "
-            f'[ -n "$p" ] && printf \'%s\\n\' "$p" >> {deltas_quoted}; :'
+            f'[ -n "$p" ] && printf \'%s\\n\' "$p" >> {deltas_quoted}; :',
         ),
     }
     hooks: dict[str, list[_JsonObject]] = {
@@ -1538,7 +1540,7 @@ def build_hook_settings(
         )
         evaluate_policy_hook: _JsonObject = {
             "type": "command",
-            "command": evaluate_policy_command,
+            "command": _shell_hook_command(bridge_dir, "policy_hook.sh", evaluate_policy_command),
         }
 
         # In bypassPermissions mode PermissionRequest never fires, so
@@ -1638,8 +1640,42 @@ def build_hook_settings(
     chain_command = read_user_status_line_command()
     if chain_command is not None:
         status_command += f"; printf '%s' \"$p\" | ( {chain_command} )"
-    settings["statusLine"] = {"type": "command", "command": status_command}
+    settings["statusLine"] = {
+        "type": "command",
+        "command": _shell_hook_command(bridge_dir, "status_line.sh", status_command),
+    }
     return settings
+
+
+def _shell_hook_command(bridge_dir: Path, name: str, body: str) -> str:
+    """
+    Render a shell hook command, moving the body to a file on Windows.
+
+    Claude Code hook commands are shell snippets. On Windows the snippet
+    reaches the shell word-split with double-quoted spans unprotected, so
+    ``-H "Authorization: Bearer $TOKEN"`` arrives as separate words. That
+    truncates the enclosing ``$( )`` and the hook dies with "unexpected EOF
+    while looking for matching ``)``" — and because the policy hook fails
+    closed, every prompt in the session is blocked.
+
+    Writing the body to a file leaves a bare ``bash <path>`` on the command
+    line: no quotes, no ``$( )``, nothing left to split. Off Windows the body
+    is returned unchanged, so POSIX keeps the single-command form.
+
+    Note the path itself must not contain spaces, for the same reason quoting
+    cannot be relied on here; bridge directories live under the system temp
+    dir, so this holds unless the account name contains one.
+
+    :param bridge_dir: Bridge directory the script is written into.
+    :param name: Script filename, e.g. ``"policy_hook.sh"``.
+    :param body: The shell snippet to run.
+    :returns: The command string to put in the hook settings.
+    """
+    if not IS_WINDOWS:
+        return body
+    script = bridge_dir / name
+    script.write_text(f"{body}\n", encoding="utf-8", newline="\n")
+    return f"bash {to_posix_path(script)}"
 
 
 def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
