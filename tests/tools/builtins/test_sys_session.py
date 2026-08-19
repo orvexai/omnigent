@@ -35,6 +35,7 @@ from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins.spawn import (
     _HISTORY_DEFAULT_TAIL,
     _HISTORY_MAX_TAIL,
+    _SESSION_LIST_ROW_MAX_CHARS,
     SysSessionCloseTool,
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
@@ -287,6 +288,19 @@ def test_send_schema_advertises_plain_string_and_purpose_object_args() -> None:
     assert "harness default" in model_desc
 
 
+def test_session_list_description_names_retired_full_fields() -> None:
+    description = SysSessionListTool.description()
+
+    for field in (
+        "label_source",
+        "task_summary",
+        "last_task_error",
+        "runner_id",
+        "pending_elicitations_count",
+    ):
+        assert field in description
+
+
 def _object_branch_props(tool: SysSessionSendTool) -> set[str]:
     """Return the property names of the object branch of ``args``."""
     params = tool.get_schema()["function"]["parameters"]
@@ -374,20 +388,25 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
 
 def test_peek_schema_required_fields_and_no_extra_props() -> None:
     """
-    The ``sys_session_get_history`` schema requires ``conversation_id``
-    and rejects unknown properties.
+    The ``sys_session_get_history`` schema advertises both identifier
+    aliases and rejects unknown properties. Runtime parsing rejects omission.
 
-    A regression here would either let the LLM omit the required
-    arg (the tool would error at parse time, but schema-wide
-    enforcement catches it earlier) or accept arbitrary extras
-    (which the validator must drop, not pass through to the
-    handler).
+    Omission is enforced at runtime because the schema subset Omnigent
+    enforces (``required`` and ``additionalProperties`` only) cannot
+    express an exactly-one-of-two-aliases constraint. Unknown extras
+    are still rejected by the schema validator.
     """
     schema = SysSessionGetHistoryTool().get_schema()
     params = schema["function"]["parameters"]
-    assert params["required"] == ["conversation_id"]
+    assert params["required"] == []
+    assert "oneOf" not in params
+    assert "session_id" in params["properties"]
     assert params["additionalProperties"] is False
-    assert set(params["properties"].keys()) == {"conversation_id", "tail_items"}
+    assert set(params["properties"].keys()) == {
+        "session_id",
+        "conversation_id",
+        "tail_items",
+    }
 
 
 def test_peek_schema_tail_items_bounds() -> None:
@@ -409,8 +428,8 @@ def test_peek_schema_tail_items_bounds() -> None:
 
 def test_close_schema_required_fields_and_no_extra_props() -> None:
     """
-    The ``sys_session_close`` schema requires ``conversation_id``
-    only — no ``tail_items``, no extras.
+    The ``sys_session_close`` schema advertises both identifier aliases —
+    no ``tail_items``, no extras. Runtime parsing rejects omission.
 
     Close has a smaller surface than peek (no slice argument);
     extending the schema later would be additive, but a regression
@@ -419,9 +438,45 @@ def test_close_schema_required_fields_and_no_extra_props() -> None:
     """
     schema = SysSessionCloseTool().get_schema()
     params = schema["function"]["parameters"]
-    assert params["required"] == ["conversation_id"]
+    assert params["required"] == []
+    assert "oneOf" not in params
+    assert "session_id" in params["properties"]
     assert params["additionalProperties"] is False
-    assert set(params["properties"].keys()) == {"conversation_id"}
+    assert set(params["properties"].keys()) == {"session_id", "conversation_id"}
+
+
+@pytest.mark.parametrize("tool_name", ["sys_session_get_history", "sys_session_close"])
+def test_session_identifier_alias_runtime_contract(tool_name: str) -> None:
+    """Runtime parsing rejects omission and accepts either alias or both."""
+    from omnigent.tools.builtins.spawn import _parse_session_args
+
+    missing = json.loads(_parse_session_args("{}", required=(), tool_name=tool_name))
+    assert "requires" in missing["error"]
+
+    for identifier in ("session_id", "conversation_id"):
+        parsed = _parse_session_args(
+            json.dumps({identifier: "conv_target"}),
+            required=(),
+            tool_name=tool_name,
+        )
+        assert parsed["session_id"] == "conv_target"
+        assert parsed["conversation_id"] == "conv_target"
+
+    both = _parse_session_args(
+        json.dumps({"session_id": "canonical", "conversation_id": "legacy"}),
+        required=(),
+        tool_name=tool_name,
+    )
+    assert both["session_id"] == "canonical"
+    assert both["conversation_id"] == "canonical"
+
+    empty_canonical = _parse_session_args(
+        json.dumps({"session_id": "", "conversation_id": "legacy"}),
+        required=(),
+        tool_name=tool_name,
+    )
+    assert empty_canonical["session_id"] == ""
+    assert empty_canonical["conversation_id"] == ""
 
 
 def test_close_description_names_retirement_guardrails() -> None:
@@ -778,6 +833,7 @@ def test_close_marks_closed_and_tombstones_internal_title(session_fixture: _Fixt
     assert payload == {
         "closed": True,
         "conversation_id": session_fixture.child_conv_id,
+        "session_id": session_fixture.child_conv_id,
         "agent": "researcher",
         "title": "auth",
     }
@@ -821,13 +877,55 @@ def test_session_list_surfaces_free_form_titled_child(session_fixture: _Fixture)
 
     listed = {entry["conversation_id"]: entry for entry in payload["sub_agents"]}
     assert child.id in listed, payload["sub_agents"]
-    assert listed[child.id] == {
-        "agent": None,
-        "title": "my-worker",
-        "conversation_id": child.id,
-    }
+    assert {
+        "agent": listed[child.id]["agent"],
+        "title": listed[child.id]["title"],
+        "conversation_id": listed[child.id]["conversation_id"],
+    } == {"agent": None, "title": "my-worker", "conversation_id": child.id}
+    assert listed[child.id]["session_id"] == child.id
+    assert listed[child.id]["agent_name"] is None
+    assert listed[child.id]["busy"] is None
+    assert listed[child.id]["status"] is None
     # The conventional child is unaffected.
     assert listed[session_fixture.child_conv_id]["agent"] == "researcher"
+
+
+def test_session_list_sessions_view_does_not_report_excluded_child_page(
+    session_fixture: _Fixture,
+) -> None:
+    for index in range(2):
+        session_fixture.conv_store.create_conversation(
+            kind="sub_agent",
+            title=f"worker-{index}",
+            parent_conversation_id=session_fixture.parent_conv_id,
+        )
+
+    payload = json.loads(
+        SysSessionListTool().invoke(
+            json.dumps({"view": "sessions", "sub_agents_limit": 1}),
+            session_fixture.ctx,
+        )
+    )
+
+    assert payload["sub_agents"] == []
+    assert payload["sub_agents_has_more"] is False
+    assert "truncated" not in payload
+
+
+def test_in_process_session_list_uses_the_shared_row_cap(session_fixture: _Fixture) -> None:
+    from omnigent.runner.tool_dispatch import _SESSION_LIST_ROW_MAX_CHARS as runner_row_cap
+
+    session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="worker:" + "x" * 10_000,
+        parent_conversation_id=session_fixture.parent_conv_id,
+    )
+    payload = json.loads(SysSessionListTool().invoke("{}", session_fixture.ctx))
+    assert runner_row_cap is _SESSION_LIST_ROW_MAX_CHARS
+    assert payload["sub_agents"]
+    assert all(
+        len(json.dumps(row)) <= _SESSION_LIST_ROW_MAX_CHARS for row in payload["sub_agents"]
+    )
 
 
 def test_runner_session_list_rows_have_status_and_extend_legacy_shape() -> None:
@@ -898,17 +996,24 @@ def test_session_list_does_not_invent_an_agent_from_a_colon_in_a_free_form_title
     payload = json.loads(SysSessionListTool().invoke("{}", session_fixture.ctx))
 
     listed = {entry["conversation_id"]: entry for entry in payload["sub_agents"]}
-    assert listed[child.id] == {
-        "agent": None,
-        "title": "team:alpha",
-        "conversation_id": child.id,
-    }
+    assert {
+        "agent": listed[child.id]["agent"],
+        "title": listed[child.id]["title"],
+        "conversation_id": listed[child.id]["conversation_id"],
+    } == {"agent": None, "title": "team:alpha", "conversation_id": child.id}
+    assert listed[child.id]["session_id"] == child.id
     # The genuinely named sibling is unaffected — it carries sub_agent_name.
-    assert listed[session_fixture.child_conv_id] == {
+    named = listed[session_fixture.child_conv_id]
+    assert {
+        "agent": named["agent"],
+        "title": named["title"],
+        "conversation_id": named["conversation_id"],
+    } == {
         "agent": "researcher",
         "title": "auth",
         "conversation_id": session_fixture.child_conv_id,
     }
+    assert named["session_id"] == session_fixture.child_conv_id
 
 
 def test_session_list_still_hides_closed_free_form_child(session_fixture: _Fixture) -> None:
@@ -955,6 +1060,7 @@ def test_close_tombstones_child_with_free_form_title(session_fixture: _Fixture) 
     assert payload == {
         "closed": True,
         "conversation_id": child.id,
+        "session_id": child.id,
         "agent": None,
         "title": "my-worker",
     }

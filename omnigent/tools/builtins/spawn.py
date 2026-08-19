@@ -8,6 +8,7 @@ sub-agent. See designs/STEERABLE_SUBAGENTS.md for the full design.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
@@ -51,6 +52,9 @@ _HISTORY_MAX_TAIL = 50
 
 _SESSION_LIST_DEFAULT_LIMIT = 100
 _SESSION_LIST_MAX_LIMIT = 100
+_SESSION_LIST_ALIAS_REMOVAL_VERSION = "orvex-v0.11.0"
+_SESSION_LIST_RESPONSE_BUDGET_CHARS = 16_000
+_SESSION_LIST_ROW_MAX_CHARS = 1_280
 _AGENT_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 
@@ -543,7 +547,7 @@ class SysSessionListTool(Tool):
       a child caller, its parent/siblings) under this conversation. The
       LLM uses these to decide which pairs already exist (so a follow-up
       ``sys_session_send`` continues rather than spawns) and to grab each
-      child's ``conversation_id`` for ``sys_session_get_history`` /
+      child's canonical ``session_id`` for ``sys_session_get_history`` /
       ``sys_session_get_info`` / ``sys_session_close``.
     - ``sessions`` — a **global** view of every session the caller can
       access (bounded by the server's per-user permission model), each
@@ -553,9 +557,13 @@ class SysSessionListTool(Tool):
       (``sys_agent_get`` / ``sys_session_get_info``) or drive
       (``sys_session_send`` by ``session_id``).
 
-    The child view is bounded to 100 rows by default. When
-    ``sub_agents_has_more`` is true, pass its ``sub_agents_next_after`` value
-    back as ``sub_agents_after`` to fetch the next page.
+    The serialized response is bounded to 16,000 characters regardless of
+    row limits or detail mode. When ``*_has_more`` is true, pass the matching
+    ``*_next_after`` value back to fetch the next page.
+
+    Rows use ``session_id``, ``agent_name``, and ``status`` as their
+    canonical fields. The old ``conversation_id``, ``agent``, ``busy``, and
+    ``current_task_status`` aliases remain through ``orvex-v0.11.0``.
 
     The global ``sessions`` view is populated only on the runner
     (REST) path, where the server enforces permissions; the in-process
@@ -583,7 +591,14 @@ class SysSessionListTool(Tool):
             "sys_session_send by session_id, including one on another "
             "host, and its reply comes back to your inbox. Inspect first "
             "via sys_agent_get / sys_session_get_info. Pass agent_name "
-            "to filter the global list to sessions running that agent."
+            "to filter the global list to sessions running that agent. "
+            "Every response is capped at 16,000 serialized characters; "
+            "when rows are cut, follow the matching cursor in 'truncated'. "
+            "Use detail='full' for retired diagnostic fields "
+            "label_source, task_summary, last_task_error, runner_id, and "
+            "pending_elicitations_count through "
+            f"{_SESSION_LIST_ALIAS_REMOVAL_VERSION}. "
+            f"Legacy aliases remain until {_SESSION_LIST_ALIAS_REMOVAL_VERSION}."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -625,6 +640,35 @@ class SysSessionListTool(Tool):
                                 "Cursor from sub_agents_next_after to fetch the next child page."
                             ),
                         },
+                        "sessions_limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": _SESSION_LIST_MAX_LIMIT,
+                            "description": (
+                                "Maximum number of global session rows to return; "
+                                f"defaults to {_SESSION_LIST_DEFAULT_LIMIT}."
+                            ),
+                        },
+                        "sessions_after": {
+                            "type": "string",
+                            "description": (
+                                "Cursor from sessions_next_after to fetch the next "
+                                "global session page."
+                            ),
+                        },
+                        "view": {
+                            "type": "string",
+                            "enum": ["both", "sub_agents", "sessions"],
+                            "description": "View to return; defaults to both.",
+                        },
+                        "detail": {
+                            "type": "string",
+                            "enum": ["summary", "full"],
+                            "description": (
+                                "Summary omits diagnostic fields; full restores them "
+                                "without changing the 16,000-character ceiling."
+                            ),
+                        },
                     },
                     "required": [],
                     "additionalProperties": False,
@@ -663,6 +707,11 @@ class SysSessionListTool(Tool):
         after = args.get("sub_agents_after")
         if not isinstance(after, str) or not after:
             after = None
+        from omnigent.runner.tool_dispatch import (
+            _child_rows_to_entries,
+            _render_session_list,
+            _session_list_budget_failure,
+        )
         from omnigent.runtime import get_conversation_store
 
         parent_conversation_id = _resolve_parent_conversation_id(ctx)
@@ -673,39 +722,56 @@ class SysSessionListTool(Tool):
             limit=limit,
             after=after,
         )
-        # ``agent`` is None for a free-form-titled child, which has no
-        # "<agent>:" prefix to recover a name from.
-        result: list[dict[str, str | None]] = []
+        raw_children = []
         for child in children.data:
-            # Named children store "<agent>:<title>"; a
-            # sys_session_create child stores a free-form title
-            # with no prefix. Both are real children the caller
-            # may drive, so both are listed — dropping the
-            # colon-less form hid every MCP-created session from
-            # its own parent. Closed rows stay hidden so they
-            # never re-surface to the LLM.
-            if child.title is None:
-                continue
-            if is_session_closed(child.labels, child.title):
-                continue
-            labelled = _agent_title_from_conversation(child)
-            result.append(
+            agent_title = _agent_title_from_conversation(child)
+            raw_children.append(
                 {
-                    "agent": labelled.agent,
-                    "title": labelled.title,
-                    "conversation_id": child.id,
+                    "id": child.id,
+                    "title": child.title,
+                    "tool": agent_title.agent,
+                    "session_name": agent_title.title,
+                    "sub_agent_name": agent_title.agent,
+                    "labels": child.labels,
+                    "busy": None,
+                    "current_task_status": None,
+                    "updated_at": child.updated_at,
+                    "task_summary": getattr(child, "task_summary", None),
+                    "last_task_error": getattr(child, "last_task_error", None),
+                    "pending_elicitations_count": getattr(child, "pending_elicitations_count", 0),
                 }
             )
-        # ``sessions`` (the global, permission-bounded view) is empty on
-        # the in-process path — it has no caller identity to scope by.
-        # The runner (REST) path populates it via GET /v1/sessions.
-        return json.dumps(
-            {
-                "sub_agents": result,
-                "sub_agents_has_more": children.has_more,
-                "sub_agents_next_after": children.last_id if children.has_more else None,
-                "sessions": [],
-            }
+        try:
+            result = _child_rows_to_entries(
+                raw_children,
+                detail=args.get("detail")
+                if args.get("detail") in {"summary", "full"}
+                else "summary",
+            )
+        except RecursionError:
+            return _session_list_budget_failure()
+        selected_view = (
+            args.get("view") if args.get("view") in {"both", "sub_agents", "sessions"} else "both"
+        )
+        page = {
+            "has_more": children.has_more,
+            "next_after": children.last_id if children.has_more else None,
+            "_prefix_cursors": [entry.get("session_id") for entry in result],
+            "server_count": len(children.data),
+        }
+        if selected_view == "sessions":
+            page = {"has_more": False, "next_after": None, "server_count": 0}
+        # The in-process path has no permission-scoped global view. It still
+        # uses the same measured renderer and therefore the same ceiling.
+        return asyncio.run(
+            _render_session_list(
+                result,
+                page,
+                [],
+                {"has_more": False, "next_after": None, "server_count": 0},
+                view=selected_view,
+                server_client=None,
+            )
         )
 
 
@@ -1375,14 +1441,21 @@ def _resolve_session_call(
 
     args = _parse_session_args(
         arguments,
-        required=("conversation_id",),
+        required=(),
         tool_name=tool_name,
     )
     if isinstance(args, str):
         return args
-    target_id = args["conversation_id"]
+    target_id = args.get("session_id")
     if not isinstance(target_id, str) or not target_id:
-        return json.dumps({"error": f"{tool_name} requires a non-empty 'conversation_id' string"})
+        return json.dumps(
+            {
+                "error": (
+                    f"{tool_name} requires a non-empty 'session_id' string "
+                    "(or legacy 'conversation_id')"
+                )
+            }
+        )
 
     caller = _resolve_caller_tree(ctx)
     conv_store = get_conversation_store()
@@ -1544,15 +1617,20 @@ class SysSessionGetHistoryTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "conversation_id": {
+                        "session_id": {
                             "type": "string",
                             "description": (
-                                "The target session's "
-                                "conversation_id. Get this from "
+                                "The target session's canonical session_id. Get this from "
                                 "sys_session_list, sys_agent_list, "
                                 "or a prior sys_session_send handle. "
                                 "Any session you can access — need "
                                 "not be in your spawn tree."
+                            ),
+                        },
+                        "conversation_id": {
+                            "type": "string",
+                            "description": (
+                                "Deprecated alias for session_id; retained through orvex-v0.11.0."
                             ),
                         },
                         "tail_items": {
@@ -1567,7 +1645,7 @@ class SysSessionGetHistoryTool(Tool):
                             ),
                         },
                     },
-                    "required": ["conversation_id"],
+                    "required": [],
                     "additionalProperties": False,
                 },
             },
@@ -1620,6 +1698,7 @@ class SysSessionGetHistoryTool(Tool):
         return json.dumps(
             {
                 "conversation_id": resolution.child.id,
+                "session_id": resolution.child.id,
                 "agent": labelled.agent,
                 "title": labelled.title,
                 "items": items,
@@ -1697,11 +1776,10 @@ class SysSessionCloseTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "conversation_id": {
+                        "session_id": {
                             "type": "string",
                             "description": (
-                                "The target session's "
-                                "conversation_id. Get this from "
+                                "The target sub-agent's canonical session_id. Get this from "
                                 "sys_session_list or from a "
                                 "prior sys_session_send handle. "
                                 "Sub-agents must be in the caller's spawn tree. "
@@ -1711,8 +1789,14 @@ class SysSessionCloseTool(Tool):
                                 "Retirement is not agent-reversible."
                             ),
                         },
+                        "conversation_id": {
+                            "type": "string",
+                            "description": (
+                                "Deprecated alias for session_id; retained through orvex-v0.11.0."
+                            ),
+                        },
                     },
-                    "required": ["conversation_id"],
+                    "required": [],
                     "additionalProperties": False,
                 },
             },
@@ -1752,6 +1836,7 @@ class SysSessionCloseTool(Tool):
             {
                 "closed": True,
                 "conversation_id": resolution.child.id,
+                "session_id": resolution.child.id,
                 "agent": labelled.agent,
                 "title": labelled.title,
             }
@@ -1797,4 +1882,15 @@ def _parse_session_args(
             return json.dumps(
                 {"error": f"{tool_name} missing required field: {field_name}"},
             )
+    if tool_name in {"sys_session_get_history", "sys_session_close"}:
+        canonical_id = args.get("session_id")
+        legacy_id = args.get("conversation_id")
+        if canonical_id is None and legacy_id is None:
+            return json.dumps(
+                {"error": f"{tool_name} requires 'session_id' (or legacy 'conversation_id')"}
+            )
+        # Canonical input wins when both are present; callers can migrate
+        # without a period where the two identifiers disagree.
+        args["session_id"] = canonical_id if canonical_id is not None else legacy_id
+        args["conversation_id"] = args["session_id"]
     return args

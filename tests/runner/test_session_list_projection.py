@@ -49,6 +49,7 @@ def _entries(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         # Deliberately do not declare the synthetic named child. The durable
         # server field, rather than the parent's AgentSpec, must bind it.
         SimpleNamespace(sub_agents=[]),
+        detail="full",
     )
 
 
@@ -76,6 +77,9 @@ def test_projection_preserves_legacy_fields_and_projects_child_state() -> None:
     assert entry["last_task_error"] is None
     assert entry["pending_elicitations_count"] == 2
     assert entry["task_summary"] is None
+    assert entry["session_id"] == "conv_research"
+    assert entry["agent_name"] == "researcher"
+    assert entry["status"] == "running"
 
 
 def test_claude_native_description_is_the_human_label_without_hex_suffix() -> None:
@@ -152,10 +156,74 @@ def test_child_projection_is_compact_and_drops_raw_labels() -> None:
     ]
 
     entries = _entries(rows)
-    rendered = json.dumps({"sub_agents": entries}, separators=(",", ":"))
+    rendered = json.dumps({"sub_agents": entries})
 
     assert len(rendered) < 40_000
     assert all("labels" not in entry for entry in entries)
+
+
+def test_default_projection_caps_every_string_and_retire_fields() -> None:
+    row = _row(
+        "conv_" + "x" * 28,
+        "t" * 10_000,
+        tool="a" * 10_000,
+        session_name="s" * 10_000,
+        sub_agent_name="a" * 10_000,
+        task_summary="q" * 10_000,
+    )
+    row["pending_elicitations_count"] = 0
+    row["last_task_error"] = {"code": "e" * 10_000, "message": "m" * 10_000}
+
+    [entry] = _child_rows_to_entries([row])
+    public_entry = {key: value for key, value in entry.items() if not key.startswith("_")}
+    assert len(json.dumps(public_entry)) <= 1_280
+    assert entry["session_id"] == entry["conversation_id"] == row["id"]
+    assert entry["agent"] == entry["agent_name"]
+    assert "label_source" not in entry
+    assert "task_summary" not in entry
+    assert "last_task_error" not in entry
+    assert "pending_elicitations_count" not in entry
+    if "error_code" in entry:
+        assert isinstance(entry["error_code"], str)
+
+    shape_row = _row(
+        "conv_shape",
+        "worker:shape",
+        tool="worker",
+        session_name="shape",
+        sub_agent_name="worker",
+        task_summary="Task summary",
+    )
+    shape_row["pending_elicitations_count"] = 0
+    [summary] = _child_rows_to_entries([shape_row])
+    [full] = _child_rows_to_entries([shape_row], detail="full")
+    assert set(summary) == {
+        "agent",
+        "agent_name",
+        "title",
+        "conversation_id",
+        "session_id",
+        "label",
+        "busy",
+        "current_task_status",
+        "status",
+        "updated_at",
+    }
+    assert set(full) == {
+        "agent",
+        "agent_name",
+        "title",
+        "conversation_id",
+        "session_id",
+        "label",
+        "busy",
+        "current_task_status",
+        "status",
+        "updated_at",
+        "label_source",
+        "task_summary",
+        "last_task_error",
+    }
 
 
 def test_ui_title_keeps_explicit_agent_and_label() -> None:

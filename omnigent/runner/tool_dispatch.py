@@ -105,6 +105,8 @@ from omnigent.tools.builtins.spawn import (
     # bounds the LLM-facing tool schema advertises.
     _ACTIVITY_MAX_CHARS,
     _HISTORY_DEFAULT_TAIL,
+    _SESSION_LIST_RESPONSE_BUDGET_CHARS,
+    _SESSION_LIST_ROW_MAX_CHARS,
     _clamp_tail_items,
 )
 from omnigent.tools.builtins.sys_terminal import (
@@ -695,6 +697,18 @@ _AGENT_LIST_PAGE_LIMIT = 1000
 # page of compact rows stays inline while cursor fields support larger trees.
 _SUBAGENT_LIST_DEFAULT_LIMIT = 100
 _SUBAGENT_LIST_MAX_LIMIT = 100
+
+# ``sys_session_list`` is an agent-facing surface, so keep its normal result
+# bounded even when a user has accumulated a large session population.  The
+# cursor fields let an orchestrator walk the complete global view explicitly.
+_SESSION_LIST_GLOBAL_DEFAULT_LIMIT = 100
+_SESSION_LIST_GLOBAL_MAX_LIMIT = 100
+_SESSION_ROW_PROSE_FLOOR_CHARS = 24
+_SESSION_ROW_PATH_FLOOR_CHARS = 32
+_SESSION_ROW_TOKEN_FLOOR_CHARS = 8
+_SESSION_ROW_ELISION = "..."
+_SUBAGENT_CURSOR_PREFIX = "v2:"
+_SESSION_LIST_CURSOR_MAX_CHARS = 2048
 
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
@@ -6289,6 +6303,10 @@ async def _execute_session_query_tool(
             args.get("agent_name"),
             sub_agents_limit=args.get("sub_agents_limit"),
             sub_agents_after=args.get("sub_agents_after"),
+            sessions_limit=args.get("sessions_limit"),
+            sessions_after=args.get("sessions_after"),
+            view=args.get("view"),
+            detail=args.get("detail"),
             agent_spec=agent_spec,
         )
     if tool_name == "sys_session_get_history":
@@ -7235,6 +7253,606 @@ def _project_agent_list(
     }
 
 
+_SESSION_ROW_DROP_ORDER: dict[tuple[str, str], tuple[str, ...]] = {
+    ("sub_agents", "summary"): ("pending_elicitations_count", "error_code"),
+    ("sub_agents", "full"): (
+        "label_source",
+        "task_summary",
+        "last_task_error",
+        "pending_elicitations_count",
+        "error_code",
+    ),
+    ("sessions", "summary"): ("parent_session_id",),
+    ("sessions", "full"): ("parent_session_id",),
+}
+
+
+def _session_row_size(row: _JsonObject) -> int:
+    """Measure only public row content; private bookkeeping is never emitted."""
+    return len(json.dumps({key: value for key, value in row.items() if not key.startswith("_")}))
+
+
+def _normalise_session_row(row: _JsonObject, *, view: str, detail: str) -> _JsonObject:
+    """Keep only the declared shapes of structured diagnostic values."""
+    allowed = {
+        "session_id",
+        "conversation_id",
+        "agent",
+        "agent_name",
+        "title",
+        "busy",
+        "current_task_status",
+        "status",
+        "updated_at",
+    }
+    if view == "sub_agents":
+        allowed.update({"label", "pending_elicitations_count", "error_code"})
+        if detail == "full":
+            allowed.update({"label_source", "task_summary", "last_task_error"})
+    else:
+        allowed.update(
+            {"runner_online", "host_id", "workspace", "git_branch", "parent_session_id"}
+        )
+        if detail == "full":
+            allowed.add("runner_id")
+    normalized: _JsonObject = {}
+    for key, value in row.items():
+        if not key.startswith("_") and key not in allowed:
+            continue
+        if key == "last_task_error":
+            if value is None:
+                normalized[key] = None
+            elif isinstance(value, str):
+                normalized[key] = {"code": value}
+            elif isinstance(value, dict):
+                error: _JsonObject = {}
+                code = value.get("code")
+                if code is None or isinstance(code, (bool, float, int, str)):
+                    if "code" in value:
+                        error["code"] = code
+                message = value.get("message")
+                if message is None or isinstance(message, str):
+                    if "message" in value:
+                        error["message"] = message
+                if error:
+                    normalized[key] = error
+            continue
+        if key == "task_summary" and value is not None and not isinstance(value, str):
+            continue
+        normalized[key] = value
+    return normalized
+
+
+def _session_row_alteration(row: _JsonObject) -> dict[str, list[str]]:
+    """Copy existing private alteration bookkeeping for an idempotent refit."""
+    existing = row.get("_altered")
+    if not isinstance(existing, dict):
+        return {"shortened": [], "dropped": []}
+    return {
+        kind: [item for item in existing.get(kind, []) if isinstance(item, str)]
+        if isinstance(existing.get(kind), list)
+        else []
+        for kind in ("shortened", "dropped")
+    }
+
+
+def _record_session_alteration(altered: dict[str, list[str]], kind: str, key: str) -> None:
+    if key not in altered[kind]:
+        altered[kind].append(key)
+
+
+def _session_row_path_value(row: _JsonObject, path: tuple[str, ...]) -> Any:
+    value: Any = row
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _set_session_row_path(row: _JsonObject, path: tuple[str, ...], value: Any) -> None:
+    target: Any = row
+    for key in path[:-1]:
+        if not isinstance(target, dict):
+            return
+        target = target.get(key)
+    if isinstance(target, dict):
+        target[path[-1]] = value
+
+
+def _shorten_session_text(
+    value: str,
+    *,
+    floor: int,
+    deficit: int,
+    left_elide: bool = False,
+) -> str:
+    """Remove exactly the needed source characters while retaining a marker."""
+    marker = _SESSION_ROW_ELISION
+    marked = value.startswith(marker) if left_elide else value.endswith(marker)
+    if left_elide and marked:
+        body = value[len(marker) :]
+    elif marked:
+        body = value[: -len(marker)]
+    else:
+        body = value
+    removable = max(0, len(body) - floor)
+    take = min(removable, deficit if marked else deficit + len(marker))
+    if take <= 0:
+        return value
+    if left_elide:
+        return marker + body[take:]
+    return body[: len(body) - take] + marker
+
+
+def _fit_session_row(row: _JsonObject, *, view: str, detail: str) -> _JsonObject:
+    """Fit a projected row using declared key classes and report alterations."""
+    normalized = _normalise_session_row(row, view=view, detail=detail)
+    if normalized == row:
+        result = row
+    else:
+        result = normalized
+    altered = _session_row_alteration(result)
+    if _session_row_size(result) <= _SESSION_LIST_ROW_MAX_CHARS:
+        return result
+    result = dict(result)
+
+    prose_paths: tuple[tuple[tuple[str, ...], str], ...] = (
+        (("title",), "title"),
+        *(((("label",), "label"),) if view == "sub_agents" else ()),
+        (("last_task_error", "message"), "last_task_error.message"),
+    )
+    path_paths: tuple[tuple[tuple[str, ...], str], ...] = (
+        (
+            (("workspace",), "workspace"),
+            (("git_branch",), "git_branch"),
+        )
+        if view == "sessions"
+        else ()
+    )
+    drop_order = _SESSION_ROW_DROP_ORDER[(view, detail)]
+
+    # Performance-only clamp. It runs only after the no-pressure measurement,
+    # and never touches IDs or atomic values.
+    for path, _ in (*prose_paths, *path_paths):
+        value = _session_row_path_value(result, path)
+        if isinstance(value, str) and len(value) > _SESSION_LIST_ROW_MAX_CHARS:
+            if path in {item[0] for item in path_paths}:
+                clamped = _SESSION_ROW_ELISION + value[-_SESSION_LIST_ROW_MAX_CHARS:]
+            else:
+                clamped = value[:_SESSION_LIST_ROW_MAX_CHARS] + _SESSION_ROW_ELISION
+            _set_session_row_path(result, path, clamped)
+    for token in ("agent", "agent_name"):
+        value = result.get(token)
+        if isinstance(value, str) and len(value) > _SESSION_LIST_ROW_MAX_CHARS:
+            result[token] = value[:_SESSION_LIST_ROW_MAX_CHARS] + _SESSION_ROW_ELISION
+
+    for key in drop_order:
+        if key in result:
+            del result[key]
+            _record_session_alteration(altered, "dropped", key)
+        if _session_row_size(result) <= _SESSION_LIST_ROW_MAX_CHARS:
+            break
+    if _session_row_size(result) <= _SESSION_LIST_ROW_MAX_CHARS:
+        if altered["shortened"] or altered["dropped"]:
+            result["_altered"] = altered
+        return result
+
+    def shorten_prose_and_paths(prose_floor: int, path_floor: int) -> None:
+        for path, label in (*prose_paths, *path_paths):
+            while _session_row_size(result) > _SESSION_LIST_ROW_MAX_CHARS:
+                value = _session_row_path_value(result, path)
+                if not isinstance(value, str):
+                    break
+                deficit = _session_row_size(result) - _SESSION_LIST_ROW_MAX_CHARS
+                shortened = _shorten_session_text(
+                    value,
+                    floor=(
+                        path_floor if path in {item[0] for item in path_paths} else prose_floor
+                    ),
+                    deficit=deficit,
+                    left_elide=path in {item[0] for item in path_paths},
+                )
+                if shortened == value:
+                    break
+                _set_session_row_path(result, path, shortened)
+                _record_session_alteration(altered, "shortened", label)
+
+    def shorten_tokens(floor: int) -> None:
+        agent = result.get("agent")
+        agent_name = result.get("agent_name")
+        if not isinstance(agent, str) or not isinstance(agent_name, str):
+            return
+        while _session_row_size(result) > _SESSION_LIST_ROW_MAX_CHARS:
+            deficit = _session_row_size(result) - _SESSION_LIST_ROW_MAX_CHARS
+            marked = agent.endswith(_SESSION_ROW_ELISION)
+            body = agent[: -len(_SESSION_ROW_ELISION)] if marked else agent
+            if not marked and len(body) <= len(_SESSION_ROW_ELISION):
+                break
+            removable = max(0, len(body) - floor)
+            marker_cost = 0 if marked else 2 * len(_SESSION_ROW_ELISION)
+            take = min(removable, (deficit + marker_cost + 1) // 2)
+            if take <= 0:
+                break
+            shortened = body[: len(body) - take] + _SESSION_ROW_ELISION
+            result["agent"] = shortened
+            result["agent_name"] = shortened
+            agent = shortened
+            agent_name = shortened
+            _record_session_alteration(altered, "shortened", "agent")
+            _record_session_alteration(altered, "shortened", "agent_name")
+
+    for prose_floor, path_floor, token_floor in (
+        (
+            _SESSION_ROW_PROSE_FLOOR_CHARS,
+            _SESSION_ROW_PATH_FLOOR_CHARS,
+            _SESSION_ROW_TOKEN_FLOOR_CHARS,
+        ),
+        (0, 0, 0),
+    ):
+        shorten_prose_and_paths(prose_floor, path_floor)
+        shorten_tokens(token_floor)
+        if _session_row_size(result) <= _SESSION_LIST_ROW_MAX_CHARS:
+            break
+
+    if altered["shortened"] or altered["dropped"]:
+        result["_altered"] = altered
+    return result
+
+
+def _session_list_budget_failure() -> str:
+    """Return the fixed envelope used when fitting or serialization fails."""
+    return json.dumps(
+        {
+            "error": "session_list_response_budget_exceeded",
+            "budget_chars": _SESSION_LIST_RESPONSE_BUDGET_CHARS,
+        }
+    )
+
+
+def _session_page_cursor(
+    page: dict[str, Any],
+    entries: list[_JsonObject],
+    count: int,
+) -> str | None:
+    """Return the cursor after an emitted prefix, without skipping a row."""
+    if count <= 0:
+        return None
+    prefixes = page.get("_prefix_cursors")
+    if isinstance(prefixes, list) and len(prefixes) >= count:
+        cursor = prefixes[count - 1]
+        if isinstance(cursor, str) and cursor:
+            return cursor
+    entry = entries[count - 1]
+    value = entry.get("session_id") or entry.get("conversation_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _session_list_payload(
+    sub_agents: list[_JsonObject],
+    sub_page: dict[str, Any],
+    sessions: list[_JsonObject],
+    sessions_page: dict[str, Any],
+    *,
+    sub_count: int,
+    sessions_count: int,
+    sub_cut: bool,
+    sessions_cut: bool,
+    rows_altered: dict[str, list[dict[str, list[str]]]] | None = None,
+) -> _JsonObject:
+    """Build the public response envelope for a selected row prefix."""
+    sub_has_more = sub_cut or sub_page.get("has_more") is True
+    sessions_has_more = sessions_cut or sessions_page.get("has_more") is True
+    sub_after = (
+        _session_page_cursor(sub_page, sub_agents, sub_count)
+        if sub_count < len(sub_agents)
+        else sub_page.get("next_after")
+    )
+    sessions_after = (
+        _session_page_cursor(sessions_page, sessions, sessions_count)
+        if sessions_count < len(sessions)
+        else sessions_page.get("next_after")
+    )
+    payload: _JsonObject = {
+        "sub_agents": sub_agents[:sub_count],
+        "sub_agents_has_more": sub_has_more,
+        "sub_agents_next_after": sub_after if sub_has_more else None,
+        "sessions": sessions[:sessions_count],
+        "sessions_has_more": sessions_has_more,
+        "sessions_next_after": sessions_after if sessions_has_more else None,
+    }
+    cut_views: dict[str, dict[str, int]] = {}
+    if sub_cut:
+        cut_views["sub_agents"] = {
+            "emitted": sub_count,
+            "server_page": int(sub_page.get("server_count", len(sub_agents))),
+        }
+    if sessions_cut:
+        cut_views["sessions"] = {
+            "emitted": sessions_count,
+            "server_page": int(sessions_page.get("server_count", len(sessions))),
+        }
+    if cut_views:
+        budget_cut = sub_count < len(sub_agents) or sessions_count < len(sessions)
+        row_limit_cut = (sub_page.get("has_more") is True and sub_count == len(sub_agents)) or (
+            sessions_page.get("has_more") is True and sessions_count == len(sessions)
+        )
+        reason = (
+            "both"
+            if budget_cut and row_limit_cut
+            else "response_budget"
+            if budget_cut
+            else "row_limit"
+        )
+        payload["truncated"] = {
+            "reason": reason,
+            "budget_chars": _SESSION_LIST_RESPONSE_BUDGET_CHARS,
+            "row_max_chars": _SESSION_LIST_ROW_MAX_CHARS,
+            **cut_views,
+            "next_step": (
+                "Call sys_session_list again with "
+                "sub_agents_after=<sub_agents_next_after> or "
+                "sessions_after=<sessions_next_after> for the next page, "
+                "or sys_session_get_info(session_id=...) for one session's full detail."
+            ),
+        }
+    altered_views: dict[str, dict[str, object]] = {}
+    for name in ("sub_agents", "sessions"):
+        records = (rows_altered or {}).get(name, [])
+        if not records:
+            continue
+        altered_views[name] = {
+            "count": len(records),
+            "shortened": sorted({key for record in records for key in record["shortened"]}),
+            "dropped": sorted({key for record in records for key in record["dropped"]}),
+        }
+    if altered_views:
+        if "truncated" not in payload:
+            payload["truncated"] = {
+                "reason": "row_cap",
+                "budget_chars": _SESSION_LIST_RESPONSE_BUDGET_CHARS,
+                "row_max_chars": _SESSION_LIST_ROW_MAX_CHARS,
+                "next_step": (
+                    "Call sys_session_get_info(session_id=...) for one session's full detail."
+                ),
+            }
+        truncated = payload.get("truncated")
+        if isinstance(truncated, dict):
+            truncated["rows_altered"] = altered_views
+    for view_name, page in (("sub_agents", sub_page), ("sessions", sessions_page)):
+        error = page.get("error")
+        if isinstance(error, str) and error:
+            payload[f"{view_name}_error"] = error
+    return payload
+
+
+async def _render_session_list_impl(
+    sub_agents: list[_JsonObject],
+    sub_page: dict[str, Any],
+    sessions: list[_JsonObject],
+    sessions_page: dict[str, Any],
+    *,
+    view: str,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Allocate, enrich, serialize, and enforce the listing response bound."""
+    runner_keys: dict[str, list[str | None]] = {
+        "sub_agents": [],
+        "sessions": [],
+    }
+    available: dict[str, list[_JsonObject]] = {}
+    altered_rows: dict[str, list[dict[str, list[str]]]] = {
+        "sub_agents": [],
+        "sessions": [],
+    }
+    for name, source in (("sub_agents", sub_agents), ("sessions", sessions)):
+        fitted: list[_JsonObject] = []
+        for row in source:
+            runner_id = row.get("_runner_id")
+            runner_keys[name].append(runner_id if isinstance(runner_id, str) else None)
+            public_row = {key: value for key, value in row.items() if key != "_runner_id"}
+            fitted_row = _fit_session_row(public_row, view=name, detail="full")
+            alteration = fitted_row.pop("_altered", None)
+            altered_rows[name].append(
+                _session_row_alteration({"_altered": alteration})
+                if isinstance(alteration, dict)
+                else {"shortened": [], "dropped": []}
+            )
+            fitted.append(fitted_row)
+        available[name] = fitted
+    pages = {"sub_agents": sub_page, "sessions": sessions_page}
+    if view == "sub_agents":
+        available["sessions"] = []
+    elif view == "sessions":
+        available["sub_agents"] = []
+
+    if any(
+        len(json.dumps(row)) > _SESSION_LIST_ROW_MAX_CHARS
+        for rows in available.values()
+        for row in rows
+    ):
+        return _session_list_budget_failure()
+
+    # The budget decision is made before runner connectivity is resolved.
+    # Only rows that can survive the cut fan out to runner status endpoints.
+    selected: dict[str, int] = {"sub_agents": 0, "sessions": 0}
+
+    async def enrich() -> None:
+        chosen = available["sessions"][: selected["sessions"]]
+        if not chosen or server_client is None:
+            return
+        runner_rows: list[dict[str, object]] = [
+            {"_runner_id": runner_id}
+            for runner_id in runner_keys["sessions"][: selected["sessions"]]
+            if runner_id
+        ]
+        online = await _resolve_runner_online_map(runner_rows, server_client)
+        for index, row in enumerate(chosen):
+            runner_id = runner_keys["sessions"][index]
+            if isinstance(runner_id, str) and runner_id:
+                row["runner_online"] = online.get(runner_id)
+            else:
+                row["runner_online"] = None
+
+    def altered_for(counts: dict[str, int]) -> dict[str, list[dict[str, list[str]]]]:
+        return {
+            name: [
+                record
+                for record in altered_rows[name][: counts[name]]
+                if record["shortened"] or record["dropped"]
+            ]
+            for name in available
+            if any(
+                record["shortened"] or record["dropped"]
+                for record in altered_rows[name][: counts[name]]
+            )
+        }
+
+    def estimate(counts: dict[str, int]) -> int:
+        cut = {
+            name: counts[name] < len(available[name]) or pages[name].get("has_more") is True
+            for name in available
+        }
+        envelope = _session_list_payload(
+            [],
+            pages["sub_agents"],
+            [],
+            pages["sessions"],
+            sub_count=counts["sub_agents"],
+            sessions_count=counts["sessions"],
+            sub_cut=cut["sub_agents"],
+            sessions_cut=cut["sessions"],
+            rows_altered=altered_for(counts),
+        )
+        total = len(json.dumps(envelope))
+        for name in available:
+            count = counts[name]
+            if count:
+                total += sum(len(json.dumps(row)) + 2 for row in available[name][:count]) - 2
+        return total
+
+    order = ("sub_agents", "sessions")
+    blocked: set[str] = set()
+    turn = 0
+    while len(blocked) < len(order):
+        name = order[turn % len(order)]
+        turn += 1
+        if selected[name] >= len(available[name]):
+            blocked.add(name)
+            continue
+        proposed = dict(selected)
+        proposed[name] += 1
+        if estimate(proposed) <= _SESSION_LIST_RESPONSE_BUDGET_CHARS:
+            selected = proposed
+            blocked.discard(name)
+        else:
+            blocked.add(name)
+
+    # Every non-empty selected view gets one row when the bound permits it.
+    # The row cap and compact envelope make this invariant satisfiable.
+    for name in order:
+        if available[name] and selected[name] == 0:
+            selected[name] = 1
+
+    await enrich()
+    for name in order:
+        refitted: list[_JsonObject] = []
+        for index, row in enumerate(available[name]):
+            fitted_row = _fit_session_row(row, view=name, detail="full")
+            alteration = fitted_row.pop("_altered", None)
+            if isinstance(alteration, dict):
+                current = altered_rows[name][index]
+                current["shortened"] = sorted(
+                    set(current["shortened"]) | set(alteration.get("shortened", []))
+                )
+                current["dropped"] = sorted(
+                    set(current["dropped"]) | set(alteration.get("dropped", []))
+                )
+            refitted.append(fitted_row)
+        available[name] = refitted
+
+    while estimate(selected) > _SESSION_LIST_RESPONSE_BUDGET_CHARS:
+        removable = [name for name in order if selected[name] > (1 if available[name] else 0)]
+        if not removable:
+            break
+        name = max(removable, key=lambda item: selected[item])
+        selected[name] -= 1
+
+    payload = _session_list_payload(
+        available["sub_agents"],
+        pages["sub_agents"],
+        available["sessions"],
+        pages["sessions"],
+        sub_count=selected["sub_agents"],
+        sessions_count=selected["sessions"],
+        sub_cut=(
+            selected["sub_agents"] < len(available["sub_agents"])
+            or pages["sub_agents"].get("has_more") is True
+        ),
+        sessions_cut=(
+            selected["sessions"] < len(available["sessions"])
+            or pages["sessions"].get("has_more") is True
+        ),
+        rows_altered=altered_for(selected),
+    )
+    rendered = json.dumps(payload)
+    # Keep the structural estimate fast, but verify the actual post-enrichment
+    # envelope and trim a tail if a future field changes its accounting.
+    while len(rendered) > _SESSION_LIST_RESPONSE_BUDGET_CHARS:
+        removable = [name for name in order if selected[name] > (1 if available[name] else 0)]
+        if not removable:
+            break
+        name = max(removable, key=lambda item: selected[item])
+        selected[name] -= 1
+        payload = _session_list_payload(
+            available["sub_agents"],
+            pages["sub_agents"],
+            available["sessions"],
+            pages["sessions"],
+            sub_count=selected["sub_agents"],
+            sessions_count=selected["sessions"],
+            sub_cut=(
+                selected["sub_agents"] < len(available["sub_agents"])
+                or pages["sub_agents"].get("has_more") is True
+            ),
+            sessions_cut=(
+                selected["sessions"] < len(available["sessions"])
+                or pages["sessions"].get("has_more") is True
+            ),
+            rows_altered=altered_for(selected),
+        )
+        rendered = json.dumps(payload)
+    if len(rendered) > _SESSION_LIST_RESPONSE_BUDGET_CHARS:
+        # Identifiers are deliberately not capped in the public schema. If a
+        # single pathological value defeats the row fitter, return a fixed
+        # envelope rather than letting an assertion escape the tool boundary.
+        rendered = _session_list_budget_failure()
+    return rendered
+
+
+async def _render_session_list(
+    sub_agents: list[_JsonObject],
+    sub_page: dict[str, Any],
+    sessions: list[_JsonObject],
+    sessions_page: dict[str, Any],
+    *,
+    view: str,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Contain fitting/serialization failures behind the listing boundary."""
+    try:
+        return await _render_session_list_impl(
+            sub_agents,
+            sub_page,
+            sessions,
+            sessions_page,
+            view=view,
+            server_client=server_client,
+        )
+    except (RecursionError, TypeError, ValueError, OverflowError):
+        return _session_list_budget_failure()
+
+
 async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
@@ -7242,26 +7860,20 @@ async def _session_list_via_rest(
     *,
     sub_agents_limit: object = None,
     sub_agents_after: object = None,
+    sessions_limit: object = None,
+    sessions_after: object = None,
+    view: object = None,
+    detail: object = None,
     agent_spec: AgentSpec | None = None,
 ) -> str:
-    """
-    Return the two-view session list: ``sub_agents`` + global ``sessions``.
+    """Return a bounded, cursorable session listing."""
+    selected_view = (
+        view if isinstance(view, str) and view in {"both", "sub_agents", "sessions"} else "both"
+    )
+    selected_detail = (
+        detail if isinstance(detail, str) and detail in {"summary", "full"} else "summary"
+    )
 
-    ``sub_agents`` is the caller's named-sub-agent view (children, plus
-    parent/siblings when the caller is itself a child) — see
-    :func:`_collect_sub_agents`. ``sessions`` is the **global**,
-    permission-bounded list of every session the caller can access, each
-    annotated with status + runner connectivity, optionally filtered by
-    ``agent_name`` — see :func:`_collect_global_sessions`. Both are
-    best-effort: a failure in either view yields an empty list for it
-    rather than failing the whole call.
-
-    :param conversation_id: The caller session id, e.g. ``"conv_root1"``.
-    :param server_client: HTTP client pointed at the Omnigent server.
-    :param agent_name: Optional agent-name filter for the global
-        ``sessions`` view; ignored for ``sub_agents``.
-    :returns: JSON ``{"sub_agents": [...], "sessions": [...]}``.
-    """
     limit = (
         sub_agents_limit
         if isinstance(sub_agents_limit, int) and not isinstance(sub_agents_limit, bool)
@@ -7269,21 +7881,42 @@ async def _session_list_via_rest(
     )
     limit = max(1, min(limit, _SUBAGENT_LIST_MAX_LIMIT))
     after = sub_agents_after if isinstance(sub_agents_after, str) and sub_agents_after else None
-    sub_agents, page = await _collect_sub_agents(
-        conversation_id,
-        server_client,
-        limit=limit,
-        after=after,
-        agent_spec=agent_spec,
+    if selected_view == "sessions":
+        sub_agents, page = [], {"has_more": False, "next_after": None, "server_count": 0}
+    else:
+        sub_agents, page = await _collect_sub_agents(
+            conversation_id,
+            server_client,
+            limit=limit,
+            after=after,
+            detail=selected_detail,
+            agent_spec=agent_spec,
+        )
+
+    global_limit = (
+        sessions_limit
+        if isinstance(sessions_limit, int) and not isinstance(sessions_limit, bool)
+        else _SESSION_LIST_GLOBAL_DEFAULT_LIMIT
     )
-    sessions = await _collect_global_sessions(server_client, agent_name)
-    return json.dumps(
-        {
-            "sub_agents": sub_agents,
-            "sub_agents_has_more": page["has_more"],
-            "sub_agents_next_after": page["next_after"],
-            "sessions": sessions,
-        }
+    global_limit = max(1, min(global_limit, _SESSION_LIST_GLOBAL_MAX_LIMIT))
+    global_after = sessions_after if isinstance(sessions_after, str) and sessions_after else None
+    if selected_view == "sub_agents":
+        sessions, sessions_page = [], {"has_more": False, "next_after": None, "server_count": 0}
+    else:
+        sessions, sessions_page = await _collect_global_sessions(
+            server_client,
+            agent_name,
+            limit=global_limit,
+            after=global_after,
+            detail=selected_detail,
+        )
+    return await _render_session_list(
+        sub_agents,
+        page,
+        sessions,
+        sessions_page,
+        view=selected_view,
+        server_client=server_client,
     )
 
 
@@ -7336,64 +7969,187 @@ async def _collect_sub_agents(
     *,
     limit: int = _SUBAGENT_LIST_DEFAULT_LIMIT,
     after: str | None = None,
+    detail: str = "summary",
     agent_spec: AgentSpec | None = None,
-) -> tuple[list[_JsonObject], dict[str, bool | str | None]]:
-    """
-    Collect the caller's named-sub-agent view via ``GET .../child_sessions``.
+) -> tuple[list[_JsonObject], dict[str, Any]]:
+    """Collect a bounded, exhaustive child/parent/sibling page."""
+    limit = max(1, min(limit, _SUBAGENT_LIST_MAX_LIMIT))
+    state: dict[str, Any] = {
+        "v": 2,
+        "phase": "own",
+        "own_after": None,
+        "sibling_after": None,
+        "main_pending": True,
+    }
+    if isinstance(after, str) and after:
+        if len(after) <= _SESSION_LIST_CURSOR_MAX_CHARS and after.startswith(
+            _SUBAGENT_CURSOR_PREFIX
+        ):
+            try:
+                encoded = after[len(_SUBAGENT_CURSOR_PREFIX) :]
+                decoded = base64.urlsafe_b64decode(encoded + "===")
+                if len(decoded) <= 4096:
+                    candidate = json.loads(decoded)
+                    cursor_keys = {"v", "phase", "own_after", "sibling_after", "main_pending"}
+                    if (
+                        isinstance(candidate, dict)
+                        and set(candidate) == cursor_keys
+                        and candidate.get("v") == 2
+                        and candidate.get("phase") in {"own", "siblings"}
+                        and isinstance(candidate.get("main_pending"), bool)
+                        and all(
+                            value is None or isinstance(value, str)
+                            for value in (
+                                candidate.get("own_after"),
+                                candidate.get("sibling_after"),
+                            )
+                        )
+                    ):
+                        state.update(candidate)
+            except (ValueError, TypeError, binascii.Error, json.JSONDecodeError):
+                pass
 
-    Returns legacy fields plus projected child state for each entry, skipping
-    closed and titleless/colonless rows so they never re-surface to the
-    LLM. Includes the caller's own children and, when the caller is
-    itself a child (e.g. a user-added agent), its parent (surfaced as
-    ``agent="main"``) and its siblings — so an added agent can still
-    discover ``main`` and its session-mates. Best-effort: a failed
-    lookup yields ``[]`` (or own-children-only) rather than raising.
+    def encode(next_state: dict[str, Any]) -> str:
+        payload = {
+            "v": 2,
+            "phase": next_state.get("phase", "own"),
+            "own_after": next_state.get("own_after"),
+            "sibling_after": next_state.get("sibling_after"),
+            "main_pending": next_state.get("main_pending") is True,
+        }
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        return _SUBAGENT_CURSOR_PREFIX + base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
-    :param conversation_id: The caller session id.
-    :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: ``(entries, page)`` where ``page`` carries ``has_more`` and the
-        ``last_id`` cursor as ``next_after``.
-    """
-    try:
-        resp = await server_client.get(
-            f"/v1/sessions/{conversation_id}/child_sessions",
-            params={"limit": limit, **({"after": after} if after else {})},
-            timeout=30.0,
-        )
-    except Exception:  # noqa: BLE001
-        return [], {"has_more": False, "next_after": None}
-    if resp.status_code != 200:
-        return [], {"has_more": False, "next_after": None}
-    body = _string_object_dict(resp.json()) or {}
-    result = _child_rows_to_entries(_json_object_list(body.get("data")), agent_spec)
-    has_more = body.get("has_more") is True
-    last_id = _optional_string(body.get("last_id")) if has_more else None
+    parent_id = await _session_parent_id(conversation_id, server_client)
+    if parent_id is None:
+        state["main_pending"] = False
 
-    # If the caller is itself a child, surface main + siblings too.
-    parent_id = await _session_parent_id(conversation_id, server_client) if after is None else None
-    if parent_id is not None:
-        result.append({"agent": "main", "title": None, "conversation_id": parent_id})
+    entries: list[_JsonObject] = []
+    prefix_cursors: list[str] = []
+    fetched_count = 0
+    last_page_error: str | None = None
+
+    while len(entries) < limit:
+        if parent_id is not None and state.get("main_pending") is True:
+            state["main_pending"] = False
+            entries.append(
+                _fit_session_row(
+                    {
+                        "agent": "main",
+                        "agent_name": "main",
+                        "title": None,
+                        "conversation_id": parent_id,
+                        "session_id": parent_id,
+                        "busy": False,
+                        "current_task_status": None,
+                        "status": None,
+                    },
+                    view="sub_agents",
+                    detail=detail,
+                )
+            )
+            prefix_cursors.append(encode(state))
+            continue
+
+        phase = state.get("phase")
+        if phase == "siblings" and parent_id is not None:
+            source_path = f"/v1/sessions/{parent_id}/child_sessions"
+            source_after_key = "sibling_after"
+        elif phase == "own":
+            source_path = f"/v1/sessions/{conversation_id}/child_sessions"
+            source_after_key = "own_after"
+        else:
+            break
+
+        params: dict[str, str | int] = {"limit": max(1, limit - len(entries))}
+        source_after = state.get(source_after_key)
+        if isinstance(source_after, str) and source_after:
+            params["after"] = source_after
         try:
-            sib_resp = await server_client.get(
-                f"/v1/sessions/{parent_id}/child_sessions",
-                params={"limit": limit},
-                timeout=30.0,
+            response = await server_client.get(source_path, params=params, timeout=30.0)
+        except Exception as exc:  # noqa: BLE001
+            last_page_error = f"session list view unavailable: {exc}"
+            break
+        if response.status_code != 200:
+            last_page_error = f"session list view returned {response.status_code}"
+            break
+        try:
+            body = _string_object_dict(response.json()) or {}
+        except (ValueError, RecursionError):
+            last_page_error = "session list view returned invalid JSON"
+            break
+
+        raw_rows = _json_object_list(body.get("data"))
+        fetched_count = max(fetched_count, len(raw_rows))
+        has_more = body.get("has_more") is True
+        last_id = _optional_string(body.get("last_id"))
+        if not raw_rows and not has_more:
+            if phase == "own" and parent_id is not None:
+                state["phase"] = "siblings"
+                continue
+            break
+        if not raw_rows and has_more and last_id:
+            state[source_after_key] = last_id
+            continue
+        if not raw_rows:
+            break
+
+        for raw in raw_rows:
+            raw_id = _optional_string(
+                raw.get("id") or raw.get("conversation_id") or raw.get("session_id")
             )
-            if sib_resp.status_code == 200:
-                sib_body = _string_object_dict(sib_resp.json()) or {}
-                for entry in _child_rows_to_entries(
-                    _json_object_list(sib_body.get("data")), agent_spec
-                ):
-                    # Exclude the caller itself from its own sibling list.
-                    if entry["conversation_id"] != conversation_id:
-                        result.append(entry)
-        except Exception:  # noqa: BLE001 — optional sibling enrichment; the primary listing must still return
-            _logger.debug(
-                "sys_session_list sibling enrichment failed for parent %s",
-                parent_id,
-                exc_info=True,
-            )
-    return result, {"has_more": has_more, "next_after": last_id}
+            if raw_id:
+                state[source_after_key] = raw_id
+            try:
+                projected = _child_rows_to_entries(
+                    [raw],
+                    agent_spec,
+                    detail=detail,
+                )
+            except RecursionError:
+                last_page_error = "session list view returned excessively nested data"
+                break
+            if not projected:
+                # The row was consumed by the server-page predicate. Keep
+                # the last visible prefix cursor at this consumed boundary;
+                # a budget cut must not replay it on the next page.
+                if prefix_cursors:
+                    prefix_cursors[-1] = encode(state)
+                continue
+            entry = projected[0]
+            if phase == "siblings" and entry.get("session_id") == conversation_id:
+                if prefix_cursors:
+                    prefix_cursors[-1] = encode(state)
+                continue
+            entries.append(_fit_session_row(entry, view="sub_agents", detail=detail))
+            prefix_cursors.append(encode(state))
+            if len(entries) >= limit:
+                source_still_has_rows = has_more or raw is not raw_rows[-1]
+                future_source = phase == "own" and parent_id is not None
+                more = source_still_has_rows or future_source
+                return entries, {
+                    "has_more": more,
+                    "next_after": prefix_cursors[-1] if more else None,
+                    "_prefix_cursors": prefix_cursors,
+                    "server_count": fetched_count,
+                    **({"error": last_page_error} if last_page_error else {}),
+                }
+
+        if has_more and last_id:
+            state[source_after_key] = last_id
+            continue
+        if phase == "own" and parent_id is not None:
+            state["phase"] = "siblings"
+            continue
+        break
+
+    return entries, {
+        "has_more": False,
+        "next_after": None,
+        "_prefix_cursors": prefix_cursors,
+        "server_count": fetched_count or len(entries),
+        **({"error": last_page_error} if last_page_error else {}),
+    }
 
 
 async def _resolve_runner_online_map(
@@ -7416,7 +8172,7 @@ async def _resolve_runner_online_map(
     unique_ids: list[str] = []
     seen: set[str] = set()
     for r in rows:
-        rid = r.get("runner_id")
+        rid = r.get("_runner_id") or r.get("runner_id")
         if isinstance(rid, str) and rid and rid not in seen:
             seen.add(rid)
             unique_ids.append(rid)
@@ -7431,92 +8187,114 @@ async def _resolve_runner_online_map(
 async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
     agent_name: object,
-) -> list[_JsonObject]:
-    """
-    Fetch the global session list via ``GET /v1/sessions``, with connectivity.
-
-    Projects each accessible session to ``{session_id, agent_name, title,
-    status, runner_id, runner_online, parent_session_id}``.
-    ``runner_online`` is resolved once per unique bound runner (see
-    :func:`_resolve_runner_online_map`). An optional ``agent_name``
-    filters the list server-side. Permission-bounded by the server (the
-    runner's request carries the owning user's identity). Best-effort:
-    returns ``[]`` on a fetch failure.
-
-    :param server_client: HTTP client pointed at the Omnigent server.
-    :param agent_name: Optional agent-name filter; applied only when a
-        non-empty string.
-    :returns: The projected global session entries.
-    """
-    params: dict[str, str | int] = {"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"}
+    *,
+    limit: int = _SESSION_LIST_GLOBAL_DEFAULT_LIMIT,
+    after: str | None = None,
+    detail: str = "summary",
+) -> tuple[list[_JsonObject], dict[str, Any]]:
+    """Fetch and project one server page of globally visible sessions."""
+    params: dict[str, str | int] = {
+        "limit": limit,
+        "order": "desc",
+        "include_closed": "false",
+    }
+    if after:
+        params["after"] = after
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     try:
-        resp = await server_client.get("/v1/sessions", params=params, timeout=30.0)
-    except Exception:  # noqa: BLE001
-        return []
-    if resp.status_code != 200:
-        return []
-    body = _string_object_dict(resp.json())
-    if body is None:
-        return []
-    rows = _json_object_list(body.get("data"))
-    online = await _resolve_runner_online_map(rows, server_client)
-    return [
-        {
-            "session_id": r.get("id"),
-            # Hide the internal ``-native-ui`` wrapper name (e.g.
-            # ``pi-native-ui`` -> ``Pi``) in the global listing too, matching
-            # ``sys_session_get_info``. The server-side ``agent_name`` filter
-            # above still receives the caller's raw argument unchanged.
-            "agent_name": public_agent_name(_optional_string(r.get("agent_name"))),
-            "title": r.get("title"),
-            "status": r.get("status"),
-            "runner_id": r.get("runner_id"),
-            "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
-            "parent_session_id": r.get("parent_session_id"),
-            # Placement, so an orchestrator can tell WHICH MACHINE and which
-            # project a session runs in before messaging it. Without these the
-            # global list is a flat set of ids and cross-host coordination is
-            # blind — the caller cannot tell a local peer from a remote one.
-            "host_id": r.get("host_id"),
-            "workspace": r.get("workspace"),
-            "git_branch": r.get("git_branch"),
+        response = await server_client.get("/v1/sessions", params=params, timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        return [], {
+            "has_more": False,
+            "next_after": None,
+            "server_count": 0,
+            "error": f"session list view unavailable: {exc}",
         }
-        for r in rows
-    ]
+    if response.status_code != 200:
+        return [], {
+            "has_more": False,
+            "next_after": None,
+            "server_count": 0,
+            "error": f"session list view returned {response.status_code}",
+        }
+    try:
+        body = _string_object_dict(response.json())
+    except (ValueError, RecursionError):
+        body = None
+    if body is None:
+        return [], {
+            "has_more": False,
+            "next_after": None,
+            "server_count": 0,
+            "error": "session list view returned invalid JSON",
+        }
+
+    raw_rows = _json_object_list(body.get("data"))
+    entries: list[_JsonObject] = []
+    prefix_cursors: list[str] = []
+    for raw in raw_rows:
+        raw_id = _optional_string(raw.get("id") or raw.get("session_id"))
+        if is_session_closed(
+            _string_mapping(raw.get("labels")) or {},
+            _optional_string(raw.get("title")),
+        ):
+            if raw_id and prefix_cursors:
+                prefix_cursors[-1] = raw_id
+            continue
+        raw_status = _optional_string(raw.get("status"))
+        busy = raw_status in {"queued", "in_progress", "running"}
+        row: _JsonObject = {
+            # Deprecated aliases remain until orvex-v0.11.0.
+            "session_id": raw.get("id") or raw.get("session_id"),
+            "conversation_id": raw.get("id") or raw.get("session_id"),
+            "agent": public_agent_name(
+                _optional_string(raw.get("agent_name") or raw.get("agent"))
+            ),
+            "agent_name": public_agent_name(
+                _optional_string(raw.get("agent_name") or raw.get("agent"))
+            ),
+            "title": raw.get("title"),
+            "busy": busy,
+            "current_task_status": raw.get("current_task_status", raw_status),
+            "status": raw_status,
+            "updated_at": raw.get("updated_at"),
+            "runner_online": None,
+            "parent_session_id": raw.get("parent_session_id"),
+            "host_id": raw.get("host_id"),
+            "workspace": raw.get("workspace"),
+            "git_branch": raw.get("git_branch"),
+            "_runner_id": raw.get("runner_id"),
+        }
+        if detail == "full":
+            row.update(
+                {
+                    "runner_id": raw.get("runner_id"),
+                }
+            )
+        entries.append(row)
+        if raw_id:
+            prefix_cursors.append(raw_id)
+
+    has_more = body.get("has_more") is True
+    last_id = _optional_string(body.get("last_id")) if has_more else None
+    return entries, {
+        "has_more": has_more,
+        "next_after": last_id,
+        "_prefix_cursors": prefix_cursors,
+        "server_count": len(raw_rows),
+    }
 
 
 def _child_rows_to_entries(
     rows: list[_JsonObject],
     agent_spec: AgentSpec | None = None,
+    *,
+    detail: str = "summary",
 ) -> list[_JsonObject]:
-    """
-    Map ``child_sessions`` rows to ``sys_session_list`` entries.
-
-    Skips closed and titleless rows. The server already parses
-    ``tool``/``session_name`` from the title (including the
-    ``"ui:<agent>:<label>"`` form), so those are reused.
-
-    ``sys_session_create`` children are included rather than skipped: they
-    take a free-form title, so dropping them hid every MCP-created child from
-    the caller's own sub-agent view.
-
-    ``agent`` is reported from the durable ``sub_agent_name`` binding, or
-    from the Web UI's explicit ``"ui:"`` prefix.
-    A bare ``":"`` is NOT sufficient: a free-form title like
-    ``"bug: login 500"`` would otherwise be reported as a child bound to an
-    agent named ``"bug"``, and an orchestrator feeding that back into
-    named-mode ``sys_session_send`` would spawn an unrelated child rather
-    than reach this one. Unrecognized rows report ``agent: null`` with the
-    whole title as the label, which still identifies the child.
-
-    :param rows: ``data`` rows from ``GET .../child_sessions``.
-    :param agent_spec: Retained for call-site compatibility; durable child
-        bindings no longer depend on the calling agent's spec.
-    :returns: Legacy fields plus projected child state and a human label.
-    """
+    """Project child rows into the lean, universally capped listing shape."""
     del agent_spec
+    full = detail == "full"
     entries: list[_JsonObject] = []
     for row in rows:
         title = _optional_string(row.get("title"))
@@ -7536,9 +8314,6 @@ def _child_rows_to_entries(
             agent = parsed_agent
             legacy_title = (_optional_string(row.get("session_name")) or "").strip()
         elif durable_agent is not None:
-            # The durable binding is authoritative. A prose title may still
-            # contain a colon, so only expose its suffix when the parsed
-            # prefix agrees with a plausible binding token.
             agent = durable_agent
             legacy_title = (
                 (_optional_string(row.get("session_name")) or "").strip()
@@ -7548,6 +8323,7 @@ def _child_rows_to_entries(
         else:
             agent = None
             legacy_title = display
+
         session_label = (_optional_string(row.get("session_name")) or "").strip()
         if not (is_ui_title or has_canonical_prefix):
             session_label = None
@@ -7565,21 +8341,54 @@ def _child_rows_to_entries(
             ((source, value) for source, value in label_candidates if value),
             ("title", display),
         )
-        entries.append(
-            {
-                "agent": agent,
-                "title": legacy_title,
-                "conversation_id": _optional_string(row.get("id")),
-                "label": label,
-                "label_source": label_source,
-                "busy": row.get("busy", False),
-                "current_task_status": row.get("current_task_status"),
-                "updated_at": row.get("updated_at"),
-                "last_task_error": row.get("last_task_error"),
-                "pending_elicitations_count": row.get("pending_elicitations_count", 0),
-                "task_summary": row.get("task_summary"),
-            }
-        )
+        raw_error = row.get("last_task_error")
+        error_code: str | None = None
+        if isinstance(raw_error, dict):
+            code = raw_error.get("code")
+            if isinstance(code, str) and code:
+                error_code = code
+        elif isinstance(raw_error, str) and raw_error:
+            error_code = raw_error
+        raw_status = row.get("current_task_status")
+        if raw_error is not None or raw_status == "failed":
+            status = "failed"
+        elif row.get("busy") is True or raw_status in {"queued", "in_progress", "running"}:
+            status = "running"
+        elif raw_status in {"completed", "cancelled", "canceled", "idle"}:
+            status = "idle"
+        else:
+            status = None
+        entry: _JsonObject = {
+            # Settled identifiers and status aliases are unconditional.
+            "agent": agent,
+            "agent_name": agent,
+            "title": legacy_title,
+            "conversation_id": _optional_string(
+                row.get("id") or row.get("conversation_id") or row.get("session_id")
+            ),
+            "session_id": _optional_string(
+                row.get("id") or row.get("conversation_id") or row.get("session_id")
+            ),
+            "label": label,
+            "busy": row.get("busy", False),
+            "current_task_status": row.get("current_task_status"),
+            "status": status,
+            "updated_at": row.get("updated_at"),
+        }
+        pending = row.get("pending_elicitations_count", 0)
+        if pending not in (0, None):
+            entry["pending_elicitations_count"] = pending
+        if error_code is not None:
+            entry["error_code"] = error_code
+        if full:
+            entry.update(
+                {
+                    "label_source": label_source,
+                    "task_summary": row.get("task_summary"),
+                    "last_task_error": raw_error,
+                }
+            )
+        entries.append(_fit_session_row(entry, view="sub_agents", detail=detail))
     return entries
 
 
@@ -7629,10 +8438,12 @@ async def _session_get_history_via_rest(
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON peek result, or a JSON error object.
     """
-    target_id = args.get("conversation_id")
+    canonical_id = args.get("session_id")
+    legacy_id = args.get("conversation_id")
+    target_id = canonical_id if canonical_id is not None else legacy_id
     if not isinstance(target_id, str) or not target_id:
         return json.dumps(
-            {"error": "sys_session_get_history requires a non-empty 'conversation_id' string"}
+            {"error": "sys_session_get_history requires a non-empty 'session_id' string"}
         )
     tail_items = _clamp_tail_items(args.get("tail_items", _HISTORY_DEFAULT_TAIL))
     if isinstance(tail_items, str):
@@ -7666,6 +8477,7 @@ async def _session_get_history_via_rest(
     return json.dumps(
         {
             "conversation_id": target_id,
+            "session_id": target_id,
             "agent": meta.agent,
             "title": meta.title,
             "items": items,
@@ -7853,11 +8665,16 @@ async def _session_close_via_rest(
     """
     from omnigent.runner import app as _runner_app
 
-    target_id = args.get("conversation_id")
+    canonical_id = args.get("session_id")
+    legacy_id = args.get("conversation_id")
+    target_id = canonical_id if canonical_id is not None else legacy_id
     if not isinstance(target_id, str) or not target_id:
         return json.dumps(
             {
-                "error": "sys_session_close requires a non-empty conversation_id string",
+                "error": (
+                    "sys_session_close requires a non-empty 'session_id' string "
+                    "(or legacy 'conversation_id')"
+                )
             }
         )
     target_snap = await _fetch_close_target(target_id, server_client)
@@ -7923,6 +8740,7 @@ async def _session_close_via_rest(
         {
             "closed": True,
             "conversation_id": target_id,
+            "session_id": target_id,
             "agent": parsed.agent,
             "title": (
                 parsed.title

@@ -5381,6 +5381,29 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
         # so there is no main/sibling enrichment — only its own children.
         if request.url.path == "/v1/sessions/conv_parent":
             return httpx.Response(200, json={"id": "conv_parent", "parent_session_id": None})
+        if request.url.path == "/v1/sessions":
+            assert request.url.params["limit"] == "100"
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "global-1",
+                            "agent_name": "researcher",
+                            "title": "global",
+                            "status": "idle",
+                            "runner_id": None,
+                            "parent_session_id": None,
+                            "host_id": "host-a",
+                            "workspace": "/work/project",
+                            "git_branch": "main",
+                        }
+                    ],
+                    "has_more": True,
+                    "last_id": "global-1",
+                },
+            )
         assert request.url.path == "/v1/sessions/conv_parent/child_sessions"
         return httpx.Response(
             200,
@@ -5455,6 +5478,11 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
         for entry in out["sub_agents"]
     ] == legacy
     assert all("current_task_status" in entry for entry in out["sub_agents"])
+    assert out["sessions"][0]["session_id"] == "global-1"
+    assert out["sessions"][0]["conversation_id"] == "global-1"
+    assert out["sessions"][0]["status"] == "idle"
+    assert out["sessions_has_more"] is True
+    assert out["sessions_next_after"] == "global-1"
 
 
 @pytest.mark.asyncio
@@ -5562,12 +5590,13 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
         out = json.loads(
             await _execute_session_query_tool(
                 "sys_session_get_history",
-                json.dumps({"conversation_id": "conv_target", "tail_items": 5}),
+                json.dumps({"session_id": "conv_target", "tail_items": 5}),
                 conversation_id="conv_caller",
                 server_client=client,
             )
         )
     assert out["conversation_id"] == "conv_target"
+    assert out["session_id"] == "conv_target"
     assert out["agent"] == "researcher"
     assert out["title"] == "auth"
     # Reversed to chronological (user ask first), and message text is
@@ -5745,6 +5774,7 @@ async def test_session_close_patches_tombstoned_title() -> None:
     assert out == {
         "closed": True,
         "conversation_id": "conv_target",
+        "session_id": "conv_target",
         "agent": "researcher",
         "title": "auth",
         "archived": False,
@@ -5814,6 +5844,7 @@ async def test_session_close_tombstones_child_without_agent_prefix(
     assert out == {
         "closed": True,
         "conversation_id": "conv_target",
+        "session_id": "conv_target",
         "agent": None,
         "title": expected_title,
         "archived": False,
@@ -6245,6 +6276,27 @@ async def test_session_close_retires_already_archived_target() -> None:
     assert patched[0]["archived"] is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["sys_session_get_history", "sys_session_close"])
+async def test_runner_session_alias_precedence_matches_in_process(tool_name: str) -> None:
+    """An empty canonical id must not fall through to the deprecated alias."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"empty canonical id reached REST: {request.url}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                tool_name,
+                json.dumps({"session_id": "", "conversation_id": "conv_legacy"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out["error"].startswith(f"{tool_name} requires a non-empty")
+
+
 def test_agent_tools_are_runner_local() -> None:
     """
     ``sys_agent_get`` / ``sys_agent_download`` dispatch locally in the
@@ -6554,36 +6606,63 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
     assert sessions_params.get("agent_name") == "researcher"
     # Both sessions projected with status + connectivity from the single
     # shared-runner status lookup.
-    assert out["sessions"] == [
-        {
-            "session_id": "s1",
-            "agent_name": "researcher",
-            "title": "auth",
-            "status": "running",
-            "runner_id": "r1",
-            "runner_online": True,
-            "parent_session_id": None,
-            "host_id": "host_b",
-            "workspace": "/srv/work/repo",
-            "git_branch": "main",
-        },
-        {
-            "session_id": "s2",
-            "agent_name": "researcher",
-            "title": "payments",
-            "status": "idle",
-            "runner_id": "r1",
-            "runner_online": True,
-            "parent_session_id": None,
-            "host_id": None,
-            "workspace": None,
-            "git_branch": None,
-        },
-    ]
-    # Connectivity resolved once per UNIQUE runner — two sessions share
-    # r1, so exactly one status call (not one per session). A count of 2
-    # would mean the dedup regressed into a per-session fan-out.
-    assert runner_status_calls == ["r1"]
+    assert [row["session_id"] for row in out["sessions"]] == ["s1", "s2"]
+    assert out["sessions"][0]["agent"] == out["sessions"][0]["agent_name"] == "researcher"
+    assert out["sessions"][0]["busy"] is True
+    assert out["sessions"][0]["current_task_status"] == "running"
+    assert out["sessions"][0]["status"] == "running"
+    assert out["sessions"][0]["runner_online"] is True
+    assert "runner_id" not in out["sessions"][0]
+    assert set(out["sessions"][0]) == {
+        "session_id",
+        "conversation_id",
+        "agent",
+        "agent_name",
+        "title",
+        "busy",
+        "current_task_status",
+        "status",
+        "updated_at",
+        "runner_online",
+        "parent_session_id",
+        "host_id",
+        "workspace",
+        "git_branch",
+    }
+    assert out["sessions"][0]["host_id"] == "host_b"
+    assert out["sessions"][0]["workspace"] == "/srv/work/repo"
+    assert out["sessions"][0]["git_branch"] == "main"
+
+    async with _session_query_client(handler) as client:
+        full = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_list",
+                json.dumps({"agent_name": "researcher", "view": "sessions", "detail": "full"}),
+                conversation_id="conv_x",
+                server_client=client,
+            )
+        )
+    assert set(full["sessions"][0]) == {
+        "session_id",
+        "conversation_id",
+        "agent",
+        "agent_name",
+        "title",
+        "busy",
+        "current_task_status",
+        "status",
+        "updated_at",
+        "runner_online",
+        "parent_session_id",
+        "runner_id",
+        "host_id",
+        "workspace",
+        "git_branch",
+    }
+    assert full["sessions"][0]["runner_id"] == "r1"
+    # Each dispatcher invocation resolves one status call. The test invokes
+    # it twice, so two entries are correct; deduplication is per invocation.
+    assert runner_status_calls == ["r1", "r1"]
 
 
 @pytest.mark.asyncio
