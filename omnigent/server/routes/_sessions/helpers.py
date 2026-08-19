@@ -6132,10 +6132,13 @@ class _SessionEventDispatchResult:
         ``"pending_a1b2c3"`` — surfaced to the sender so it can adopt
         the id and dedupe against the snapshot. ``None`` for non-native
         events (already persisted, so no separate pending entry).
+    :param delivery: Runner verdict, ``"buffered"`` or ``"accepted"``, when
+        the runner returned one; ``None`` for older or bypass paths.
     """
 
     item_id: str | None
     pending_id: str | None
+    delivery: str | None = None
 
 
 def _extract_persistent_item_from_sse(

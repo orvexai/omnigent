@@ -1724,6 +1724,8 @@ def register_events_routes(
         # stability) and relies on stableKey + FIFO instead.
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
+        if dispatch.delivery is not None:
+            response["delivery"] = dispatch.delivery
         return response
 
     # ── GET /sessions/{session_id}/stream ────────────────────────

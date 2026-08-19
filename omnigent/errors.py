@@ -58,6 +58,7 @@ class ErrorCode:
         exists on the selected host (HTTP 410). Retrying cannot recreate
         deleted workspace state; the user must start a session in a valid
         workspace.
+    :cvar QUEUE_FULL: The runner's bounded message buffer is full (HTTP 429).
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -75,6 +76,7 @@ class ErrorCode:
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
     WORKSPACE_MISSING = "workspace_missing"
+    QUEUE_FULL = "queue_full"
 
 
 # Single source of truth for error code → HTTP status.
@@ -105,6 +107,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
     ErrorCode.WORKSPACE_MISSING: 410,
+    ErrorCode.QUEUE_FULL: 429,
 }
 
 
