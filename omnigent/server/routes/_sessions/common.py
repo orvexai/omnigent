@@ -102,6 +102,7 @@ _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
     {"idle", "running", "waiting", "failed"}
 )
+# External forwarders intentionally omit ``launching`` as a policy boundary.
 
 
 _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT: int = 1000

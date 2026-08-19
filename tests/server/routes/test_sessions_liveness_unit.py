@@ -138,17 +138,25 @@ async def test_recovery_clears_failed_status_without_scheduled_completion(
 
 
 @pytest.mark.asyncio
-async def test_snapshot_drops_unvalidated_runner_status(
+@pytest.mark.parametrize(
+    ("runner_status", "expected_cache"),
+    [("bogus", None), ("launching", "launching")],
+)
+async def test_snapshot_validates_runner_status_at_ingress(
     two_pod_status_cache: Any,
     monkeypatch: pytest.MonkeyPatch,
+    runner_status: str,
+    expected_cache: str | None,
 ) -> None:
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions
     from omnigent.server.routes._sessions import orchestration
 
     class FakeResponse:
         status_code = 200
 
         def json(self) -> dict[str, str]:
-            return {"status": "bogus"}
+            return {"status": runner_status}
 
     class FakeRunnerClient:
         async def get(self, url: str, *, timeout: float) -> FakeResponse:
@@ -179,6 +187,8 @@ async def test_snapshot_drops_unvalidated_runner_status(
 
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
     monkeypatch.setattr("omnigent.runtime.get_runner_client", FakeRunnerClient)
+    monkeypatch.setattr(session_live_state, "persist_live_status", lambda *args: None)
+    monkeypatch.setattr(sessions, "session_stream", SimpleNamespace(publish=lambda *args: None))
     monkeypatch.setattr(orchestration, "_fetch_runner_skills", empty_runner_skills)
     monkeypatch.setattr(orchestration, "_fetch_model_options", empty_model_options)
     monkeypatch.setattr(orchestration, "load_session_usage", lambda *args: None)
@@ -197,8 +207,9 @@ async def test_snapshot_drops_unvalidated_runner_status(
     with two_pod_status_cache.enter_pod("b"):
         snapshot = await orchestration._get_session_snapshot(FakeStore(), session_id)
         assert snapshot.status == "idle"
-        assert session_id not in two_pod_status_cache.cache
-        assert two_pod_status_cache.cache == {}
+        assert two_pod_status_cache.cache.get(session_id) == expected_cache
+        if expected_cache is None:
+            assert two_pod_status_cache.cache == {}
 
 
 @pytest.mark.asyncio
@@ -330,13 +341,14 @@ def test_status_publisher_rejects_invalid_status(
 
     from omnigent.server import session_live_state
     from omnigent.server.routes import sessions
-    from omnigent.server.routes._sessions import helpers
+    from omnigent.server.routes._sessions import helpers, orchestration
     from omnigent.server.schemas import SessionStatusEvent
 
     assert (
         frozenset(get_args(SessionStatusEvent.model_fields["status"].annotation))
         == helpers._SESSION_STATUS_VALUES
     )
+    assert orchestration._SESSION_STATUS_VALUES is helpers._SESSION_STATUS_VALUES
 
     persisted: list[tuple[Any, ...]] = []
     events: list[Any] = []
@@ -392,10 +404,16 @@ def test_status_publisher_accepts_launching_status(
 
 
 @pytest.mark.asyncio
-async def test_relay_drops_bogus_status_before_publish(
+@pytest.mark.parametrize(
+    ("runner_status", "expected_cache"),
+    [("bogus", None), ("launching", "launching")],
+)
+async def test_relay_validates_runner_status_at_ingress(
     two_pod_status_cache: Any,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    runner_status: str,
+    expected_cache: str | None,
 ) -> None:
     from omnigent.server import session_live_state
     from omnigent.server.routes import sessions
@@ -410,7 +428,7 @@ async def test_relay_drops_bogus_status_before_publish(
 
         async def aiter_text(self) -> Any:
             yield 'data: {"type": "session.heartbeat"}\n\n'
-            yield 'data: {"type": "session.status", "status": "bogus"}\n\n'
+            yield f'data: {{"type": "session.status", "status": "{runner_status}"}}\n\n'
             yield "data: [DONE]\n\n"
 
     class FakeRunnerClient:
@@ -439,12 +457,20 @@ async def test_relay_drops_bogus_status_before_publish(
             FakeRunnerClient(),  # type: ignore[arg-type]
             SimpleNamespace(),  # type: ignore[arg-type]
         )
-        assert session_id not in two_pod_status_cache.cache
-        assert two_pod_status_cache.cache == {}
+        assert two_pod_status_cache.cache.get(session_id) == expected_cache
+        if expected_cache is None:
+            assert two_pod_status_cache.cache == {}
 
-    assert persisted == []
-    assert events == []
-    assert "Ignoring invalid runner session status='bogus'" in caplog.text
+    if expected_cache is None:
+        assert persisted == []
+        assert events == []
+    else:
+        assert persisted
+        assert events[0][1]["status"] == expected_cache
+    if expected_cache is None:
+        assert f"Ignoring invalid runner session status='{runner_status}'" in caplog.text
+    else:
+        assert f"Ignoring invalid runner session status='{runner_status}'" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -468,7 +494,9 @@ async def test_offline_verdict_running_cache_fails_row_idle_with_cause(
 async def test_tunnel_hook_cache_only_table_and_crash_path(
     two_pod_status_cache: Any,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
     session_id = "offline-tunnel-hook"
     with two_pod_status_cache.enter_pod("b"):
         events, persisted = await _run_offline_reconciliation(
@@ -479,7 +507,12 @@ async def test_tunnel_hook_cache_only_table_and_crash_path(
         assert two_pod_status_cache.cache == {}
     assert events == []
     assert persisted == []
+    assert (
+        "Offline reconciliation has no local status for session=offline-tunnel-hook; "
+        "declining verdict"
+    ) in caplog.text
 
+    caplog.clear()
     with two_pod_status_cache.enter_pod("a"):
         two_pod_status_cache.cache[session_id] = "running"
         events, persisted = await _run_offline_reconciliation(
@@ -499,6 +532,7 @@ async def test_tunnel_hook_cache_only_table_and_crash_path(
         assert two_pod_status_cache.cache[crash_id] == "failed"
     assert events[0]["id"] == crash_id
     assert persisted[0][1].code == "runner_disconnected"
+    assert "Offline reconciliation has no local status" not in caplog.text
 
 
 @pytest.mark.asyncio

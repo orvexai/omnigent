@@ -1152,10 +1152,11 @@ def _session_status_from_cache(
     """
     Map the relay-fed status cache value to a list-item status.
 
-    The cache stores the fine-grained relay status (``"running"``,
-    ``"waiting"``, ``"failed"``, ``"idle"``); the list-item shape
-    collapses ``"running"``/``"waiting"`` to ``"running"``. A cache
-    miss falls back to *db_status* — the row value the tunnel-holding
+    The cache stores the fine-grained relay status (``"idle"``,
+    ``"launching"``, ``"running"``, ``"waiting"``, ``"failed"``); the
+    list-item shape collapses ``"running"``/``"waiting"`` to ``"running"``
+    and treats ``"launching"`` as a quiet exit. A cache miss falls back to
+    *db_status* — the row value the tunnel-holding
     replica persisted (``omnigent_conversation_metadata.live_status``) — so a replica
     that does NOT hold this session's runner tunnel still serves the
     real status. No cache entry and no row value presents as ``"idle"``.
@@ -3745,10 +3746,6 @@ def _publish_status(
         "background_task_count": background_task_count,
         "blocked_on": blocked_on,
     }
-    if status not in _SESSION_STATUS_VALUES:
-        # Keep the internal API loud while deriving accepted values from the
-        # schema; this call raises before any cache or persistence side effect.
-        SessionStatusEvent(**event_kwargs)  # type: ignore[arg-type]
     event = SessionStatusEvent(**event_kwargs)  # type: ignore[arg-type]
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
