@@ -23,7 +23,7 @@ import time
 import urllib.parse
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
@@ -2348,7 +2348,7 @@ _remote_dispatch_tasks: dict[str, asyncio.Task[None]] = {}
 
 # Cross-runner peer sends from other callers wait here while one dispatch owns
 # the target. The queue preserves one active turn per target.
-_peer_dispatch_queues: dict[str, deque[Callable[[], Awaitable[None]]]] = {}
+_peer_dispatch_queues: dict[str, deque[Callable[[], Coroutine[Any, Any, None]]]] = {}
 _peer_dispatch_tasks: set[asyncio.Task[Any]] = set()
 
 # Set by :func:`create_runner_app` so the tool dispatcher can start a
@@ -2369,7 +2369,7 @@ def peer_dispatch_queue_full(target_session_id: str) -> bool:
 
 def enqueue_peer_dispatch(
     target_session_id: str,
-    callback: Callable[[], Awaitable[None]],
+    callback: Callable[[], Coroutine[Any, Any, None]],
 ) -> bool:
     """Queue one peer dispatch without changing the active target slot."""
     if peer_dispatch_queue_full(target_session_id):

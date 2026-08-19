@@ -1413,7 +1413,7 @@ async def _resolve_thread_for_send(
                 thread=resolution.thread,
                 server_client=server_client,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — helper signals a bad status with RuntimeError; the send continues on runner-local state
             _logger.warning(
                 "Could not persist message thread %s; continuing with runner-local state",
                 resolution.thread.thread_id,
@@ -7386,7 +7386,7 @@ async def _collect_sub_agents(
                     # Exclude the caller itself from its own sibling list.
                     if entry["conversation_id"] != conversation_id:
                         result.append(entry)
-        except Exception:
+        except Exception:  # noqa: BLE001 — optional sibling enrichment; the primary listing must still return
             _logger.debug(
                 "sys_session_list sibling enrichment failed for parent %s",
                 parent_id,
@@ -7831,7 +7831,7 @@ async def _session_close_via_rest(
                 thread=thread,
                 server_client=server_client,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — helper signals a bad status with RuntimeError; the close already succeeded
             _logger.warning(
                 "Could not delete labels for closed message thread %s",
                 thread.thread_id,
@@ -9700,7 +9700,7 @@ async def _evaluate_async_tool_call_policy(
             resp.status_code,
             evaluation_id,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 — any evaluation failure must deny, never propagate
         _logger.warning(
             "async PHASE_TOOL_CALL policy evaluate failed for %s; denying",
             evaluation_id,
