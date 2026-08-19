@@ -44,7 +44,7 @@ import os
 import re
 import tempfile
 import xml.etree.ElementTree as ET
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,6 +106,23 @@ from tests.runner.helpers import NullServerClient
 
 _TEST_HARNESS_NAME = "runner-test-default"
 _TEST_HARNESS_MODULE = "tests._fixtures.runner_test_harness"
+
+
+@pytest.fixture(autouse=True)
+def _clear_process_manager_ref_between_tests() -> Iterator[None]:
+    """Clear fake managers leaked through ``runner.app._process_manager_ref``.
+
+    ``create_runner_app`` stores each test app's manager in that module-global
+    ref. Cross-file xdist worksteal can expose the leak; a serial file run
+    cannot, so clear it on both sides of every dispatch test.
+    """
+    from omnigent.runner import app as runner_app
+
+    runner_app._process_manager_ref = None
+    try:
+        yield
+    finally:
+        runner_app._process_manager_ref = None
 
 
 def _assert_agent_message_envelope(
@@ -5730,6 +5747,7 @@ async def test_session_close_patches_tombstoned_title() -> None:
         "conversation_id": "conv_target",
         "agent": "researcher",
         "title": "auth",
+        "archived": False,
     }
 
 
@@ -5798,6 +5816,7 @@ async def test_session_close_tombstones_child_without_agent_prefix(
         "conversation_id": "conv_target",
         "agent": None,
         "title": expected_title,
+        "archived": False,
     }
 
 
@@ -5857,14 +5876,7 @@ async def test_session_close_rejects_out_of_tree_target_without_patch() -> None:
 
 @pytest.mark.asyncio
 async def test_session_close_rejects_top_level_target() -> None:
-    """
-    ``sys_session_close`` refuses a top-level session (no parent) even
-    when it shares the caller's root, and issues no PATCH.
-
-    A top-level session in the caller's own tree (its root) has no
-    ``parent_session_id``; close only operates on sub-agents, so the
-    tool returns ``session_not_a_sub_agent``.
-    """
+    """Self-close remains refused because top-level targets are not sub-agents."""
     from omnigent.runner.tool_dispatch import _execute_session_query_tool
 
     patched = False
@@ -5891,13 +5903,346 @@ async def test_session_close_rejects_top_level_target() -> None:
             await _execute_session_query_tool(
                 "sys_session_close",
                 json.dumps({"conversation_id": "conv_root"}),
-                # Caller IS conv_root, so its self-snapshot is the same row.
                 conversation_id="conv_root",
                 server_client=client,
             )
         )
-    assert out == {"error": "session_not_a_sub_agent", "conversation_id": "conv_root"}
+    assert out["error"] == "session_in_caller_tree"
+    assert out["conversation_id"] == "conv_root"
+    assert "top-level session" not in out["message"]
+    assert "human" in out["message"]
+    assert "different session tree" in out["message"]
     assert patched is False
+
+
+@pytest.mark.asyncio
+async def test_session_close_patch_shape_escalates_only_foreign_top_level() -> None:
+    """A foreign top-level retirement carries the server OWNER escalation."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    patched: dict[str, dict[str, Any]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_foreign":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_foreign",
+                    "title": "foreign",
+                    "root_conversation_id": "other_root",
+                    "parent_session_id": None,
+                    "status": "idle",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "worker:child",
+                    "root_conversation_id": "caller_root",
+                    "parent_session_id": "conv_caller",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"root_conversation_id": "caller_root"})
+        if request.method == "PATCH":
+            patched[request.url.path.rsplit("/", 1)[-1]] = json.loads(request.content)
+            return httpx.Response(
+                200, json={"archived": "archived" in json.loads(request.content)}
+            )
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        await _execute_session_query_tool(
+            "sys_session_close",
+            json.dumps({"conversation_id": "conv_foreign"}),
+            conversation_id="conv_caller",
+            server_client=client,
+        )
+        await _execute_session_query_tool(
+            "sys_session_close",
+            json.dumps({"conversation_id": "conv_child"}),
+            conversation_id="conv_caller",
+            server_client=client,
+        )
+
+    assert "archived" in patched["conv_foreign"]
+    assert "archived" not in patched["conv_child"]
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "status"),
+    [
+        ({"status": "running"}, "running"),
+        ({"status": "idle", "background_task_count": 2}, "idle"),
+    ],
+    ids=["running", "background_shells"],
+)
+@pytest.mark.asyncio
+async def test_session_close_rejects_busy_top_level_without_patch(
+    snapshot: dict[str, Any], status: str
+) -> None:
+    """Live top-level work is refused before the destructive PATCH."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "target",
+                    "root_conversation_id": "other_root",
+                    "parent_session_id": None,
+                    **snapshot,
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"root_conversation_id": "caller_root"})
+        if request.method == "PATCH":
+            raise AssertionError("busy top-level target must not be PATCHed")
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out["error"] == "session_busy"
+    assert out["conversation_id"] == "conv_target"
+    assert out["status"] == status
+
+
+@pytest.mark.asyncio
+async def test_session_close_rejects_callers_root_without_patch() -> None:
+    """A child cannot retire the root that is running its own tree."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_root":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_root",
+                    "title": "root",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": None,
+                    "status": "idle",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"root_conversation_id": "conv_root"})
+        if request.method == "PATCH":
+            raise AssertionError("caller root must not be PATCHed")
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_root"}),
+                conversation_id="conv_child",
+                server_client=client,
+            )
+        )
+    assert out["error"] == "session_in_caller_tree"
+    assert "top-level session" not in out["message"]
+    assert "human" in out["message"]
+    assert "different session tree" in out["message"]
+
+
+@pytest.mark.parametrize(
+    ("patch_status", "expected_error"),
+    [(404, "session_not_found"), (403, "access_denied"), (422, "retire_unsupported")],
+)
+@pytest.mark.asyncio
+async def test_session_close_maps_retirement_patch_statuses(
+    patch_status: int, expected_error: str
+) -> None:
+    """Retirement PATCH statuses map to stable LLM-facing errors."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "target",
+                    "root_conversation_id": "other_root",
+                    "parent_session_id": None,
+                    "status": "idle",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"root_conversation_id": "caller_root"})
+        if request.method == "PATCH":
+            return httpx.Response(patch_status, json={})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out["error"] == expected_error
+    assert out["conversation_id"] == "conv_target"
+
+
+@pytest.mark.asyncio
+async def test_session_close_maps_subagent_422_to_generic_status_error() -> None:
+    """A legacy PATCH rejection is not retirement-specific for sub-agents."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "worker:child",
+                    "root_conversation_id": "caller_root",
+                    "parent_session_id": "conv_caller",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"root_conversation_id": "caller_root"})
+        if request.method == "PATCH":
+            return httpx.Response(422, json={})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_child"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out == {"error": "sys_session_close returned 422"}
+
+
+@pytest.mark.asyncio
+async def test_session_close_tolerates_malformed_success_payload() -> None:
+    """An applied archive remains a successful close if the echo is malformed."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "target",
+                    "root_conversation_id": "other_root",
+                    "parent_session_id": None,
+                    "status": "idle",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"root_conversation_id": "caller_root"})
+        if request.method == "PATCH":
+            return httpx.Response(200, content=b"not-json")
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out["closed"] is True
+    assert out["archived"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_close_ignores_non_boolean_archive_echo() -> None:
+    """A malformed archive field cannot override the requested retirement."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "target",
+                    "root_conversation_id": "other_root",
+                    "parent_session_id": None,
+                    "status": "idle",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"root_conversation_id": "caller_root"})
+        if request.method == "PATCH":
+            return httpx.Response(200, json={"archived": None})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out["closed"] is True
+    assert out["archived"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_close_retires_already_archived_target() -> None:
+    """Retiring an already archived target remains idempotent."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    patched: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "target:closed:conv_target",
+                    "root_conversation_id": "other_root",
+                    "parent_session_id": None,
+                    "status": "idle",
+                    "archived": True,
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"root_conversation_id": "caller_root"})
+        if request.method == "PATCH":
+            patched.append(json.loads(request.content))
+            return httpx.Response(200, json={"archived": True})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out["closed"] is True
+    assert out["archived"] is True
+    assert patched[0]["archived"] is True
 
 
 def test_agent_tools_are_runner_local() -> None:

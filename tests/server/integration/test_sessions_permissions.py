@@ -30,6 +30,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import presence
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER, LEVEL_READ
+from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -826,6 +827,222 @@ async def test_archive_requires_owner_access(
         f"If 403, the gate is wrongly raised above owner."
     )
     assert resp.json()["archived"] is True
+
+
+async def test_archive_escalation_covers_multi_field_patch(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Adding title and labels must not lower the archive OWNER gate."""
+    agent = await create_test_agent(auth_client, user="bryan")
+    session = await _create_session_as(auth_client, agent["id"], "user-a", title="original")
+    grant = await _grant_permission(
+        auth_client,
+        session["id"],
+        granter="user-a",
+        target_user="user-b",
+        level=LEVEL_EDIT,
+    )
+    assert grant.status_code == 200, grant.text
+    response = await auth_client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={
+            "title": "should-not-persist",
+            "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+            "archived": True,
+        },
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert response.status_code == 403, response.text
+    snapshot = await auth_client.get(
+        f"/v1/sessions/{session['id']}", headers={"X-Forwarded-Email": "user-a"}
+    )
+    body = snapshot.json()
+    assert body["title"] == "original"
+    assert body["archived"] is False
+    assert CLOSED_LABEL_KEY not in body.get("labels", {})
+
+
+async def test_runner_session_close_owner_retire_and_edit_denial(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The same REST path archives an owner target and denies an editor."""
+    from omnigent.runner.tool_dispatch import _session_close_via_rest
+
+    owner_target = await _create_session_as(auth_client, "ignored", "alice", title="owner-target")
+    owner_caller = await _create_session_as(auth_client, "ignored", "alice", title="owner-caller")
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    owner_result = json.loads(
+        await _session_close_via_rest(
+            {"conversation_id": owner_target["id"]}, owner_caller["id"], auth_client
+        )
+    )
+    assert owner_result["closed"] is True
+    assert owner_result["archived"] is True
+    snapshot = await auth_client.get(
+        f"/v1/sessions/{owner_target['id']}", headers={"X-Forwarded-Email": "alice"}
+    )
+    assert snapshot.json()["archived"] is True
+    assert snapshot.json()["labels"][CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(owner_target["id"])
+    assert stored is not None and ":closed:" in stored.title
+
+    target = await _create_session_as(auth_client, "ignored", "alice", title="foreign-edit")
+    caller = await _create_session_as(auth_client, "ignored", "bob", title="bob-caller")
+    grant = await _grant_permission(
+        auth_client,
+        target["id"],
+        granter="alice",
+        target_user="bob",
+        level=LEVEL_EDIT,
+    )
+    assert grant.status_code == 200, grant.text
+    auth_client.headers["X-Forwarded-Email"] = "bob"
+    denied = json.loads(
+        await _session_close_via_rest({"conversation_id": target["id"]}, caller["id"], auth_client)
+    )
+    assert denied == {"error": "access_denied", "conversation_id": target["id"]}
+    unchanged = await auth_client.get(
+        f"/v1/sessions/{target['id']}", headers={"X-Forwarded-Email": "alice"}
+    )
+    assert unchanged.json()["archived"] is False
+
+
+async def test_runner_session_close_does_not_infer_tree_owner_for_retirement(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """A caller's READ/EDIT grants cannot authorize top-level retirement."""
+    from omnigent.runner.tool_dispatch import _session_close_via_rest
+
+    caller = await _create_session_as(auth_client, "ignored", "alice", title="alice-caller")
+    unshared = await _create_session_as(auth_client, "ignored", "alice", title="alice-unshared")
+    edit_shared = await _create_session_as(
+        auth_client, "ignored", "alice", title="alice-edit-shared"
+    )
+    read_grant = await _grant_permission(
+        auth_client,
+        caller["id"],
+        granter="alice",
+        target_user="carol",
+        level=LEVEL_READ,
+    )
+    assert read_grant.status_code == 200, read_grant.text
+    edit_grant = await _grant_permission(
+        auth_client,
+        edit_shared["id"],
+        granter="alice",
+        target_user="carol",
+        level=LEVEL_EDIT,
+    )
+    assert edit_grant.status_code == 200, edit_grant.text
+
+    auth_client.headers["X-Forwarded-Email"] = "carol"
+    unshared_result = json.loads(
+        await _session_close_via_rest(
+            {"conversation_id": unshared["id"]}, caller["id"], auth_client
+        )
+    )
+    assert unshared_result == {
+        "error": "session_not_found",
+        "conversation_id": unshared["id"],
+    }
+    edit_shared_result = json.loads(
+        await _session_close_via_rest(
+            {"conversation_id": edit_shared["id"]}, caller["id"], auth_client
+        )
+    )
+    assert edit_shared_result == {
+        "error": "access_denied",
+        "conversation_id": edit_shared["id"],
+    }
+
+    for target, title in ((unshared, "alice-unshared"), (edit_shared, "alice-edit-shared")):
+        snapshot = await auth_client.get(
+            f"/v1/sessions/{target['id']}", headers={"X-Forwarded-Email": "alice"}
+        )
+        assert snapshot.status_code == 200, snapshot.text
+        body = snapshot.json()
+        assert body["title"] == title
+        assert body["archived"] is False
+        assert CLOSED_LABEL_KEY not in body.get("labels", {})
+
+
+async def test_runner_session_close_admin_retire_without_grant(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An admin retires another user's idle top-level session without a grant."""
+    from omnigent.runner.tool_dispatch import _session_close_via_rest
+
+    # The admin flag must exist before the caller session is created and
+    # authenticated; otherwise the request is treated as an ordinary user.
+    SqlAlchemyPermissionStore(db_uri).ensure_user("root-admin", is_admin=True)
+    target = await _create_session_as(auth_client, "ignored", "alice", title="admin-target")
+    caller = await _create_session_as(auth_client, "ignored", "root-admin", title="admin-caller")
+    auth_client.headers["X-Forwarded-Email"] = "root-admin"
+
+    result = json.loads(
+        await _session_close_via_rest({"conversation_id": target["id"]}, caller["id"], auth_client)
+    )
+    assert result["closed"] is True
+    assert result["archived"] is True
+    snapshot = await auth_client.get(
+        f"/v1/sessions/{target['id']}", headers={"X-Forwarded-Email": "alice"}
+    )
+    body = snapshot.json()
+    assert body["archived"] is True
+    assert body["labels"][CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(target["id"])
+    assert stored is not None and stored.archived is True
+
+
+async def test_runner_session_close_no_auth_and_local_need_no_info_probe(
+    client: httpx.AsyncClient,
+    local_auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No-auth and local single-user retirement do not call ``/v1/info``."""
+    from omnigent.runner.tool_dispatch import _session_close_via_rest
+
+    target = await _create_session_as(client, "ignored", None, title="no-auth-target")
+    caller = await _create_session_as(client, "ignored", None, title="no-auth-caller")
+    paths: list[str] = []
+    original_get = client.get
+
+    async def recording_get(url: Any, *args: Any, **kwargs: Any) -> httpx.Response:
+        paths.append(str(url))
+        return await original_get(url, *args, **kwargs)
+
+    monkeypatch.setattr(client, "get", recording_get)
+    result = json.loads(
+        await _session_close_via_rest({"conversation_id": target["id"]}, caller["id"], client)
+    )
+    assert result["closed"] is True
+    assert result["archived"] is True
+    assert not any(path.endswith("/v1/info") for path in paths)
+
+    local_target = await _create_session_as(
+        local_auth_client, "ignored", None, title="local-target"
+    )
+    local_caller = await _create_session_as(
+        local_auth_client, "ignored", None, title="local-caller"
+    )
+    local_paths: list[str] = []
+    original_local_get = local_auth_client.get
+
+    async def recording_local_get(url: Any, *args: Any, **kwargs: Any) -> httpx.Response:
+        local_paths.append(str(url))
+        return await original_local_get(url, *args, **kwargs)
+
+    monkeypatch.setattr(local_auth_client, "get", recording_local_get)
+    local_result = json.loads(
+        await _session_close_via_rest(
+            {"conversation_id": local_target["id"]}, local_caller["id"], local_auth_client
+        )
+    )
+    assert local_result["closed"] is True
+    assert local_result["archived"] is True
+    assert not any(path.endswith("/v1/info") for path in local_paths)
 
 
 async def test_cost_control_override_patch_requires_edit_access(

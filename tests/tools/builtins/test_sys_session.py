@@ -424,6 +424,22 @@ def test_close_schema_required_fields_and_no_extra_props() -> None:
     assert set(params["properties"].keys()) == {"conversation_id"}
 
 
+def test_close_description_names_retirement_guardrails() -> None:
+    """The schema advertises emitted close errors, not unreachable ones."""
+    description = SysSessionCloseTool.description()
+    assert "session_busy" in description
+    assert "session_in_caller_tree" in description
+    assert "access_denied" in description
+    assert "retire_unsupported" in description
+    assert "archived" in description
+    assert "stop" in description
+    assert "runner" in description
+    assert "not agent-reversible" in description
+    assert "caller itself or its root" in description
+    assert "session_not_a_sub_agent" not in description
+    assert "sub_agent_busy" not in description
+
+
 # ── Peek invoke tests ─────────────────────────────────────
 
 
@@ -717,34 +733,25 @@ def test_peek_top_level_conversation_in_tree_is_rejected(
     assert payload["conversation_id"] == session_fixture.parent_conv_id
 
 
-def test_close_top_level_conversation_in_tree_is_rejected(
+def test_close_top_level_conversation_self_is_rejected(
     session_fixture: _Fixture,
 ) -> None:
-    """
-    Close refuses a top-level conversation_id even when it's in
-    the caller's spawn tree.
-
-    Same invariant as the peek case — the LLM cannot tombstone a
-    non-sub-agent conversation, so the tool returns
-    ``session_not_a_sub_agent`` and leaves the row's title intact.
-
-    :param session_fixture: Per-test fixture providing the tool ctx
-        and parent conversation id.
-    """
+    """The in-process executor refuses every top-level target."""
     tool = SysSessionCloseTool()
     raw = tool.invoke(
         json.dumps({"conversation_id": session_fixture.parent_conv_id}),
         session_fixture.ctx,
     )
     payload = json.loads(raw)
-    assert payload["error"] == "session_not_a_sub_agent"
+    assert payload["error"] == "session_in_caller_tree"
     assert payload["conversation_id"] == session_fixture.parent_conv_id
-
-    parent_after = session_fixture.conv_store.get_conversation(
-        session_fixture.parent_conv_id,
-    )
+    assert "top-level session" not in payload["message"]
+    assert "human" in payload["message"]
+    assert "different session tree" in payload["message"]
+    parent_after = session_fixture.conv_store.get_conversation(session_fixture.parent_conv_id)
     assert parent_after is not None
     assert CLOSED_TITLE_INFIX not in (parent_after.title or "")
+    assert CLOSED_LABEL_KEY not in (parent_after.labels or {})
 
 
 # ── Close invoke tests ────────────────────────────────────

@@ -6231,7 +6231,8 @@ async def _execute_session_query_tool(
     - ``sys_session_get_info`` → ``GET /v1/sessions/{target}`` (plus a
       best-effort ``GET /v1/runners/{id}/status`` for connectivity)
     - ``sys_session_close`` → ``GET`` the target snapshot then ``PATCH
-      /v1/sessions/{target}`` with a tombstoned title
+      /v1/sessions/{target}`` with a tombstoned title and, for a dead
+      top-level target, ``archived: true``
     - ``sys_session_share`` → ``PUT /v1/sessions/{target}/permissions``
       with the grantee + numeric level
 
@@ -6244,9 +6245,9 @@ async def _execute_session_query_tool(
 
     Scoping by tool, since it is deliberately NOT uniform:
 
-    - ``sys_session_close`` is tree-scoped on both executors. Tombstoning
-      is destructive bookkeeping and stays confined to what the caller
-      spawned.
+    - ``sys_session_close`` is tree-scoped for sub-agents on both executors.
+      A dead top-level target is retired through the server's owner gate on
+      the REST path; the in-process path cannot retire top-level sessions.
     - ``sys_session_send`` is tree-scoped in-process (that executor has no
       caller identity to bound anything else by) but here reaches any
       session the server lets the caller read. This is what makes
@@ -7672,6 +7673,49 @@ async def _session_get_history_via_rest(
     )
 
 
+def _close_top_level_preconditions(
+    target_snap: _JsonObject,
+    _caller_conversation_id: str,
+    caller_root: object,
+    target_id: str,
+) -> str | None:
+    """Refuse unsafe top-level retirement targets before issuing a PATCH."""
+    if target_id == caller_root:
+        return json.dumps(
+            {
+                "error": "session_in_caller_tree",
+                "conversation_id": target_id,
+                "message": ("Ask a human or an agent in a different session tree to retire it."),
+            }
+        )
+    status = target_snap.get("status")
+    if status in ("running", "waiting"):
+        return json.dumps(
+            {
+                "error": "session_busy",
+                "conversation_id": target_id,
+                "status": status,
+                "message": (
+                    "The session is doing work; wait for it to become idle before retiring it."
+                ),
+            }
+        )
+    background_task_count = target_snap.get("background_task_count")
+    if isinstance(background_task_count, int) and background_task_count > 0:
+        return json.dumps(
+            {
+                "error": "session_busy",
+                "conversation_id": target_id,
+                "status": status,
+                "message": (
+                    "The session has background shells; wait for them to finish "
+                    "before retiring it."
+                ),
+            }
+        )
+    return None
+
+
 async def _fetch_close_target(
     target_id: str,
     server_client: httpx.AsyncClient,
@@ -7683,7 +7727,7 @@ async def _fetch_close_target(
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: The parsed snapshot dict on HTTP 200; otherwise a JSON
         error string (``session_not_found`` for 404,
-        ``session_out_of_tree`` for 401/403, a generic status error
+        ``access_denied`` for 401/403, a generic status error
         otherwise) suitable for returning verbatim to the LLM.
     """
     try:
@@ -7693,7 +7737,7 @@ async def _fetch_close_target(
     if snap.status_code == 404:
         return json.dumps({"error": "session_not_found", "conversation_id": target_id})
     if snap.status_code in (401, 403):
-        return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
+        return json.dumps({"error": "access_denied", "conversation_id": target_id})
     if snap.status_code != 200:
         return json.dumps({"error": f"sys_session_close returned {snap.status_code}"})
     body = _string_object_dict(snap.json())
@@ -7702,55 +7746,86 @@ async def _fetch_close_target(
     return body
 
 
-async def _close_tree_scope_error(
+@dataclass(frozen=True)
+class _CloseShape:
+    error: str | None
+    retire: bool
+
+
+async def _close_scope_error(
     target_snap: _JsonObject,
     caller_conversation_id: str,
     target_id: str,
     server_client: httpx.AsyncClient,
-) -> str | None:
+) -> _CloseShape:
     """
-    Enforce the close tool's spawn-tree gate over REST.
+    Select the REST close shape from topology and liveness.
 
-    Mirrors the in-process :func:`_resolve_session_call` check: the
-    target must share the caller's ``root_conversation_id`` and must be
-    a sub-agent (have a parent). The caller's own root is resolved via
-    its session snapshot — a session can always read itself, so this is
-    a 200 on the happy path; a non-200 is surfaced as an error rather
-    than failing open. A ``None`` root on either side is treated as
-    out-of-tree (never a match).
+    The caller’s root is resolved via its session snapshot — a session can
+    always read itself. Sub-agent targets must share that root. Top-level
+    targets pass through the liveness guardrail; a non-self target selects
+    the archive-bearing PATCH shape, leaving authorization to the server.
 
-    :param target_snap: The close target's session snapshot dict (from
-        :func:`_fetch_close_target`), carrying ``root_conversation_id``
-        and ``parent_session_id``.
-    :param caller_conversation_id: The calling session's own id, e.g.
-        ``"conv_caller"``.
-    :param target_id: The target conversation id, echoed into errors,
-        e.g. ``"conv_abc123"``.
+    :param target_snap: The close target’s session snapshot dict (from
+        ``_fetch_close_target``, carrying ``root_conversation_id``,
+        ``parent_session_id``, and liveness fields).
+    :param caller_conversation_id: The calling session’s own id.
+    :param target_id: The target conversation id, echoed into errors.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: ``None`` when the target is in-tree and a sub-agent;
-        otherwise a JSON error string (``session_out_of_tree`` or
-        ``session_not_a_sub_agent``).
+    :returns: A decision carrying an error, if any, and whether the PATCH
+        must archive a non-self top-level target.
     """
     try:
         caller_snap = await server_client.get(
             f"/v1/sessions/{caller_conversation_id}", timeout=30.0
         )
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"sys_session_close failed: {exc}"})
+        return _CloseShape(json.dumps({"error": f"sys_session_close failed: {exc}"}), False)
     if caller_snap.status_code != 200:
-        return json.dumps(
-            {
-                "error": "sys_session_close could not resolve caller session "
-                f"{caller_conversation_id!r}"
-            }
+        return _CloseShape(
+            json.dumps(
+                {
+                    "error": "sys_session_close could not resolve caller session "
+                    f"{caller_conversation_id!r}"
+                }
+            ),
+            False,
         )
     caller_root = caller_snap.json().get("root_conversation_id")
     target_root = target_snap.get("root_conversation_id")
-    if caller_root is None or target_root != caller_root:
-        return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
-    if target_snap.get("parent_session_id") is None:
-        return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
-    return None
+    if not isinstance(caller_root, str) or not caller_root:
+        return _CloseShape(
+            json.dumps({"error": "session_out_of_tree", "conversation_id": target_id}),
+            False,
+        )
+    parent_session_id = target_snap.get("parent_session_id")
+    target_is_top_level = not isinstance(parent_session_id, str) or not parent_session_id
+    if target_is_top_level:
+        if target_id == caller_conversation_id:
+            return _CloseShape(
+                json.dumps(
+                    {
+                        "error": "session_in_caller_tree",
+                        "conversation_id": target_id,
+                        "message": (
+                            "Ask a human or an agent in a different session tree to retire it."
+                        ),
+                    }
+                ),
+                False,
+            )
+        precondition_error = _close_top_level_preconditions(
+            target_snap, caller_conversation_id, caller_root, target_id
+        )
+        if precondition_error is not None:
+            return _CloseShape(precondition_error, False)
+        return _CloseShape(None, True)
+    if target_root != caller_root:
+        return _CloseShape(
+            json.dumps({"error": "session_out_of_tree", "conversation_id": target_id}),
+            False,
+        )
+    return _CloseShape(None, False)
 
 
 async def _session_close_via_rest(
@@ -7759,68 +7834,75 @@ async def _session_close_via_rest(
     server_client: httpx.AsyncClient,
 ) -> str:
     """
-    Close a target sub-agent via ``GET`` snapshot + ``PATCH`` metadata.
+    Close a target session via ``GET`` snapshot + ``PATCH`` metadata.
 
-    Mirrors :class:`SysSessionCloseTool` — including its tree-scoping:
-    close is a write, so the target MUST share the caller's spawn tree
-    (same ``root_conversation_id``) and MUST itself be a sub-agent (have
-    a parent). Without this the REST path would let an agent tombstone
-    any session it merely has edit access to — e.g. a sub-agent in one
-    of the caller's *other*, unrelated spawn trees — which the in-process
-    path forbids. The gate lives in the close tool (via
-    :func:`_close_tree_scope_error`), not the PATCH route, because the
-    route is a general title/metadata mutator; only the close tool
-    carries the spawn-tree contract.
+    Child targets must share the caller’s spawn tree. A non-self top-level
+    target is retired by adding ``archived: true`` to the PATCH, which
+    invokes the server’s OWNER gate. The runner performs no owner lookup or
+    deployment-capability check.
 
-    On success marks the child with ``omnigent.closed=true`` and
-    rewrites its internal title to ``"<agent>:<title>:closed:<id>"`` so
-    future ``sys_session_send`` calls with the same ``(agent, title)``
-    create a fresh child.
+    On success marks the target with ``omnigent.closed=true`` and rewrites
+    its internal title to ``"<agent>:<title>:closed:<id>"``. A top-level
+    retirement also archives the session; the server’s detached teardown
+    stops its work and host runner on a best-effort basis.
 
     :param args: Parsed tool arguments; requires ``conversation_id``.
-    :param conversation_id: The calling session's own id, e.g.
-        ``"conv_caller"``. Used to resolve the caller's spawn-tree root
-        for the tree-scope check.
+    :param conversation_id: The calling session’s own id.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: JSON ``{"closed": true, ...}`` on success; a JSON error
-        object otherwise: ``session_not_found`` (404),
-        ``session_out_of_tree`` (403/401, or the target's root differs
-        from the caller's), or ``session_not_a_sub_agent`` (the target
-        is a top-level session, not a sub-agent).
+    :returns: JSON success or error output.
     """
     from omnigent.runner import app as _runner_app
 
     target_id = args.get("conversation_id")
     if not isinstance(target_id, str) or not target_id:
         return json.dumps(
-            {"error": "sys_session_close requires a non-empty 'conversation_id' string"}
+            {
+                "error": "sys_session_close requires a non-empty conversation_id string",
+            }
         )
     target_snap = await _fetch_close_target(target_id, server_client)
     if isinstance(target_snap, str):
         return target_snap
-    scope_error = await _close_tree_scope_error(
-        target_snap, conversation_id, target_id, server_client
-    )
-    if scope_error is not None:
-        return scope_error
+    scope = await _close_scope_error(target_snap, conversation_id, target_id, server_client)
+    if scope.error is not None:
+        return scope.error
     raw_title = _optional_string(target_snap.get("title"))
     parsed = _parse_session_title(raw_title)
-    # Tombstone the stored title itself: a child created with a
-    # free-form title (or none) is still a sub-agent and must close.
     new_title = tombstoned_title(raw_title, target_id)
+    patch_body: _JsonObject = {
+        "title": new_title,
+        "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+    }
+    if scope.retire:
+        patch_body["archived"] = True
     try:
         patch = await server_client.patch(
             f"/v1/sessions/{target_id}",
-            json={
-                "title": new_title,
-                "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
-            },
+            json=patch_body,
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_close failed: {exc}"})
+    if patch.status_code == 404:
+        return json.dumps({"error": "session_not_found", "conversation_id": target_id})
+    if patch.status_code in (401, 403):
+        return json.dumps({"error": "access_denied", "conversation_id": target_id})
+    if patch.status_code == 422 and scope.retire:
+        return json.dumps(
+            {
+                "error": "retire_unsupported",
+                "conversation_id": target_id,
+                "message": "The server does not support top-level session retirement.",
+            }
+        )
     if patch.status_code != 200:
         return json.dumps({"error": f"sys_session_close returned {patch.status_code}"})
+    try:
+        patch_payload = _string_object_dict(patch.json()) or {}
+    except (TypeError, ValueError):
+        patch_payload = {}
+    echoed_archived = patch_payload.get("archived")
+    archived = echoed_archived if isinstance(echoed_archived, bool) else scope.retire
     for thread in list(_runner_app._threads_by_id.values()):
         if target_id not in (thread.opener_session_id, thread.target_session_id):
             continue
@@ -7847,6 +7929,7 @@ async def _session_close_via_rest(
                 if parsed.agent is not None
                 else (title_without_closed_marker(raw_title) or "")
             ),
+            "archived": archived,
         }
     )
 

@@ -1414,15 +1414,20 @@ def _resolve_session_call(
         # Peek/close operate on sub-agents only, so a session
         # with no parent is refused with a typed error — this
         # is the gate, not the title's shape.
+        if tool_name == SysSessionCloseTool.name():
+            error = "session_in_caller_tree"
+            message = "Ask a human or an agent in a different session tree to retire it."
+        else:
+            error = "session_not_a_sub_agent"
+            message = (
+                "target conversation is a top-level conversation, not a sub-agent session; "
+                "peek/close only operate on sub-agents."
+            )
         return json.dumps(
             {
-                "error": "session_not_a_sub_agent",
+                "error": error,
                 "conversation_id": target_id,
-                "message": (
-                    "target conversation is a top-level "
-                    "conversation, not a sub-agent session; "
-                    "peek/close only operate on sub-agents."
-                ),
+                "message": message,
             }
         )
     return _SessionResolution(
@@ -1624,31 +1629,35 @@ class SysSessionGetHistoryTool(Tool):
 
 class SysSessionCloseTool(Tool):
     """
-    Tombstone any sibling sub-agent session in the same spawn tree.
+    Tombstone a sub-agent in the same spawn tree, or retire a dead top-level
+    session through the server's owner gate.
 
     The LLM uses ``sys_session_close`` to declare that a
     sub-agent conversation is finished. The child's title is
     rewritten so future ``sys_session_send`` calls with the same
     ``(agent, title)`` no longer find it and create a fresh
-    child instead. Tree-scoping is enforced by the tool on both
-    dispatch paths — the in-process path here and the runner's
-    REST path (``_session_close_via_rest``): callers can only
-    close sub-agent conversations sharing their
-    ``root_conversation_id``. Because close is a write, this gate
-    is stricter than the bare per-user edit permission the
-    underlying PATCH route enforces — edit access to a session in
-    a *different* spawn tree is not enough to close it.
+    child instead. Tree-scoping is enforced for sub-agent targets on both
+    dispatch paths — the in-process path here and the runner's REST path
+    (``_session_close_via_rest``). The REST path can retire a dead top-level
+    target by sending ``archived: true`` and letting the server's OWNER gate
+    decide; the in-process path refuses top-level targets in the caller's tree
+    with ``session_in_caller_tree``.
 
-    The close marker is non-destructive: the child conversation's
-    items remain in the store and can still be read by id (e.g. via
-    the server REST API). User-input write paths reject closed
-    children, and the ``(parent, title)`` lookup path is closed off.
+    Sub-agent close is non-destructive: the child conversation's items remain
+    in the store and can still be read by id (e.g. via the server REST API).
+    Top-level retirement is the destructive exception: the session is archived,
+    its work is stopped, and its host-launched runner is torn down. User-input
+    write paths reject closed children, and the ``(parent, title)`` lookup path
+    is closed off.
 
-    Refuses to tombstone a session whose child has a non-terminal
-    task in flight (returns ``sub_agent_busy``) — closing during a
-    live turn would leave a running child orphaned from the
-    parent's tracking. The LLM should wait for the in-flight task
-    to drain (or call ``sys_cancel_task``) before closing.
+    REST retirement refuses a top-level session that is running, waiting, or
+    has background shells (returns ``session_busy``), and refuses the caller's
+    own root (returns ``session_in_caller_tree``). ``access_denied`` is terminal:
+    do not retry or choose a sibling. ``retire_unsupported`` means the server
+    is too old to retire top-level sessions; report it rather than retrying.
+    Retirement is not reversible from the agent side; this tool never sends
+    ``archived: false`` and has no unarchive path. Ask a human or an agent in a
+    different session tree to retire a refused target.
     """
 
     @classmethod
@@ -1660,13 +1669,17 @@ class SysSessionCloseTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Tombstone a sibling sub-agent session in the same "
-            "spawn tree so future sys_session_send calls with the "
-            "same (agent, title) create a fresh child rather than "
-            "continuing this one. Returns session_not_found if "
-            "conversation_id is unknown, session_out_of_tree if it "
-            "isn't part of the caller's tree, or sub_agent_busy if "
-            "the child has a non-terminal task in flight."
+            "Tombstone a sub-agent in the same spawn tree so future "
+            "sys_session_send calls with the same (agent, title) create a "
+            "fresh child. A dead top-level target is retired by the server's "
+            "owner gate, archives the session, stops its work, and tears down "
+            "its host runner. Returns session_not_found if conversation_id is "
+            "unknown, session_out_of_tree if a sub-agent isn't part of the "
+            "caller's tree, access_denied for terminal authorization failures "
+            "(do not retry or choose a sibling), session_busy if a top-level "
+            "target is doing work, session_in_caller_tree if it is the caller "
+            "itself or its root, or retire_unsupported when the server is too old. Retirement "
+            "is not agent-reversible and never sends archived: false."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -1687,12 +1700,15 @@ class SysSessionCloseTool(Tool):
                         "conversation_id": {
                             "type": "string",
                             "description": (
-                                "The target sub-agent's "
+                                "The target session's "
                                 "conversation_id. Get this from "
                                 "sys_session_list or from a "
                                 "prior sys_session_send handle. "
-                                "Must be in the caller's spawn "
-                                "tree."
+                                "Sub-agents must be in the caller's spawn tree. "
+                                "A top-level target must be dead and is retired "
+                                "by the server's OWNER gate; this archives it, "
+                                "stops its work, and tears down its host runner. "
+                                "Retirement is not agent-reversible."
                             ),
                         },
                     },
