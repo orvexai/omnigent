@@ -5883,6 +5883,19 @@ async def _relay_runner_stream_once(
                     if evt_type == "session.status":
                         status = event.get("status", "")
                         if status:
+                            if status not in (
+                                "idle",
+                                "launching",
+                                "running",
+                                "waiting",
+                                "failed",
+                            ):
+                                _logger.warning(
+                                    "Ignoring invalid runner session status=%r for %s",
+                                    status,
+                                    session_id,
+                                )
+                                continue
                             # Forward the runner's failure detail on a
                             # ``failed`` transition so a SETUP-phase
                             # failure (which never emits response.failed)

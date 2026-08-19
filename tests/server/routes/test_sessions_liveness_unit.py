@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 
@@ -321,12 +322,21 @@ async def test_offline_verdict_idle_cache_does_not_fail_row_running(
     assert persisted == []
 
 
-def test_status_publisher_drops_invalid_status_before_side_effects(
+def test_status_publisher_rejects_invalid_status(
     two_pod_status_cache: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from pydantic import ValidationError
+
     from omnigent.server import session_live_state
     from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions import helpers
+    from omnigent.server.schemas import SessionStatusEvent
+
+    assert (
+        frozenset(get_args(SessionStatusEvent.model_fields["status"].annotation))
+        == helpers._SESSION_STATUS_VALUES
+    )
 
     persisted: list[tuple[Any, ...]] = []
     events: list[Any] = []
@@ -340,14 +350,101 @@ def test_status_publisher_drops_invalid_status_before_side_effects(
         "session_stream",
         SimpleNamespace(publish=lambda *args: events.append(args)),
     )
-
     session_id = "invalid-status-publisher"
     with two_pod_status_cache.enter_pod("a"):
-        sessions._publish_status(session_id, "bogus")
+        with pytest.raises(ValidationError):
+            sessions._publish_status(session_id, "bogus")
         assert session_id not in two_pod_status_cache.cache
 
     assert persisted == []
     assert events == []
+
+
+def test_status_publisher_accepts_launching_status(
+    two_pod_status_cache: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions
+
+    persisted: list[tuple[Any, ...]] = []
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_live_status",
+        lambda *args: persisted.append(args),
+    )
+    monkeypatch.setattr(
+        sessions,
+        "session_stream",
+        SimpleNamespace(
+            publish=lambda session_id, payload: events.append({"id": session_id, **payload})
+        ),
+    )
+
+    session_id = "launching-status-publisher"
+    with two_pod_status_cache.enter_pod("a"):
+        sessions._publish_status(session_id, "launching")
+        assert two_pod_status_cache.cache[session_id] == "launching"
+
+    assert persisted == [(session_id, "launching")]
+    assert events[0]["status"] == "launching"
+
+
+@pytest.mark.asyncio
+async def test_relay_drops_bogus_status_before_publish(
+    two_pod_status_cache: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions import orchestration
+
+    class FakeResponse:
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            del args
+
+        async def aiter_text(self) -> Any:
+            yield 'data: {"type": "session.heartbeat"}\n\n'
+            yield 'data: {"type": "session.status", "status": "bogus"}\n\n'
+            yield "data: [DONE]\n\n"
+
+    class FakeRunnerClient:
+        def stream(self, *args: Any, **kwargs: Any) -> FakeResponse:
+            del args, kwargs
+            return FakeResponse()
+
+    persisted: list[tuple[Any, ...]] = []
+    events: list[Any] = []
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_live_status",
+        lambda *args: persisted.append(args),
+    )
+    monkeypatch.setattr(
+        sessions,
+        "session_stream",
+        SimpleNamespace(publish=lambda *args: events.append(args)),
+    )
+    caplog.set_level(logging.WARNING, logger="omnigent.server.routes.sessions")
+    session_id = "relay-bogus-status"
+
+    with two_pod_status_cache.enter_pod("b"):
+        await orchestration._relay_runner_stream(
+            session_id,
+            FakeRunnerClient(),  # type: ignore[arg-type]
+            SimpleNamespace(),  # type: ignore[arg-type]
+        )
+        assert session_id not in two_pod_status_cache.cache
+        assert two_pod_status_cache.cache == {}
+
+    assert persisted == []
+    assert events == []
+    assert "Ignoring invalid runner session status='bogus'" in caplog.text
 
 
 @pytest.mark.asyncio

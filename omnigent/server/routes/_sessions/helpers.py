@@ -26,7 +26,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 
 import httpx
 from fastapi import (
@@ -280,6 +280,8 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+
+_SESSION_STATUS_VALUES = frozenset(get_args(SessionStatusEvent.model_fields["status"].annotation))
 
 
 def _codex_plan_mode_enabled(mode: str) -> bool:
@@ -3710,8 +3712,8 @@ def _publish_status(
     update the cache the list endpoint reads.
 
     ``status`` must be one of the literals on
-    :class:`SessionStatusEvent` (``idle`` / ``running`` / ``waiting``
-    / ``failed``); other values fail Pydantic validation rather than
+    :class:`SessionStatusEvent` (``idle`` / ``launching`` / ``running`` /
+    ``waiting`` / ``failed``); other values fail Pydantic validation rather than
     silently shipping a non-conforming wire shape (rule 15).
 
     Every publish site funnels through here so the in-memory
@@ -3732,9 +3734,22 @@ def _publish_status(
     :param response_id: Optional response id for terminal-backed status
         edges, e.g. ``"codex_turn_abc123"``.
     """
-    if status not in ("idle", "running", "waiting", "failed"):
-        _logger.warning("Ignoring invalid session status=%r for %s", status, session_id)
-        return
+    # Validate before any cache, durable-mirror, or stream side effect. The
+    # schema is the single source of truth for accepted status values.
+    event_kwargs = {
+        "type": "session.status",
+        "conversation_id": session_id,
+        "status": status,
+        "response_id": response_id,
+        "error": error,
+        "background_task_count": background_task_count,
+        "blocked_on": blocked_on,
+    }
+    if status not in _SESSION_STATUS_VALUES:
+        # Keep the internal API loud while deriving accepted values from the
+        # schema; this call raises before any cache or persistence side effect.
+        SessionStatusEvent(**event_kwargs)  # type: ignore[arg-type]
+    event = SessionStatusEvent(**event_kwargs)  # type: ignore[arg-type]
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
     # follow-on quiescence signal. This matters for claude-native: the
@@ -3799,15 +3814,6 @@ def _publish_status(
             _session_background_task_count_cache.pop(session_id, None)
     elif status in ("running", "failed"):
         _session_background_task_count_cache.pop(session_id, None)
-    event = SessionStatusEvent(
-        type="session.status",
-        conversation_id=session_id,
-        status=status,  # type: ignore[arg-type]
-        response_id=response_id,
-        error=error,
-        background_task_count=background_task_count,
-        blocked_on=blocked_on,
-    )
     payload = event.model_dump()
     if response_id is None:
         payload.pop("response_id", None)
