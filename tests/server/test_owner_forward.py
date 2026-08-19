@@ -131,6 +131,25 @@ async def test_owner_path_does_not_take_an_extra_hop() -> None:
 
 
 @pytest.mark.anyio
+async def test_wrong_replica_without_owner_is_not_forwarded() -> None:
+    """A re-addressable error without a durable owner cannot be replayed."""
+
+    async def owner(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected forward to {request.url}")
+
+    body = b'{"error":{"code":"wrong_replica","message":"retry"}}'
+    async with httpx.AsyncClient(transport=httpx.MockTransport(owner)) as client:
+        middleware = OwnerForwardMiddleware(
+            _wrong_replica_app(OWNER),
+            pod_addr=LOCAL,
+            client=client,
+        )
+        assert not middleware._can_forward(
+            {"type": "http", "state": {}}, body, body_replayable=True
+        )
+
+
+@pytest.mark.anyio
 async def test_forward_replays_request_and_pipes_owner_response() -> None:
     seen: dict[str, object] = {}
 

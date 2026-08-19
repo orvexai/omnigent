@@ -7,6 +7,7 @@ import contextlib
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import partial
+from typing import cast
 
 import httpx
 import pytest
@@ -29,7 +30,13 @@ from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
-from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.runner_tunnel import (
+    PING_INTERVAL_S,
+    PING_MISS_THRESHOLD,
+    create_runner_tunnel_router,
+)
+from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+from omnigent.stores.runner_tunnel_store import RunnerTunnelStore
 from tests.runner.helpers import NullServerClient
 
 pytestmark = pytest.mark.asyncio
@@ -125,6 +132,8 @@ def _tunnel_route_app(
     allowed_tunnel_tokens: frozenset[str] | None = None,
     auth_provider: AuthProvider | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
+    runner_tunnel_store: RunnerTunnelStore | None = None,
+    pod_addr: str | None = None,
 ) -> TunnelRouteApp:
     """Create a minimal app containing only the runner tunnel route.
 
@@ -136,6 +145,9 @@ def _tunnel_route_app(
     :param resolve_managed_runner_owner: Optional ``runner_id -> owner``
         resolver for server-managed sandbox runners (binding-token auth,
         no user session). ``None`` disables the managed-runner lookup.
+    :param runner_tunnel_store: Optional durable ownership store used by the
+        ping-loop heartbeat test.
+    :param pod_addr: Optional pod address paired with ``runner_tunnel_store``.
     :returns: The FastAPI app and registry owned by its route.
     """
     registry = TunnelRegistry()
@@ -147,6 +159,8 @@ def _tunnel_route_app(
             allowed_tunnel_tokens=allowed_tunnel_tokens,
             auth_provider=auth_provider,
             resolve_managed_runner_owner=resolve_managed_runner_owner,
+            runner_tunnel_store=runner_tunnel_store,
+            pod_addr=pod_addr,
         ),
         prefix="/v1",
     )
@@ -1210,28 +1224,49 @@ async def test_ping_loop_restamps_runner_liveness(
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
 
     touches: list[list[str]] = []
+    heartbeats: list[tuple[str, str | None]] = []
 
     class _RecordingStore:
         def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
             del now
             touches.append(runner_ids)
 
-    session_live_state.configure(_RecordingStore())  # type: ignore[arg-type]
-    route_app = _tunnel_route_app()
+        def claim(self, runner_id: str, owner_addr: str | None) -> None:
+            del runner_id, owner_addr
+
+        def heartbeat(self, runner_id: str, owner_addr: str | None) -> None:
+            heartbeats.append((runner_id, owner_addr))
+
+        def release(self, runner_id: str, owner_addr: str | None) -> None:
+            del runner_id, owner_addr
+
+    ownership_store = _RecordingStore()
+    session_live_state.configure(ownership_store)  # type: ignore[arg-type]
+    route_app = _tunnel_route_app(
+        runner_tunnel_store=cast(RunnerTunnelStore, ownership_store),
+        pod_addr="10.20.30.41:8000",
+    )
     communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
     try:
         await _send_hello(communicator, route_app.registry)
-        # The loop should re-stamp within a couple of shortened intervals.
-        # A recorded touch means the executor already applied the write
-        # (the recording store appends inside the store call), so the poll
-        # loop breaking is itself the completion signal — no drain needed.
+        # Both independent workers should record their writes within a couple
+        # of shortened intervals; wait for both before asserting either one.
         deadline = asyncio.get_event_loop().time() + 2.0
-        while not touches and asyncio.get_event_loop().time() < deadline:
+        while (not touches or not heartbeats) and asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(0.02)
         assert touches, "ping loop never re-stamped runner liveness"
         assert all(ids == [_RUNNER_ID] for ids in touches)
+        assert heartbeats
+        assert all(heartbeat == (_RUNNER_ID, "10.20.30.41:8000") for heartbeat in heartbeats)
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
             await communicator.wait(timeout=1.0)
         session_live_state.configure(None)
+
+
+async def test_runner_liveness_budget_covers_ping_miss_window() -> None:
+    """The lease TTL must cover one full ping miss budget."""
+    # This protects the cadence/TTL invariant, not the owner() gate itself;
+    # reverting that gate should leave this independent budget check passing.
+    assert RUNNER_LIVENESS_TTL_S >= PING_INTERVAL_S * PING_MISS_THRESHOLD

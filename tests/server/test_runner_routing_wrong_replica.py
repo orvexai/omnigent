@@ -1,7 +1,34 @@
 """Tests for WRONG_REPLICA classification in RunnerRouter._runner_absent_code."""
 
-from omnigent.errors import ErrorCode
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy import update
+from sqlalchemy.orm import Session
+
+from omnigent.db.db_models import SqlRunnerTunnel
+from omnigent.db.utils import get_or_create_engine, now_epoch
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.routing import RunnerRouter
+from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+from omnigent.stores.host_store import HostStore
+
+LOCAL = "10.20.30.41:8000"
+REMOTE = "10.20.30.40:8000"
+
+
+def _set_runner_updated_at(db_uri: str, runner_id: str, value: int) -> None:
+    """Force a durable runner lease timestamp for routing classification."""
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        session.execute(
+            update(SqlRunnerTunnel)
+            .where(SqlRunnerTunnel.runner_id == runner_id)
+            .values(updated_at=value)
+        )
+        session.commit()
 
 
 class MockHostRegistry:
@@ -33,6 +60,13 @@ class MockTunnelRegistry:
 
 class MockConversationStore:
     """Mock conversation store."""
+
+    def __init__(self, conversation=None):
+        self.conversation = conversation
+
+    def get_conversation(self, conversation_id):
+        del conversation_id
+        return self.conversation
 
 
 def test_runner_absent_code_no_host_id_returns_runner_unavailable():
@@ -116,3 +150,90 @@ def test_runner_absent_code_no_store_registry_only_returns_wrong_replica():
     code = router._runner_absent_code("host_789")
     # Without store, absence locally is treated as wrong replica (could be elsewhere)
     assert code == ErrorCode.WRONG_REPLICA
+
+
+def test_stale_durable_owner_is_unavailable_and_unforwardable(db_uri: str) -> None:
+    """A stale remote row cannot classify or forward a request cross-replica."""
+    runner_id = "runner_token_stale_durable_route_b0c8ab2431"
+    tunnels = HostStore(db_uri).runner_tunnel_store
+    tunnels.claim(runner_id, REMOTE)
+    _set_runner_updated_at(db_uri, runner_id, now_epoch() - RUNNER_LIVENESS_TTL_S - 1)
+    router = RunnerRouter(
+        registry=MockTunnelRegistry(),
+        conversation_store=MockConversationStore(
+            SimpleNamespace(runner_id=runner_id, host_id=None)
+        ),
+        runner_tunnel_store=tunnels,
+        pod_addr=LOCAL,
+    )
+
+    with pytest.raises(OmnigentError) as exc_info:
+        router.client_for_existing_conversation("conv-stale")
+
+    error = exc_info.value
+    assert error.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert error.owner_addr is None
+    assert error.http_status == 503
+
+
+def test_released_runner_is_unavailable_during_disconnect_grace(db_uri: str) -> None:
+    """A released tunnel stays a 503 rather than becoming a 400 re-address."""
+    runner_id = "runner_token_released_durable_route_b0c8ab2431"
+    tunnels = HostStore(db_uri).runner_tunnel_store
+    tunnels.claim(runner_id, REMOTE)
+    tunnels.release(runner_id, REMOTE)
+    router = RunnerRouter(
+        registry=MockTunnelRegistry(),
+        conversation_store=MockConversationStore(
+            SimpleNamespace(runner_id=runner_id, host_id=None)
+        ),
+        runner_tunnel_store=tunnels,
+        pod_addr=LOCAL,
+    )
+
+    with pytest.raises(OmnigentError) as exc_info:
+        router.client_for_existing_conversation("conv-released")
+
+    error = exc_info.value
+    assert error.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert error.owner_addr is None
+    assert error.http_status == 503
+
+
+def test_fresh_remote_durable_owner_is_wrong_replica(db_uri: str) -> None:
+    """A fresh remote row remains eligible for re-addressing."""
+    runner_id = "runner_token_fresh_durable_route_b0c8ab2431"
+    tunnels = HostStore(db_uri).runner_tunnel_store
+    tunnels.claim(runner_id, REMOTE)
+    router = RunnerRouter(
+        registry=MockTunnelRegistry(),
+        conversation_store=MockConversationStore(
+            SimpleNamespace(runner_id=runner_id, host_id=None)
+        ),
+        runner_tunnel_store=tunnels,
+        pod_addr=LOCAL,
+    )
+
+    with pytest.raises(OmnigentError) as exc_info:
+        router.client_for_existing_conversation("conv-fresh")
+
+    error = exc_info.value
+    assert error.code == ErrorCode.WRONG_REPLICA
+    assert error.owner_addr == REMOTE
+
+
+def test_single_replica_skips_durable_owner_read() -> None:
+    """Without a pod address, the single-replica path remains inert."""
+
+    class _ExplodingStore:
+        def owner(self, runner_id: str) -> str | None:
+            raise AssertionError(f"unexpected ownership read for {runner_id}")
+
+    router = RunnerRouter(
+        registry=MockTunnelRegistry(),
+        conversation_store=MockConversationStore(),
+        runner_tunnel_store=_ExplodingStore(),  # type: ignore[arg-type]
+        pod_addr=None,
+    )
+
+    assert router.runner_owner_addr("runner-single-replica") is None
