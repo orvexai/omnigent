@@ -283,6 +283,14 @@ from omnigent.stores.permission_store import PermissionStore
 
 _SESSION_STATUS_VALUES = frozenset(get_args(SessionStatusEvent.model_fields["status"].annotation))
 
+_SERVER_RESERVED_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUES = frozenset(
+    {
+        _ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+        _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+        _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+    }
+)
+
 
 def _codex_plan_mode_enabled(mode: str) -> bool:
     """
@@ -8254,6 +8262,13 @@ def _reject_server_reserved_label_seed(
     """
     if not labels:
         return
+    wrapper_value = labels.get("omnigent.wrapper")
+    if wrapper_value in _SERVER_RESERVED_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUES:
+        raise OmnigentError(
+            "label 'omnigent.wrapper' with a native sub-agent value is "
+            "server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     if _TURN_ACTOR_LABEL in labels:
         raise OmnigentError(
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",

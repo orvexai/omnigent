@@ -42,9 +42,16 @@ UI_MODE_TERMINAL_VALUE = "terminal"
 # here are a server-side contract break.
 CLAUDE_NATIVE_WRAPPER_VALUE = "claude-code-native-ui"
 
+# Value stamped on a Claude-native sub-agent child conversation. This is
+# server-owned metadata, distinct from the parent wrapper value above.
+CLAUDE_NATIVE_SUBAGENT_WRAPPER_VALUE = "claude-code-native-ui-subagent"
+
 # Value the ``omnigent codex`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 CODEX_NATIVE_WRAPPER_VALUE = "codex-native-ui"
+
+# Value stamped on a Codex-native sub-agent child conversation.
+CODEX_NATIVE_SUBAGENT_WRAPPER_VALUE = "codex-native-ui-subagent"
 
 # Value the ``omnigent pi`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
@@ -69,6 +76,9 @@ GOOSE_NATIVE_WRAPPER_VALUE = "goose-native-ui"
 # Value the ``omnigent antigravity`` native (agy TUI) wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 ANTIGRAVITY_NATIVE_WRAPPER_VALUE = "antigravity-native-ui"
+
+# Value stamped on an Antigravity-native sub-agent child conversation.
+ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE = "antigravity-native-ui-subagent"
 
 # Value the ``omnigent qwen`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.

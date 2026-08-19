@@ -913,6 +913,9 @@ async def test_external_subagent_start_mints_child_session(
     child = matching[0]
     assert child["parent_session_id"] == parent["id"]
     assert child["kind"] == "sub_agent"
+    # Golden wire value: the runner uses this label to recognize the
+    # harness-owned, in-band result path.
+    assert child["labels"]["omnigent.wrapper"] == "claude-code-native-ui-subagent"
     # Title format mirrors omnigent-spawned children (``tool:name``).
     # The session_name half encodes ``subagent_id`` so two children
     # with the same agent_type + description don't collide on the
@@ -923,6 +926,36 @@ async def test_external_subagent_start_mints_child_session(
     # Description is preserved on the row's labels for surfaces that
     # want it; the rail's row UI ignores ``session_name``.
     assert child["labels"]["omnigent.claude_native.description"] == "Trace the auth flow"
+
+
+async def test_client_cannot_seed_native_subagent_wrapper_values(
+    client: httpx.AsyncClient,
+) -> None:
+    """Reserve sub-agent wrapper values without reserving the wrapper key."""
+    agent = await create_test_agent(client)
+    forbidden = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "labels": {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+        },
+    )
+    assert forbidden.status_code == 400, forbidden.text
+
+    allowed = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+        },
+    )
+    assert allowed.status_code == 201, allowed.text
+
+    forbidden_patch = await client.patch(
+        f"/v1/sessions/{allowed.json()['id']}",
+        json={"labels": {"omnigent.wrapper": "codex-native-ui-subagent"}},
+    )
+    assert forbidden_patch.status_code == 400, forbidden_patch.text
 
 
 async def test_external_subagent_start_handles_duplicate_agent_type_and_description(
@@ -3828,18 +3861,33 @@ def _install_claude_native_idle_deferral_cache(
     return test_cache
 
 
+_RESERVED_SUBAGENT_WRAPPERS = frozenset(
+    {
+        "antigravity-native-ui-subagent",
+        "claude-code-native-ui-subagent",
+        "codex-native-ui-subagent",
+    }
+)
+
+
 async def _create_external_status_forwarding_context(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     *,
     wrapper: str,
+    db_uri: str,
     top_level: bool = False,
 ) -> tuple[httpx.AsyncClient, list[dict[str, Any]], dict[str, Any]]:
     """Create a session and capture its external status runner forwards.
 
+    A native sub-agent wrapper value is server-internal: the create route
+    rejects it as a client seed, so it is stamped through the store after
+    creation, which is where production writes it.
+
     :param client: The test HTTP client.
     :param monkeypatch: Test monkeypatch manager.
     :param wrapper: Wrapper label to put on the session.
+    :param db_uri: Database URI, used to stamp server-internal labels.
     :param top_level: Whether to create a default session instead of a child.
     :returns: Fake runner, captured request bodies, and the session JSON.
     """
@@ -3865,11 +3913,13 @@ async def _create_external_status_forwarding_context(
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
     agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+    server_internal = wrapper in _RESERVED_SUBAGENT_WRAPPERS
     payload: dict[str, Any] = {
         "agent_id": agent["id"],
         "title": "worker:native",
-        "labels": {"omnigent.wrapper": wrapper},
     }
+    if not server_internal:
+        payload["labels"] = {"omnigent.wrapper": wrapper}
     if not top_level:
         parent = await _create_session(client, agent["id"])
         payload.update(
@@ -3880,19 +3930,24 @@ async def _create_external_status_forwarding_context(
         )
     child_resp = await client.post("/v1/sessions", json=payload)
     assert child_resp.status_code == 201, child_resp.text
+    child = child_resp.json()
+    if server_internal:
+        SqlAlchemyConversationStore(db_uri).set_labels(child["id"], {"omnigent.wrapper": wrapper})
     forwarded.clear()
-    return fake_runner, forwarded, child_resp.json()
+    return fake_runner, forwarded, child
 
 
 async def test_claude_native_subagent_idle_retries_after_assistant_item(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """A retried idle edge carries text mirrored after the first rejection."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui",
+        db_uri=db_uri,
     )
     status_payload = {
         "type": "external_session_status",
@@ -3941,12 +3996,14 @@ async def test_claude_native_subagent_idle_retries_after_assistant_item(
 async def test_claude_native_subagent_idle_deferral_is_bounded(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """An empty child eventually forwards after the deferral budget."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui-subagent",
+        db_uri=db_uri,
     )
     status_payload = {
         "type": "external_session_status",
@@ -3983,6 +4040,7 @@ async def test_claude_native_subagent_idle_capacity_pressure_fails_open(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    db_uri: str,
 ) -> None:
     """A full deferral cache forwards without evicting live state and warns once."""
     import logging
@@ -3996,6 +4054,7 @@ async def test_claude_native_subagent_idle_capacity_pressure_fails_open(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui-subagent",
+        db_uri=db_uri,
     )
     active_key = "active-session"
     _claude_native_subagent_idle_deferrals[active_key] = 1
@@ -4062,6 +4121,7 @@ async def test_claude_native_subagent_idle_capacity_pressure_fails_open(
 async def test_claude_native_subagent_idle_deferral_survives_supported_stall(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """The deferral budget survives the supported worst-case retry gap."""
     from omnigent.server.routes._sessions.common import (
@@ -4082,6 +4142,7 @@ async def test_claude_native_subagent_idle_deferral_survives_supported_stall(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui-subagent",
+        db_uri=db_uri,
     )
     status_payload = {
         "type": "external_session_status",
@@ -4113,6 +4174,7 @@ async def test_claude_native_subagent_idle_deferral_survives_supported_stall(
 async def test_claude_native_subagent_idle_deferral_restarts_after_ttl_expiry(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """An expired budget restarts but still forwards after bounded retries."""
     clock = _FakeClock()
@@ -4121,6 +4183,7 @@ async def test_claude_native_subagent_idle_deferral_restarts_after_ttl_expiry(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui-subagent",
+        db_uri=db_uri,
     )
     status_payload = {
         "type": "external_session_status",
@@ -4153,12 +4216,14 @@ async def test_claude_native_subagent_idle_deferral_restarts_after_ttl_expiry(
 async def test_claude_native_subagent_idle_deferral_rearms_for_next_turn(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """A completed empty turn gives the next empty turn its own budget."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui-subagent",
+        db_uri=db_uri,
     )
     try:
         responses = []
@@ -4197,6 +4262,7 @@ async def test_claude_native_subagent_idle_deferral_rearms_for_next_turn(
 async def test_top_level_claude_native_idle_without_assistant_text_forwards(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """Top-level Claude-native idle edges do not use sub-agent deferral."""
     fake_runner, forwarded, session = await _create_external_status_forwarding_context(
@@ -4204,6 +4270,7 @@ async def test_top_level_claude_native_idle_without_assistant_text_forwards(
         monkeypatch,
         wrapper="claude-code-native-ui",
         top_level=True,
+        db_uri=db_uri,
     )
     try:
         status_resp = await client.post(
@@ -4220,12 +4287,14 @@ async def test_top_level_claude_native_idle_without_assistant_text_forwards(
 async def test_codex_native_subagent_idle_without_assistant_text_forwards(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """Codex-native child idle edges remain immediate and empty when needed."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="codex-native-ui-subagent",
+        db_uri=db_uri,
     )
     try:
         status_resp = await client.post(
@@ -4242,12 +4311,14 @@ async def test_codex_native_subagent_idle_without_assistant_text_forwards(
 async def test_claude_native_subagent_failed_status_is_not_deferred(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """Failed Claude-native child edges remain immediate and empty when needed."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui-subagent",
+        db_uri=db_uri,
     )
     try:
         status_resp = await client.post(
@@ -4300,12 +4371,14 @@ async def _post_mirrored_message(
 async def test_subagent_idle_turn_scope_rejects_stale_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """A new user turn prevents delivery of the previous turn's text."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui-subagent",
+        db_uri=db_uri,
     )
     try:
         await _post_mirrored_message(
@@ -4357,12 +4430,14 @@ async def test_subagent_idle_turn_scope_rejects_stale_output(
 async def test_subagent_idle_turn_scope_delivers_current_turn_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """A later assistant item resolves the current turn's deferred idle edge."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui-subagent",
+        db_uri=db_uri,
     )
     try:
         await _post_mirrored_message(
@@ -4425,12 +4500,14 @@ async def test_subagent_idle_turn_scope_delivers_current_turn_output(
 async def test_subagent_idle_turn_scope_gives_up_without_current_turn_text(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """An empty current turn eventually forwards without an output field."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui-subagent",
+        db_uri=db_uri,
     )
     try:
         await _post_mirrored_message(
@@ -4481,12 +4558,14 @@ async def test_subagent_idle_turn_scope_gives_up_without_current_turn_text(
 async def test_subagent_idle_turn_scope_ignores_interrupt_marker_boundary(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """Claude's synthesized interrupt marker does not end the turn."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui-subagent",
+        db_uri=db_uri,
     )
     try:
         await _post_mirrored_message(
@@ -4527,6 +4606,7 @@ async def test_subagent_idle_turn_scope_ignores_interrupt_marker_boundary(
 async def test_top_level_claude_native_idle_turn_scope_uses_kind_free_interrupt_gate(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """Pin the kind-free Claude-native predicate for top-level sessions."""
     fake_runner, forwarded, session = await _create_external_status_forwarding_context(
@@ -4534,6 +4614,7 @@ async def test_top_level_claude_native_idle_turn_scope_uses_kind_free_interrupt_
         monkeypatch,
         wrapper="claude-code-native-ui",
         top_level=True,
+        db_uri=db_uri,
     )
     try:
         await _post_mirrored_message(
@@ -4574,12 +4655,14 @@ async def test_top_level_claude_native_idle_turn_scope_uses_kind_free_interrupt_
 async def test_subagent_idle_turn_scope_treats_meta_interrupt_as_boundary(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """A meta interrupt-shaped user item is still a turn boundary."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui-subagent",
+        db_uri=db_uri,
     )
     try:
         await _post_mirrored_message(
@@ -4621,12 +4704,14 @@ async def test_subagent_idle_turn_scope_treats_meta_interrupt_as_boundary(
 async def test_codex_native_subagent_idle_turn_scope_drops_stale_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """A codex child does not forward an earlier turn's text."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="codex-native-ui-subagent",
+        db_uri=db_uri,
     )
     try:
         await _post_mirrored_message(
@@ -4674,6 +4759,7 @@ async def test_codex_native_subagent_idle_turn_scope_drops_stale_output(
 async def test_top_level_claude_native_idle_turn_scope_drops_stale_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """A top-level native session does not forward an earlier turn's text."""
     fake_runner, forwarded, session = await _create_external_status_forwarding_context(
@@ -4681,6 +4767,7 @@ async def test_top_level_claude_native_idle_turn_scope_drops_stale_output(
         monkeypatch,
         wrapper="claude-code-native-ui",
         top_level=True,
+        db_uri=db_uri,
     )
     try:
         await _post_mirrored_message(
@@ -4728,12 +4815,14 @@ async def test_top_level_claude_native_idle_turn_scope_drops_stale_output(
 async def test_claude_native_subagent_idle_turn_scope_rejects_meta_user_boundary(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """A meta user turn start prevents stale output delivery."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="claude-code-native-ui-subagent",
+        db_uri=db_uri,
     )
     try:
         await _post_mirrored_message(
@@ -4785,12 +4874,14 @@ async def test_claude_native_subagent_idle_turn_scope_rejects_meta_user_boundary
 async def test_codex_native_subagent_idle_turn_scope_rejects_meta_user_boundary(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """A Codex meta user turn start does not forward stale output."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="codex-native-ui-subagent",
+        db_uri=db_uri,
     )
     try:
         await _post_mirrored_message(
@@ -4839,12 +4930,14 @@ async def test_codex_native_subagent_idle_turn_scope_rejects_meta_user_boundary(
 async def test_codex_native_subagent_idle_turn_scope_treats_interrupt_text_as_boundary(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """A Codex user's interrupt-shaped message starts a new turn."""
     fake_runner, forwarded, child = await _create_external_status_forwarding_context(
         client,
         monkeypatch,
         wrapper="codex-native-ui-subagent",
+        db_uri=db_uri,
     )
     try:
         await _post_mirrored_message(
