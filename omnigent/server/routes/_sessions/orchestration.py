@@ -338,6 +338,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
+    NameAlreadyExistsError,
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
@@ -8032,11 +8033,11 @@ async def _create_session_from_existing_agent(
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
         )
-    except Exception:
+    except Exception as create_exc:
         # Broad catch is intentional: ANY create_conversation failure
         # (integrity error, name clash, ...) must trigger orphan-worktree
-        # cleanup before the error propagates. We re-raise unchanged
-        # below, so nothing is swallowed. Gate on created_worktree_path,
+        # cleanup before the error propagates. We re-raise below, so
+        # nothing is swallowed. Gate on created_worktree_path,
         # NOT git_branch: only a worktree Omnigent created here may be
         # force-removed. An existing worktree bound via workspace_branch
         # also sets git_branch but is the user's — never destroy it.
@@ -8053,6 +8054,15 @@ async def _create_session_from_existing_agent(
                 request=request,
                 reason="create-rollback",
             )
+        if isinstance(create_exc, NameAlreadyExistsError):
+            # A sibling already holds this title under the same parent.
+            # Without this the store's typed error reaches FastAPI as an
+            # unhandled exception and the caller sees an opaque 500.
+            raise OmnigentError(
+                f"a session titled {body.title!r} already exists under parent "
+                f"{body.parent_session_id!r}; close it or use a different title",
+                code=ErrorCode.ALREADY_EXISTS,
+            ) from create_exc
         raise
 
     # The create request has no conv id in its URL, so the path-based
