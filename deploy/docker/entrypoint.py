@@ -25,6 +25,17 @@ Configuration is via environment variables:
                         ``postgres://...``) and the explicit psycopg3
                         form (``postgresql+psycopg://...``) are accepted;
                         the prefix is normalized automatically.
+  MIGRATION_DATABASE_URL Optional direct PostgreSQL URL for Alembic; defaults
+                        to the resolved application database URL.
+  OMNIGENT_RUN_MIGRATIONS_ON_BOOT
+                        Defaults to ``1``. Set to ``0`` to verify the schema
+                        without upgrading it.
+  OMNIGENT_DB_DISABLE_PREPARED_STATEMENTS
+                        Defaults to ``0``. Set to ``1`` for transaction pools.
+  OMNIGENT_MIGRATION_LOCK_TIMEOUT_SECONDS
+                        Defaults to ``600`` seconds for the advisory-lock wait.
+  OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S
+                        Defaults to ``20`` seconds for the bounded drain.
   ARTIFACT_DIR          Directory for the local artifact store.
                         Defaults to ``/data/artifacts`` (the volume
                         mount point used by docker-compose).
@@ -34,6 +45,7 @@ Configuration is via environment variables:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 import traceback
@@ -59,6 +71,8 @@ _DEFAULT_HOST = "0.0.0.0"
 # decoupled from the CLI's local-server default (6767 in host/local_server.py).
 _DEFAULT_PORT = "8000"
 _DEFAULT_ARTIFACT_DIR = "/data/artifacts"
+_DEFAULT_SERVER_SHUTDOWN_TIMEOUT_S = 20
+_SERVER_SHUTDOWN_TIMEOUT_ENV = "OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S"
 
 
 @dataclass(frozen=True)
@@ -100,15 +114,42 @@ def run_migrations(database_url: str) -> None:
     runs before any store boots. Creates a throwaway engine, upgrades,
     and disposes it.
     """
-    import sqlalchemy
+    from omnigent.db.utils import (
+        _create_engine,
+        _resolve_migration_database_url,
+    )
+    from omnigent.db.utils import (
+        _run_migrations as _run_alembic_upgrade,
+    )
 
-    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
-
-    migration_engine = sqlalchemy.create_engine(database_url)
+    migration_database_url = _resolve_migration_database_url(database_url)
+    migration_engine = _create_engine(migration_database_url)
     try:
-        _run_alembic_upgrade(migration_engine, database_url)
+        _run_alembic_upgrade(migration_engine, migration_database_url)
     finally:
         migration_engine.dispose()
+
+
+def _run_migrations_on_boot() -> bool:
+    """Return whether the Docker server should upgrade its schema at boot."""
+    raw_value = os.environ.get("OMNIGENT_RUN_MIGRATIONS_ON_BOOT")
+    return raw_value is None or raw_value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _server_shutdown_timeout() -> float:
+    """Resolve the positive Uvicorn shutdown timeout for the container."""
+    from omnigent.cli import _parse_shutdown_timeout
+
+    raw_value = os.environ.get(
+        _SERVER_SHUTDOWN_TIMEOUT_ENV,
+        str(_DEFAULT_SERVER_SHUTDOWN_TIMEOUT_S),
+    )
+    try:
+        return _parse_shutdown_timeout(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{_SERVER_SHUTDOWN_TIMEOUT_ENV} must be a positive number, got {raw_value!r}"
+        ) from exc
 
 
 def _resolve_database_url(cfg: dict[str, Any]) -> str:
@@ -453,7 +494,12 @@ def main() -> None:
         # ── Migrations ───────────────────────────────────────────
         # Alembic upgrade runs before the stores boot — the SQLAlchemy
         # stores refuse to start on a stale schema.
-        run_migrations(resolved_config.database_url)
+        if _run_migrations_on_boot():
+            run_migrations(resolved_config.database_url)
+        else:
+            logger.info(
+                "Skipping database migrations at boot; schema verification remains enabled."
+            )
 
         resolved = build_app(resolved_config)
 
@@ -461,15 +507,25 @@ def main() -> None:
 
         from omnigent.runner.transports.ws_tunnel.limits import (
             RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+            TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+            TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
         )
 
         logger.info("Starting omnigent server on %s:%d", resolved.host, resolved.port)
+        # Let Uvicorn close SSE as a transport drop so clients reconnect; do
+        # not emit session_stream's _DONE sentinel, which means deliberate close.
         uvicorn.run(
             resolved.app,
             host=resolved.host,
             port=resolved.port,
             ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+            ws_ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+            ws_ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+            timeout_graceful_shutdown=math.ceil(_server_shutdown_timeout()),
         )
+    except TimeoutError:
+        logger.error("FATAL: migration advisory lock timed out:\n%s", traceback.format_exc())
+        sys.exit(1)
     except Exception:  # noqa: BLE001 — startup catch-all so failures land in logs
         logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())
         # Keep the process alive briefly so the container log capture has time
@@ -496,16 +552,17 @@ def migrate_only() -> int:
         from omnigent.server.server_config import load_server_config
 
         database_url = _resolve_database_url(load_server_config())
-        import sqlalchemy
+        from omnigent.db.utils import _create_engine, _resolve_migration_database_url
 
-        migration_engine = sqlalchemy.create_engine(database_url)
+        migration_database_url = _resolve_migration_database_url(database_url)
+        migration_engine = _create_engine(migration_database_url)
         current = _get_current_db_revision(migration_engine)
-        head = _get_head_db_revision(database_url)
+        head = _get_head_db_revision(migration_database_url)
         if current == head:
             logger.info("Database schema already at head (%s)", head)
         else:
             logger.info("Migrating database schema: %s → %s", current or "<empty>", head)
-        _run_migrations(migration_engine, database_url)
+        _run_migrations(migration_engine, migration_database_url)
         return 0
     except Exception:  # noqa: BLE001 — a Job must fail promptly without retry sleep
         logger.error("Database migration failed:\n%s", traceback.format_exc())

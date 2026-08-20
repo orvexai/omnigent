@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import secrets
 import shutil
@@ -633,6 +634,7 @@ _DAEMON_RECONNECT_GRACE_S = 5.0
 # bringing its tunnel up. Avoids racing/thrashing sibling invocations.
 _DAEMON_REUSE_MIN_AGE_S = 6.0
 
+
 # How long uvicorn waits for active connections (WebSocket, SSE) after
 # SIGTERM before force-closing them.  SSE streams signal themselves via
 # session_stream.shutdown_all() in _ShutdownSignalingServer.shutdown(),
@@ -640,9 +642,21 @@ _DAEMON_REUSE_MIN_AGE_S = 6.0
 # that need a moment to drain.  5 s is enough for a clean tunnel teardown
 # while keeping Ctrl-C feeling instant.
 # Overridable via OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S for deployments that
-# need a longer drain window (e.g. large file uploads).
-_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S_DEFAULT = 5
-_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S = int(
+# need a longer drain window (e.g. large file uploads). Uvicorn requires whole
+# seconds, so both call sites round up to avoid shortening a fractional drain.
+def _parse_shutdown_timeout(raw_value: str) -> float:
+    """Parse the shared positive shutdown timeout setting."""
+    try:
+        timeout = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"shutdown timeout must be a positive number, got {raw_value!r}") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"shutdown timeout must be a positive number, got {raw_value!r}")
+    return timeout
+
+
+_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S_DEFAULT = 5.0
+_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S = _parse_shutdown_timeout(
     os.environ.get(
         "OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S",
         str(_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S_DEFAULT),
@@ -4069,7 +4083,7 @@ def server(
         # budget (issue #1116).
         ws_ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
         ws_ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-        timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        timeout_graceful_shutdown=math.ceil(_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S),
     )
     try:
         _ShutdownSignalingServer(_config).run()

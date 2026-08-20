@@ -12,10 +12,13 @@ blow up if called during import).
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NoReturn
 
 import pytest
@@ -216,6 +219,155 @@ def test_migrate_only_failure_returns_promptly(
     started = time.monotonic()
     assert entrypoint.migrate_only() == 1
     assert time.monotonic() - started < 2
+
+
+def test_main_exits_nonzero_when_migration_lock_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deploy.docker.entrypoint as entrypoint
+
+    monkeypatch.setattr(
+        entrypoint,
+        "_resolve_config",
+        lambda: SimpleNamespace(database_url="postgresql+psycopg://user:pass@db/omnigent"),
+    )
+    monkeypatch.setattr(
+        entrypoint,
+        "run_migrations",
+        lambda _database_url: (_ for _ in ()).throw(TimeoutError("lock timeout")),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        entrypoint.main()
+
+    assert exc_info.value.code == 1
+
+
+@pytest.mark.parametrize(
+    ("boot_flag", "migration_calls"),
+    [(None, 1), ("0", 0)],
+)
+def test_main_configures_bounded_reconnect_drain(
+    monkeypatch: pytest.MonkeyPatch,
+    boot_flag: str | None,
+    migration_calls: int,
+) -> None:
+    """Docker boot bounds shutdown and leaves SSE as a reconnecting drop."""
+    import uvicorn
+
+    import deploy.docker.entrypoint as entrypoint
+
+    if boot_flag is None:
+        monkeypatch.delenv("OMNIGENT_RUN_MIGRATIONS_ON_BOOT", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_RUN_MIGRATIONS_ON_BOOT", boot_flag)
+    monkeypatch.delenv("OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S", raising=False)
+    config = SimpleNamespace(database_url="postgresql+psycopg://user:pass@db/omnigent")
+    migration_seen: list[object] = []
+    uvicorn_kwargs: dict[str, object] = {}
+
+    monkeypatch.setattr(entrypoint, "_resolve_config", lambda: config)
+    monkeypatch.setattr(
+        entrypoint,
+        "run_migrations",
+        lambda database_url: migration_seen.append(database_url),
+    )
+    monkeypatch.setattr(
+        entrypoint,
+        "build_app",
+        lambda _config: entrypoint._BuiltApp(app=object(), host="127.0.0.1", port=8000),
+    )
+    monkeypatch.setattr(
+        uvicorn,
+        "run",
+        lambda _app, **kwargs: uvicorn_kwargs.update(kwargs),
+    )
+
+    entrypoint.main()
+
+    assert len(migration_seen) == migration_calls
+    source = inspect.getsource(entrypoint)
+    assert "shutdown_all" not in source
+    assert "[DONE]" not in source
+    assert uvicorn_kwargs["timeout_graceful_shutdown"] == 20
+    assert uvicorn_kwargs["ws_ping_interval"] == 30.0
+    assert uvicorn_kwargs["ws_ping_timeout"] == 90.0
+
+
+def test_main_allows_shutdown_timeout_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    import uvicorn
+
+    import deploy.docker.entrypoint as entrypoint
+
+    monkeypatch.setenv("OMNIGENT_RUN_MIGRATIONS_ON_BOOT", "0")
+    monkeypatch.setenv("OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S", "7.5")
+    monkeypatch.setattr(
+        entrypoint,
+        "_resolve_config",
+        lambda: SimpleNamespace(database_url="postgresql+psycopg://user:pass@db/omnigent"),
+    )
+    monkeypatch.setattr(
+        entrypoint,
+        "build_app",
+        lambda _config: entrypoint._BuiltApp(app=object(), host="127.0.0.1", port=8000),
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(uvicorn, "run", lambda _app, **kwargs: captured.update(kwargs))
+
+    entrypoint.main()
+
+    assert captured["timeout_graceful_shutdown"] == 8
+
+
+def test_fractional_shutdown_timeout_allows_cli_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = os.environ.copy()
+    env["OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S"] = "7.5"
+    result = subprocess.run(
+        [sys.executable, "-c", "import omnigent.cli"],
+        cwd=Path(__file__).parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_migrate_only_uses_direct_migration_database_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deploy.docker.entrypoint as entrypoint
+    from omnigent.db import utils
+
+    class _Engine:
+        def dispose(self) -> None:
+            pass
+
+    created: list[str] = []
+    migrated: list[tuple[object, str]] = []
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@pooler/omnigent")
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", "postgres://user:pass@direct/omnigent")
+    monkeypatch.setattr(entrypoint, "_resolve_database_url", lambda _cfg: "pooler")
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        dict,
+    )
+    monkeypatch.setattr(utils, "_create_engine", lambda url: created.append(url) or _Engine())
+    monkeypatch.setattr(utils, "_get_current_db_revision", lambda _engine: None)
+    monkeypatch.setattr(utils, "_get_head_db_revision", lambda _url: "head")
+    monkeypatch.setattr(
+        utils,
+        "_run_migrations",
+        lambda engine, url: migrated.append((engine, url)),
+    )
+
+    assert entrypoint.migrate_only() == 0
+    expected = "postgresql+psycopg://user:pass@direct/omnigent"
+    assert created == [expected]
+    assert migrated == [(migrated[0][0], expected)]
 
 
 @pytest.mark.parametrize(

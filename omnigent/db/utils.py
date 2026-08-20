@@ -1,4 +1,12 @@
-"""Database utilities — engine caching, session management, helpers."""
+"""Database utilities — engine caching, session management, helpers.
+
+``MIGRATION_DATABASE_URL`` selects the direct database endpoint used for
+Alembic work and defaults to the caller's database URL. ``OMNIGENT_RUN_MIGRATIONS_ON_BOOT=0``
+disables automatic upgrades while retaining the head-revision check.
+``OMNIGENT_MIGRATION_LOCK_TIMEOUT_SECONDS`` bounds lock waits at 10 minutes by
+default, and ``OMNIGENT_DB_DISABLE_PREPARED_STATEMENTS=1`` disables psycopg3
+named preparation for transaction-pooling deployments.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
 
 if TYPE_CHECKING:
     from alembic.config import Config
@@ -65,9 +73,14 @@ _LAKEBASE_POOL_RECYCLE_SECONDS = 600
 _POOL_SIZE_ENV = "OMNIGENT_DB_POOL_SIZE"
 _MAX_OVERFLOW_ENV = "OMNIGENT_DB_MAX_OVERFLOW"
 _POOL_TIMEOUT_ENV = "OMNIGENT_DB_POOL_TIMEOUT_SECONDS"
+_MIGRATION_DATABASE_URL_ENV = "MIGRATION_DATABASE_URL"
+_RUN_MIGRATIONS_ON_BOOT_ENV = "OMNIGENT_RUN_MIGRATIONS_ON_BOOT"
+_MIGRATION_LOCK_TIMEOUT_ENV = "OMNIGENT_MIGRATION_LOCK_TIMEOUT_SECONDS"
+_DISABLE_PREPARED_STATEMENTS_ENV = "OMNIGENT_DB_DISABLE_PREPARED_STATEMENTS"
 _DEFAULT_POOL_SIZE = 32
 _DEFAULT_MAX_OVERFLOW = 32
 _DEFAULT_POOL_TIMEOUT_SECONDS = 10
+_DEFAULT_MIGRATION_LOCK_TIMEOUT_SECONDS = 600.0
 
 # Process-wide override, primarily for tests and for callers that want to plug
 # in their own token source (e.g. a non-default Databricks auth flow) without
@@ -98,6 +111,19 @@ def _pool_setting(
         comparison = f">= {int(minimum)}" if inclusive else f"> {minimum:g}"
         raise RuntimeError(f"{env_name} must be {comparison}, got {raw_value!r}")
     return value
+
+
+def _env_flag(env_name: str, default: bool) -> bool:
+    """Resolve a boolean environment setting with an explicit default."""
+    raw_value = os.environ.get(env_name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _run_migrations_on_boot() -> bool:
+    """Return whether boot may upgrade a database that is behind head."""
+    return _env_flag(_RUN_MIGRATIONS_ON_BOOT_ENV, True)
 
 
 def set_lakebase_token_provider(provider: LakebaseTokenProvider | None) -> None:
@@ -226,6 +252,14 @@ def normalize_database_url(url: str) -> str:
     return url
 
 
+def _resolve_migration_database_url(database_url: str) -> str:
+    """Resolve and normalize the URL reserved for schema migrations."""
+    configured_url = os.environ.get(_MIGRATION_DATABASE_URL_ENV)
+    if configured_url is None:
+        return normalize_database_url(database_url)
+    return normalize_database_url(configured_url)
+
+
 # ── Engine caching ─────────────────────────────────────
 
 _engine_cache: dict[str, Engine] = {}
@@ -317,7 +351,11 @@ def _create_engine(db_uri: str) -> Engine:
         minimum=0.0,
         inclusive=False,
     )
-    connect_args = {"connect_timeout": 3} if db_uri.startswith("postgresql") else {}
+    connect_args: dict[str, object] = (
+        {"connect_timeout": 3} if db_uri.startswith("postgresql") else {}
+    )
+    if db_uri.startswith("postgresql") and _env_flag(_DISABLE_PREPARED_STATEMENTS_ENV, False):
+        connect_args["prepare_threshold"] = None
     engine = create_engine(
         db_uri,
         connect_args=connect_args,
@@ -440,6 +478,36 @@ def _build_alembic_config(db_uri: str) -> Config:
 _MIGRATION_LOCK_KEY = 734_891_203
 
 
+def _migration_lock_timeout_seconds() -> float:
+    """Resolve the bounded wait for the PostgreSQL migration lock."""
+    return float(
+        _pool_setting(
+            _MIGRATION_LOCK_TIMEOUT_ENV,
+            _DEFAULT_MIGRATION_LOCK_TIMEOUT_SECONDS,
+            integer=False,
+            minimum=0.0,
+            inclusive=False,
+        )
+    )
+
+
+def _assert_migration_lock_backend(
+    connection: Connection,
+    expected_pid: int,
+    *,
+    phase: str,
+) -> None:
+    """Abort if a transaction pooler moved the session to another backend."""
+    observed_pid = int(connection.execute(text("SELECT pg_backend_pid()")).scalar_one())
+    if observed_pid != expected_pid:
+        raise RuntimeError(
+            "Migration advisory lock connection is not pinned: PostgreSQL backend PID "
+            f"changed from {expected_pid} to {observed_pid} {phase}. "
+            "Set MIGRATION_DATABASE_URL to a direct PostgreSQL endpoint, not a "
+            "PgBouncer transaction-pooling endpoint."
+        )
+
+
 @contextmanager
 def _migration_lock(engine: Engine) -> Iterator[None]:
     """Serialize schema changes on PostgreSQL using a dedicated connection.
@@ -453,27 +521,71 @@ def _migration_lock(engine: Engine) -> Iterator[None]:
         yield
         return
 
+    timeout_seconds = _migration_lock_timeout_seconds()
+    deadline = time.monotonic() + timeout_seconds
+    warned = False
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as lock_connection:
-        acquired = lock_connection.execute(
-            text("SELECT pg_try_advisory_lock(:lock_key)"),
-            {"lock_key": _MIGRATION_LOCK_KEY},
-        ).scalar()
-        if not acquired:
-            _logger.warning(
-                "Waiting for the migration advisory lock, held by another process "
-                "(Job or another server pod); this deploy will proceed once it releases."
+        while True:
+            row = (
+                lock_connection.execute(
+                    text(
+                        "SELECT pg_backend_pid() AS backend_pid, "
+                        "pg_try_advisory_lock(:lock_key) AS acquired"
+                    ),
+                    {"lock_key": _MIGRATION_LOCK_KEY},
+                )
+                .mappings()
+                .one()
             )
-            lock_connection.execute(
-                text("SELECT pg_advisory_lock(:lock_key)"),
-                {"lock_key": _MIGRATION_LOCK_KEY},
-            )
+            if row["acquired"]:
+                backend_pid = int(row["backend_pid"])
+                break
+
+            if not warned:
+                _logger.warning(
+                    "Waiting for the migration advisory lock, held by another process "
+                    "(Job or another server pod); this deploy will proceed once it releases."
+                )
+                warned = True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Timed out after "
+                    f"{timeout_seconds:g} seconds waiting for the migration advisory lock. "
+                    "Check for a stuck migration holder before retrying."
+                )
+            time.sleep(min(0.1, remaining))
+
+        _assert_migration_lock_backend(
+            lock_connection,
+            backend_pid,
+            phase="before schema work",
+        )
+        migration_error: BaseException | None = None
         try:
             yield
+        except BaseException as exc:
+            migration_error = exc
+            raise
         finally:
-            lock_connection.execute(
-                text("SELECT pg_advisory_unlock(:lock_key)"),
-                {"lock_key": _MIGRATION_LOCK_KEY},
-            )
+            try:
+                _assert_migration_lock_backend(
+                    lock_connection,
+                    backend_pid,
+                    phase="before unlock",
+                )
+                lock_connection.execute(
+                    text("SELECT pg_advisory_unlock(:lock_key)"),
+                    {"lock_key": _MIGRATION_LOCK_KEY},
+                )
+            except BaseException:
+                if migration_error is None:
+                    raise
+                _logger.warning(
+                    "Could not verify or release the migration advisory lock after "
+                    "the migration failed; preserving the original migration error.",
+                    exc_info=True,
+                )
 
 
 def _run_migrations(engine: Engine, db_uri: str) -> None:
@@ -501,22 +613,36 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
 
     from omnigent.db.db_models import ConversationBase, OmnigentBase
 
-    _logger.info("Running database migrations...")
-    config = _build_alembic_config(db_uri)
-    # Pass a shared connection so Alembic operates within the same
-    # engine (required for SQLite in-memory databases, and avoids
-    # creating a second connection pool). The connection is handed over
-    # outside any transaction so Alembic owns transaction demarcation:
-    # a migration with an autocommit_block (CREATE INDEX CONCURRENTLY)
-    # cannot suspend an externally-begun transaction.
-    with query_name_scope("omnigent.database.run_migrations"), _migration_lock(engine):
-        with engine.connect() as connection:
-            config.attributes["connection"] = connection
-            command.upgrade(config, "head")
-        # Keep metadata creation under the same lock: checkfirst is an
-        # inspect-then-CREATE sequence and is not safe across callers.
-        for base in (OmnigentBase, ConversationBase):
-            base.metadata.create_all(bind=engine, checkfirst=True)
+    migration_url = _resolve_migration_database_url(db_uri)
+    migration_engine = engine
+    owns_migration_engine = False
+    if migration_url != db_uri:
+        migration_engine = _create_engine(migration_url)
+        owns_migration_engine = True
+
+    try:
+        _logger.info("Running database migrations...")
+        config = _build_alembic_config(migration_url)
+        # Pass a shared connection so Alembic operates within the same
+        # engine (required for SQLite in-memory databases, and avoids
+        # creating a second connection pool). The connection is handed over
+        # outside any transaction so Alembic owns transaction demarcation:
+        # a migration with an autocommit_block (CREATE INDEX CONCURRENTLY)
+        # cannot suspend an externally-begun transaction.
+        with (
+            query_name_scope("omnigent.database.run_migrations"),
+            _migration_lock(migration_engine),
+        ):
+            with migration_engine.connect() as connection:
+                config.attributes["connection"] = connection
+                command.upgrade(config, "head")
+            # Keep metadata creation under the same lock: checkfirst is an
+            # inspect-then-CREATE sequence and is not safe across callers.
+            for base in (OmnigentBase, ConversationBase):
+                base.metadata.create_all(bind=migration_engine, checkfirst=True)
+    finally:
+        if owns_migration_engine:
+            migration_engine.dispose()
 
 
 def _get_current_db_revision(engine: Engine) -> str | None:
@@ -595,6 +721,13 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     current = _get_current_db_revision(engine)
 
     if current is None:
+        if not _run_migrations_on_boot():
+            raise RuntimeError(
+                "Omnigent database schema is not at head "
+                f"(found revision <empty>, expected {head!r}); "
+                f"{_RUN_MIGRATIONS_ON_BOOT_ENV}=0 disables automatic migration. "
+                "Run the migration job or enable boot migrations before starting the server."
+            )
         _run_migrations(engine, db_uri)
         return
 
@@ -613,6 +746,13 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
         ) from exc
 
     if current != head:
+        if not _run_migrations_on_boot():
+            raise RuntimeError(
+                "Omnigent database schema is out of date "
+                f"(found revision {current!r}, expected {head!r}); "
+                f"{_RUN_MIGRATIONS_ON_BOOT_ENV}=0 disables automatic migration. "
+                "Run the migration job or enable boot migrations before starting the server."
+            )
         _logger.warning(
             "Omnigent database schema is out of date "
             "(found revision %r, expected %r); attempting automatic migration.",

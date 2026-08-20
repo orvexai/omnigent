@@ -12,6 +12,7 @@ from alembic import command
 from sqlalchemy import create_engine
 
 from omnigent.db.utils import (
+    _DISABLE_PREPARED_STATEMENTS_ENV,
     _LAKEBASE_POOL_RECYCLE_SECONDS,
     _SERVER_POOL_RECYCLE_SECONDS,
     _build_alembic_config,
@@ -21,6 +22,7 @@ from omnigent.db.utils import (
     _initialize_or_verify_schema,
     _install_lakebase_token_refresh,
     _resolve_lakebase_token_provider,
+    _resolve_migration_database_url,
     build_search_snippet,
     builtin_agent_id,
     clear_engine_cache,
@@ -87,6 +89,30 @@ def test_non_sqlite_engine_has_pool_settings(
     assert captured_kwargs["pool_size"] == 32
     assert captured_kwargs["max_overflow"] == 32
     assert captured_kwargs["pool_timeout"] == 10
+    assert captured_kwargs["connect_args"] == {"connect_timeout": 3}
+
+
+def test_prepare_threshold_is_disabled_only_under_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, Any]] = []
+    mock_engine = MagicMock()
+
+    def _capturing_create_engine(uri: str, **kwargs: Any) -> MagicMock:
+        captured.append(kwargs)
+        return mock_engine
+
+    monkeypatch.setattr("omnigent.db.utils.create_engine", _capturing_create_engine)
+    monkeypatch.delenv(_DISABLE_PREPARED_STATEMENTS_ENV, raising=False)
+    _create_engine("postgresql://user:pass@localhost/testdb")
+    monkeypatch.setenv(_DISABLE_PREPARED_STATEMENTS_ENV, "1")
+    _create_engine("postgresql://user:pass@localhost/testdb")
+
+    assert captured[0]["connect_args"] == {"connect_timeout": 3}
+    assert captured[1]["connect_args"] == {
+        "connect_timeout": 3,
+        "prepare_threshold": None,
+    }
 
 
 def test_non_sqlite_pool_settings_are_environment_configurable(
@@ -515,6 +541,43 @@ def test_initialize_or_verify_schema_auto_migrates_when_stale(
         assert _get_current_db_revision(engine) == head
     finally:
         engine.dispose()
+
+
+def test_initialize_or_verify_schema_flag_off_refuses_stale_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabling boot upgrades still refuses to serve an old schema."""
+    db_path = tmp_path / "stale_no_boot_migration.db"
+    stale_revision = "8a4f1e9c2b07"
+    uri = _make_db_at_revision(db_path, stale_revision)
+    head = _get_head_db_revision(uri)
+    assert stale_revision != head
+    monkeypatch.setenv("OMNIGENT_RUN_MIGRATIONS_ON_BOOT", "0")
+
+    migration_calls: list[tuple[object, object]] = []
+
+    def _unexpected_migration(*args: object, **kwargs: object) -> None:
+        migration_calls.append((args, kwargs))
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _unexpected_migration)
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="OMNIGENT_RUN_MIGRATIONS_ON_BOOT=0"):
+            _initialize_or_verify_schema(engine, uri)
+    finally:
+        engine.dispose()
+
+    assert migration_calls == []
+
+
+def test_migration_database_url_defaults_to_caller_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIGRATION_DATABASE_URL", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@decoy.example/db")
+
+    assert _resolve_migration_database_url("sqlite:///caller.db") == "sqlite:///caller.db"
 
 
 def test_initialize_or_verify_schema_reports_manual_retry_when_auto_migration_fails(
