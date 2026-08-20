@@ -5,7 +5,8 @@
 #
 # Flow: push to orvexai/omnigent (web branch) -> GitHub webhook -> platform
 #       listener -> this Trigger (filters repo + branch) -> PipelineRun
-#       -> build omnigent/omnigent:web -> rollout-restart consumers.
+#       -> build omnigent/omnigent:web -> run migrations. No rollout:
+#       deploying is a deliberate digest bump in my-idp.
 #
 # No changed-path filter: the daily upstream-sync workflow pushes merge
 # commits whose file list can be large/truncated in the webhook payload, so
@@ -51,11 +52,9 @@ spec:
         taskRunTemplate:
           serviceAccountName: tekton-smoke-test-builder
         taskRunSpecs:
-          # The rollout task needs cross-namespace deployment patch rights;
-          # the build SA does not. Use the dedicated omnigent rollout SA
-          # (rollout-rbac.yaml).
-          - pipelineTaskName: rollout-restart
-            serviceAccountName: tekton-omnigent-rollout
+          # Migrations need their own SA; the build SA does not carry those
+          # rights. There is no rollout task — deploying is a deliberate
+          # digest bump in my-idp, not something a push performs.
           - pipelineTaskName: run-migrations
             serviceAccountName: tekton-omnigent-migrate
         workspaces:
