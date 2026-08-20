@@ -1114,17 +1114,17 @@ def test_normalize_path_relative_dotdot_within_cwd_is_normalized(tmp_path: Path)
 
 
 def test_create_filesystem_registry_git_workspace(tmp_path: Path) -> None:
-    """A directory with a .git subdirectory yields :class:`GitFilesystemRegistry`.
+    """A real Git worktree yields :class:`GitFilesystemRegistry`.
 
-    Failure means the factory's _find_git_root detection is broken and git
+    Failure means the factory's Git worktree detection is broken and git
     workspaces would fall back to the plain agent-edit registry, losing
     git-backed baseline support.
     """
-    (tmp_path / ".git").mkdir()
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
     registry = create_filesystem_registry(tmp_path)
     assert isinstance(registry, GitFilesystemRegistry), (
         f"Expected GitFilesystemRegistry for a git workspace, got {type(registry).__name__}. "
-        "The factory's _find_git_root detection may be broken."
+        "The factory's Git worktree detection may be broken."
     )
 
 
@@ -1141,20 +1141,20 @@ def test_create_filesystem_registry_plain_dir(tmp_path: Path) -> None:
 
 
 def test_create_filesystem_registry_nested_git_workspace(tmp_path: Path) -> None:
-    """A subdirectory inside a git repo yields :class:`GitFilesystemRegistry`.
+    """A subdirectory inside a real Git worktree yields :class:`GitFilesystemRegistry`.
 
-    Failure means _find_git_root doesn't walk parent directories, so nested
-    workspaces (agent sandboxes inside a repo) would incorrectly use the
-    plain agent-edit registry and lose git-backed baseline support.
+    Failure means the factory does not recognize parent Git worktrees, so
+    nested workspaces (agent sandboxes inside a repo) would incorrectly use
+    the plain agent-edit registry and lose git-backed baseline support.
     """
-    (tmp_path / ".git").mkdir()
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
     nested = tmp_path / "subdir" / "workspace"
     nested.mkdir(parents=True)
     registry = create_filesystem_registry(nested)
     assert isinstance(registry, GitFilesystemRegistry), (
         f"Expected GitFilesystemRegistry for a nested git workspace, "
         f"got {type(registry).__name__}. "
-        "_find_git_root may not be walking parent directories."
+        "The factory may not be recognizing parent Git worktrees."
     )
 
 

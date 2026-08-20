@@ -36,7 +36,6 @@ import base64
 import mimetypes
 import os
 import re
-import subprocess
 from pathlib import Path
 from typing import TypeAlias, cast
 
@@ -51,9 +50,7 @@ from omnigent.runner.environment_filesystem import (
     split_glob_list,
 )
 from omnigent.runtime.filesystem_registry import (
-    AgentEditFilesystemRegistry,
     FilesystemRegistry,
-    GitFilesystemRegistry,
     GitStatusUnavailable,
     create_filesystem_registry,
 )
@@ -64,25 +61,8 @@ _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
 _WorkspacePayload: TypeAlias = dict[str, object]
 
 
-def _workspace_has_git_repository(root: Path) -> bool:
-    """Return whether *root* resolves to a usable Git worktree."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            check=False,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
-
-
 def _create_workspace_registry(root: Path) -> FilesystemRegistry:
-    registry = create_filesystem_registry(root)
-    if isinstance(registry, GitFilesystemRegistry) and not _workspace_has_git_repository(root):
-        return AgentEditFilesystemRegistry(root)
-    return registry
+    return create_filesystem_registry(root)
 
 
 class WorkspaceReaderError(Exception):

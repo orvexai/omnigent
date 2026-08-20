@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,33 @@ def _ensure_subprocess_pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
     existing = os.environ.get("PYTHONPATH", "")
     new_path = f"{_PROJECT_ROOT}{os.pathsep}{existing}" if existing else str(_PROJECT_ROOT)
     monkeypatch.setenv("PYTHONPATH", new_path)
+
+
+@pytest.fixture(autouse=True)
+async def _configure_runner_default_executor() -> AsyncIterator[None]:
+    """Use the bounded executor that the runner installs in production."""
+    executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="runner-test")
+    asyncio.get_running_loop().set_default_executor(executor)
+    try:
+        yield
+    finally:
+        executor.shutdown(wait=True)
+
+
+@pytest.fixture(autouse=True)
+async def _keep_runner_test_loop_responsive() -> AsyncIterator[None]:
+    """Model the runner's background tasks while endpoint tests await threads."""
+
+    async def _heartbeat() -> None:
+        while True:
+            await asyncio.sleep(0.01)
+
+    heartbeat = asyncio.create_task(_heartbeat())
+    try:
+        yield
+    finally:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:

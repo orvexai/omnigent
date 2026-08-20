@@ -765,8 +765,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
     :param watch_path: The workspace directory, e.g.
         ``Path("/home/user/project")``.
-    :param git_root: The repository root (directory containing ``.git/``),
-        as returned by :func:`_find_git_root`.
+    :param git_root: The repository root reported by ``git rev-parse``.
     """
 
     def __init__(self, watch_path: Path, git_root: Path) -> None:
@@ -1228,16 +1227,30 @@ class GitFilesystemRegistry(FilesystemRegistry):
 def create_filesystem_registry(watch_path: Path) -> FilesystemRegistry:
     """Return the appropriate :class:`FilesystemRegistry` for *watch_path*.
 
-    Detects whether *watch_path* is inside a git repository and returns:
+    Detects whether *watch_path* is inside a usable git repository and returns:
 
-    - :class:`GitFilesystemRegistry` when a ``.git`` entry is found at or
-      above *watch_path*.
+    - :class:`GitFilesystemRegistry` when Git accepts *watch_path* as a
+      worktree.
     - :class:`AgentEditFilesystemRegistry` otherwise.
 
     :param watch_path: The workspace root to track.
     :returns: A :class:`FilesystemRegistry` instance ready to be used.
     """
-    git_root = _find_git_root(watch_path.resolve())
-    if git_root is not None:
-        return GitFilesystemRegistry(watch_path, git_root)
+    resolved_path = watch_path.resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(resolved_path), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return AgentEditFilesystemRegistry(watch_path)
+    if result.returncode == 0:
+        try:
+            git_root = Path(result.stdout.decode("utf-8", errors="replace").strip()).resolve()
+        except (OSError, ValueError):
+            git_root = None
+        if git_root is not None:
+            return GitFilesystemRegistry(watch_path, git_root)
     return AgentEditFilesystemRegistry(watch_path)
