@@ -392,9 +392,9 @@ async def _remote_terminal_owner(
             session_id,
         )
         runner_id = getattr(conversation, "runner_id", None)
-        if not runner_id or runner_router.runner_is_online(runner_id):
+        if not runner_id or await asyncio.to_thread(runner_router.runner_is_online, runner_id):
             return None, False
-        owner = runner_router.runner_owner_addr(runner_id)
+        owner = await asyncio.to_thread(runner_router.runner_owner_addr, runner_id)
         return owner if owner != pod_addr else None, True
     except Exception:  # noqa: BLE001
         # The existing route remains responsible for classifying an ordinary

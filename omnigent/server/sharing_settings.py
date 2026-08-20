@@ -17,6 +17,7 @@ import contextlib
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -43,6 +44,9 @@ _SETTINGS_TABLE = Table(
 )
 _session_makers: dict[str, Any] = {}
 _database_lock = Lock()
+_OVERRIDE_CACHE_TTL_S = 1.0
+_override_cache_lock = Lock()
+_override_cache: dict[tuple[str, str, str | None], tuple[float, str | None]] = {}
 
 
 def resolve_sharing_mode_path() -> Path:
@@ -168,13 +172,38 @@ def write_runtime_setting(key: str, value: str, legacy_path: Path) -> None:
     session_maker = _session_maker()
     if session_maker is None:
         _write_override_text(legacy_path, value)
-        return
-    _write_database_setting(key, value, legacy_path, session_maker)
+    else:
+        _write_database_setting(key, value, legacy_path, session_maker)
+    _invalidate_runtime_setting_cache(key, legacy_path)
+
+
+def _cached_runtime_setting(key: str, legacy_path: Path) -> str | None:
+    """Read a runtime setting with a short TTL for request hot paths."""
+    cache_key = (key, str(legacy_path), _database_uri())
+    now = time.monotonic()
+    with _override_cache_lock:
+        cached = _override_cache.get(cache_key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    value = read_runtime_setting(key, legacy_path)
+    with _override_cache_lock:
+        _override_cache[cache_key] = (now + _OVERRIDE_CACHE_TTL_S, value)
+    return value
+
+
+def _invalidate_runtime_setting_cache(key: str, legacy_path: Path) -> None:
+    """Drop all cached sources for a setting after a successful write."""
+    path = str(legacy_path)
+    with _override_cache_lock:
+        for cache_key in tuple(_override_cache):
+            if cache_key[:2] == (key, path):
+                _override_cache.pop(cache_key, None)
 
 
 def read_sharing_mode_override() -> SharingMode | None:
     """Return the admin-set sharing-mode override, or ``None`` when unset."""
-    raw = read_runtime_setting("sharing_mode", resolve_sharing_mode_path())
+    path = resolve_sharing_mode_path()
+    raw = _cached_runtime_setting("sharing_mode", path)
     if not raw:
         return None
     try:
@@ -186,7 +215,9 @@ def read_sharing_mode_override() -> SharingMode | None:
 
 def write_sharing_mode_override(mode: SharingMode) -> None:
     """Persist the admin sharing-mode override."""
-    write_runtime_setting("sharing_mode", mode.value, resolve_sharing_mode_path())
+    path = resolve_sharing_mode_path()
+    write_runtime_setting("sharing_mode", mode.value, path)
+    _invalidate_runtime_setting_cache("sharing_mode", path)
 
 
 def public_sharing_env_default() -> bool:
@@ -199,7 +230,8 @@ def public_sharing_env_default() -> bool:
 
 def read_public_sharing_override() -> bool | None:
     """Return the admin-set public-sharing override, or ``None`` when unset."""
-    raw = read_runtime_setting("public_sharing", resolve_public_sharing_path())
+    path = resolve_public_sharing_path()
+    raw = _cached_runtime_setting("public_sharing", path)
     if raw is None or raw == "":
         return None
     return raw.lower() not in _PUBLIC_FALSY
@@ -207,8 +239,6 @@ def read_public_sharing_override() -> bool | None:
 
 def write_public_sharing_override(enabled: bool) -> None:
     """Persist the admin public-sharing override."""
-    write_runtime_setting(
-        "public_sharing",
-        "on" if enabled else "off",
-        resolve_public_sharing_path(),
-    )
+    path = resolve_public_sharing_path()
+    write_runtime_setting("public_sharing", "on" if enabled else "off", path)
+    _invalidate_runtime_setting_cache("public_sharing", path)

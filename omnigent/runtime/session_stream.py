@@ -141,6 +141,10 @@ def _runner_binding_changed(
     return current_owner_addr != local_addr
 
 
+_DEFAULT_RUNNER_BINDING_FOR = _runner_binding_for
+_DEFAULT_RUNNER_BINDING_CHANGED = _runner_binding_changed
+
+
 def publish(conversation_id: str, event: dict[str, Any]) -> None:
     """
     Broadcast an event to every active subscriber of the given
@@ -320,7 +324,17 @@ async def subscribe(
             exc_info=True,
         )
         pre_ready_events = []
-    initial_runner_binding = _runner_binding_for(conversation_id)
+    try:
+        from omnigent.runtime import get_runner_router
+
+        router_configured = get_runner_router() is not None
+    except Exception:
+        router_configured = False
+    initial_runner_binding = (
+        await asyncio.to_thread(_runner_binding_for, conversation_id)
+        if router_configured or _runner_binding_for is not _DEFAULT_RUNNER_BINDING_FOR
+        else None
+    )
     try:
         if ready_event is not None:
             yield ready_event
@@ -350,7 +364,14 @@ async def subscribe(
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=heartbeat_interval_s)
                 except asyncio.TimeoutError:
-                    if _runner_binding_changed(conversation_id, initial_runner_binding):
+                    if (
+                        router_configured
+                        or _runner_binding_changed is not _DEFAULT_RUNNER_BINDING_CHANGED
+                    ) and await asyncio.to_thread(
+                        _runner_binding_changed,
+                        conversation_id,
+                        initial_runner_binding,
+                    ):
                         raise SubscriberReconnectError(
                             f"session stream for {conversation_id!r} moved to another replica"
                         ) from None

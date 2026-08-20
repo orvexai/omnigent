@@ -87,7 +87,7 @@ async def record_elicitation_resolution_if_off_owner(
     stats = stats_for_request(request)
     runner_id = getattr(conversation, "runner_id", None)
     if stats is not None and runner_id and runner_router is not None:
-        if not runner_router.runner_is_online(runner_id):
+        if not await asyncio.to_thread(runner_router.runner_is_online, runner_id):
             owner = (
                 await asyncio.to_thread(_owner_for_request, request, runner_router, runner_id)
                 if _stage2_active(request, runner_router)
@@ -125,8 +125,8 @@ async def record_hook_park_if_off_owner(
             session_id,
         )
     runner_id = getattr(conversation, "runner_id", None)
-    if runner_id and not runner_router.runner_is_online(runner_id):
-        owner = _owner_for_request(request, runner_router, runner_id)
+    if runner_id and not await asyncio.to_thread(runner_router.runner_is_online, runner_id):
+        owner = await asyncio.to_thread(_owner_for_request, request, runner_router, runner_id)
         if owner is not None:
             stats.record_hook_park_off_owner()
             raise OmnigentError(

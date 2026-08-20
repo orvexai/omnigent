@@ -400,7 +400,7 @@ class RunnerRouter:
         if self._runner_tunnel_store is None or self._pod_addr is None:
             return None
         owner_addr = self._runner_tunnel_store.owner(runner_id)
-        _logger.info(
+        _logger.debug(
             "runner routing ownership decision: runner_id=%s local_addr=%s owner_addr=%s",
             runner_id,
             self._pod_addr,

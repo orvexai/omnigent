@@ -21,9 +21,29 @@ class _RunnerRouter:
         return "10.0.0.7:8000"
 
 
+class _OfflineRunnerRouter:
+    def runner_owner_addr(self, runner_id: str) -> None:
+        assert runner_id == "runner_offline"
+        return
+
+
 def _request() -> Request:
     app = SimpleNamespace(state=SimpleNamespace(pod_addr="10.0.0.9:8000"))
     return Request({"type": "http", "app": app})
+
+
+def _offline_request() -> Request:
+    state = SimpleNamespace(
+        pod_addr="10.0.0.9:8000",
+        host_registry=SimpleNamespace(get=lambda _host_id: None),
+        host_store=SimpleNamespace(get_host=lambda _host_id: None),
+    )
+    return Request({"type": "http", "app": SimpleNamespace(state=state)})
+
+
+class _ConnectedRequest:
+    async def is_disconnected(self) -> bool:
+        return False
 
 
 @pytest.mark.asyncio
@@ -42,9 +62,43 @@ async def test_non_owner_session_stream_is_wrong_replica_not_hollow_200() -> Non
     assert exc_info.value.owner_addr == "10.0.0.7:8000"
 
 
-class _ConnectedRequest:
-    async def is_disconnected(self) -> bool:
-        return False
+@pytest.mark.asyncio
+async def test_offline_runner_stream_opens_and_replays_history_without_done() -> None:
+    """An offline host does not block history reconciliation for its sessions."""
+    conversation = SimpleNamespace(runner_id="runner_offline", host_id="host_offline")
+
+    await _ensure_stream_owner(
+        _offline_request(),
+        conversation,
+        runner_client=None,
+        runner_router=_OfflineRunnerRouter(),  # type: ignore[arg-type]
+    )
+
+    async def history_snapshot() -> list[dict[str, str]]:
+        return [
+            {
+                "type": "session.changed_files.invalidated",
+                "session_id": "conv_offline",
+                "environment_id": "default",
+            }
+        ]
+
+    session_stream._subscribers.clear()
+    stream = _stream_live_events(
+        _ConnectedRequest(),
+        "conv_offline",
+        history_snapshot,
+    )
+    try:
+        ready = await asyncio.wait_for(stream.__anext__(), timeout=2.0)
+        history = await asyncio.wait_for(stream.__anext__(), timeout=2.0)
+
+        assert "session.heartbeat" in ready
+        assert "session.changed_files.invalidated" in history
+        assert "[DONE]" not in ready
+        assert "[DONE]" not in history
+    finally:
+        await stream.aclose()
 
 
 @pytest.mark.asyncio

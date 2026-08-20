@@ -86,6 +86,34 @@ def test_preexisting_on_disk_settings_are_migrated(
     assert read_public_sharing_override() is False
 
 
+def test_sharing_override_reads_use_short_ttl_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Repeated request reads do not issue a database lookup every time."""
+    from omnigent.server import sharing_settings
+
+    calls: list[str] = []
+    mode_path = tmp_path / "sharing_mode"
+    public_path = tmp_path / "public_sharing"
+
+    def read_runtime_setting(key: str, _path: Path) -> str:
+        calls.append(key)
+        return "read_only" if key == "sharing_mode" else "off"
+
+    monkeypatch.setattr(sharing_settings, "read_runtime_setting", read_runtime_setting)
+    monkeypatch.setattr(sharing_settings, "resolve_sharing_mode_path", lambda: mode_path)
+    monkeypatch.setattr(sharing_settings, "resolve_public_sharing_path", lambda: public_path)
+    monkeypatch.setattr(sharing_settings, "_database_uri", lambda: "test-db")
+    sharing_settings._override_cache.clear()
+
+    assert read_sharing_mode_override() == SharingMode.READ_ONLY
+    assert read_sharing_mode_override() == SharingMode.READ_ONLY
+    assert read_public_sharing_override() is False
+    assert read_public_sharing_override() is False
+    assert calls == ["sharing_mode", "public_sharing"]
+
+
 def test_default_oidc_domain_additions_are_shared_and_migrated(
     runtime_init: None,
     db_uri: str,

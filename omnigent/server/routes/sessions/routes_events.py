@@ -372,10 +372,6 @@ async def _ensure_stream_owner(
                 code=ErrorCode.WRONG_REPLICA,
                 owner_addr=owner_addr,
             )
-        raise OmnigentError(
-            "session runner is unavailable on this replica; retry",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
 
     host_id = getattr(conv, "host_id", None)
     if not isinstance(host_id, str) or not host_id:

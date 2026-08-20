@@ -1807,8 +1807,11 @@ def register_core_routes(
             else:
                 from omnigent.server.routes import sessions as _sf
 
-                runner_id = _sf._registered_runner_id(
-                    runner_router, body.runner_id, user_id=user_id
+                runner_id = await asyncio.to_thread(
+                    _sf._registered_runner_id,
+                    runner_router,
+                    body.runner_id,
+                    user_id=user_id,
                 )
                 try:
                     await asyncio.to_thread(

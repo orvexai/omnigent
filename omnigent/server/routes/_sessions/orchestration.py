@@ -9154,7 +9154,10 @@ async def _get_session_snapshot(
     runner_router = get_runner_router()
     if runner_router is not None:
         try:
-            routed = runner_router.client_for_session_resources(session_id)
+            routed = await asyncio.to_thread(
+                runner_router.client_for_session_resources,
+                session_id,
+            )
             runner_client = routed.client
         except OmnigentError as exc:
             if exc.code == ErrorCode.WRONG_REPLICA:

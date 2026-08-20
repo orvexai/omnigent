@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
 import threading
 import time
@@ -49,6 +50,7 @@ from sqlalchemy import (
     insert,
     select,
 )
+from sqlalchemy.exc import ProgrammingError
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
@@ -57,6 +59,7 @@ _logger = logging.getLogger(__name__)
 
 _SHARED_EVENT_RETENTION_S = 300.0
 _SHARED_EVENT_POLL_INTERVAL_S = 0.25
+_SHARED_EVENT_POLL_BACKOFF_MAX_S = 5.0
 
 _shared_metadata = MetaData()
 _shared_events = Table(
@@ -153,6 +156,8 @@ class _Subscriber:
 
 def _shared_bus() -> _SharedEventBus | None:
     """Return the shared event transport when runtime database wiring exists."""
+    if not os.environ.get("OMNIGENT_POD_ADDR"):
+        return None
     try:
         from omnigent.runtime import get_agent_store
 
@@ -192,6 +197,26 @@ def _bus_storage_location(bus: object) -> str:
     if isinstance(storage_location, str) and storage_location:
         return storage_location
     return f"bus:{id(bus)}"
+
+
+def _is_schema_error(exc: BaseException) -> bool:
+    """Return whether *exc* means the shared announcement schema is invalid."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ProgrammingError) or type(current).__name__ in {
+            "SchemaError",
+            "UndefinedColumn",
+            "UndefinedTable",
+            "NoSuchTableError",
+        }:
+            return True
+        message = str(current).lower()
+        if "no such table" in message or "does not exist" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _deliver_local(
@@ -238,6 +263,7 @@ async def _poll_shared_events(
             ],
             read_after_all,
         )
+        backoff_s = _SHARED_EVENT_POLL_INTERVAL_S
         while True:
             await asyncio.sleep(_SHARED_EVENT_POLL_INTERVAL_S)
             with _lock:
@@ -250,9 +276,15 @@ async def _poll_shared_events(
                 return
             try:
                 rows, cursor = await asyncio.to_thread(read_after_all, cursor)
-            except Exception:
+            except Exception as exc:
+                if _is_schema_error(exc):
+                    _logger.exception("shared user-session event schema is unavailable")
+                    raise
                 _logger.exception("shared user-session event poll failed")
-                raise
+                await asyncio.sleep(backoff_s)
+                backoff_s = min(_SHARED_EVENT_POLL_BACKOFF_MAX_S, backoff_s * 2)
+                continue
+            backoff_s = _SHARED_EVENT_POLL_INTERVAL_S
             publisher_id = getattr(bus, "publisher_id", None)
             for _sequence, workspace_id, row_publisher_id, user_key, event in rows:
                 if row_publisher_id == publisher_id:
@@ -275,6 +307,34 @@ def _ensure_shared_poller(bus: Any, initial_cursor: int) -> None:
         )
 
 
+async def _append_shared_event(
+    user_key: str,
+    event: dict[str, Any],
+    workspace_id: int,
+    local_delivery_done: bool,
+) -> None:
+    """Append an announcement without running database work on the loop."""
+    bus = await asyncio.to_thread(_shared_bus)
+    if bus is None:
+        if not local_delivery_done:
+            _deliver_local(user_key, event, workspace_id, None)
+        return
+    storage_location = _bus_storage_location(bus)
+    if not local_delivery_done:
+        _deliver_local(user_key, event, workspace_id, storage_location)
+    await asyncio.to_thread(bus.append, user_key, event, workspace_id)
+
+
+def _report_shared_append_failure(task: asyncio.Task[None]) -> None:
+    """Log a fire-and-forget announcement failure without killing the loop."""
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception:
+        _logger.exception("shared user-session event append failed")
+
+
 def publish(user_key: str, event: dict[str, Any]) -> None:
     """
     Broadcast an event to every active subscriber for ``user_key``.
@@ -289,14 +349,35 @@ def publish(user_key: str, event: dict[str, Any]) -> None:
         ``{"type": "session_added", "session_id": "conv_abc123"}``.
     """
     workspace_id = current_workspace_id()
-    bus = _shared_bus()
-    storage_location = _bus_storage_location(bus) if bus is not None else None
+    if not os.environ.get("OMNIGENT_POD_ADDR"):
+        _deliver_local(user_key, event, workspace_id, None)
+        return
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # Synchronous producers already run outside the server event loop.
+        bus = _shared_bus()
+        storage_location = _bus_storage_location(bus) if bus is not None else None
+        _deliver_local(user_key, event, workspace_id, storage_location)
+        if bus is not None:
+            bus.append(user_key, event, workspace_id)
+        return
+
+    with _lock:
+        subscribers = list(_subscribers.get(user_key, ()))
+    matching_subscribers = [
+        subscriber for subscriber in subscribers if subscriber.workspace_id == workspace_id
+    ]
+    storage_locations = {subscriber.storage_location for subscriber in matching_subscribers}
+    local_delivery_done = bool(matching_subscribers) and len(storage_locations) == 1
+    storage_location = next(iter(storage_locations), None)
     _deliver_local(user_key, event, workspace_id, storage_location)
-    if bus is not None:
-        # Local delivery is queued first so a slow database cannot add latency
-        # to same-process subscribers. A configured schema failure still
-        # propagates; it never degrades into local-only delivery.
-        bus.append(user_key, event, workspace_id)
+    task = asyncio.create_task(
+        _append_shared_event(user_key, event, workspace_id, local_delivery_done),
+        name="user-session-shared-event-append",
+    )
+    task.add_done_callback(_report_shared_append_failure)
 
 
 async def subscribe(user_key: str) -> AsyncIterator[dict[str, Any]]:
@@ -316,7 +397,7 @@ async def subscribe(user_key: str) -> AsyncIterator[dict[str, Any]]:
     workspace_id = current_workspace_id()
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     loop = asyncio.get_running_loop()
-    bus = await asyncio.to_thread(_shared_bus)
+    bus = await asyncio.to_thread(_shared_bus) if os.environ.get("OMNIGENT_POD_ADDR") else None
     storage_location = _bus_storage_location(bus) if bus is not None else None
     cursor = (
         await asyncio.to_thread(bus.cursor, user_key, workspace_id) if bus is not None else None

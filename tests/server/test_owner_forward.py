@@ -115,7 +115,10 @@ async def _request(
 
 
 @pytest.mark.anyio
-async def test_forwarded_request_is_not_forwarded_again() -> None:
+async def test_forwarded_request_is_not_forwarded_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="omnigent.server.owner_forward")
     calls = 0
 
     async def owner(request: httpx.Request) -> httpx.Response:
@@ -134,10 +137,19 @@ async def test_forwarded_request_is_not_forwarded_again() -> None:
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "wrong_replica"
     assert calls == 0
+    assert any(
+        record.message.startswith("wrong_replica routing failure:")
+        and "reason=already_forwarded" in record.message
+        for record in caplog.records
+    )
 
 
 @pytest.mark.anyio
-async def test_unreachable_owner_returns_readdressable_wrong_replica() -> None:
+async def test_unreachable_owner_returns_readdressable_wrong_replica(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="omnigent.server.owner_forward")
+
     async def owner(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("owner unavailable", request=request)
 
@@ -147,6 +159,11 @@ async def test_unreachable_owner_returns_readdressable_wrong_replica() -> None:
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "wrong_replica"
+    assert any(
+        record.levelno >= logging.WARNING
+        and record.message.startswith("wrong_replica routing failure:")
+        for record in caplog.records
+    )
 
 
 @pytest.mark.anyio
@@ -198,7 +215,10 @@ async def test_wrong_replica_without_owner_is_not_forwarded() -> None:
 
 
 @pytest.mark.anyio
-async def test_forward_replays_request_and_pipes_owner_response() -> None:
+async def test_forward_replays_request_and_pipes_owner_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.server.owner_forward")
     seen: dict[str, object] = {}
 
     async def owner(request: httpx.Request) -> httpx.Response:
@@ -224,6 +244,12 @@ async def test_forward_replays_request_and_pipes_owner_response() -> None:
         "body": b"payload",
         "marker": LOCAL,
     }
+    assert not any(
+        record.levelno >= logging.WARNING
+        and record.message.startswith("wrong_replica routing failure:")
+        for record in caplog.records
+    )
+    assert any("owner forwarding succeeded" in record.message for record in caplog.records)
 
 
 @pytest.mark.anyio

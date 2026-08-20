@@ -21,6 +21,7 @@ end-to-end publish pipeline.
 from __future__ import annotations
 
 import asyncio
+import threading
 from typing import Any
 
 import pytest
@@ -126,6 +127,59 @@ async def test_single_subscriber_receives_events_in_order() -> None:
         f"A mismatch indicates either reordering inside publish or "
         f"a missed event during fan-out."
     )
+
+
+@pytest.mark.asyncio
+async def test_runner_binding_database_work_runs_off_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Heartbeat ownership probes never execute their sync body on the loop."""
+    event_loop_thread = threading.get_ident()
+    binding_threads: list[int] = []
+
+    def binding(_conversation_id: str) -> tuple[str, str | None] | None:
+        binding_threads.append(threading.get_ident())
+        return ("runner-1", None)
+
+    def binding_changed(
+        _conversation_id: str,
+        _initial_binding: tuple[str, str | None] | None,
+    ) -> bool:
+        binding_threads.append(threading.get_ident())
+        return False
+
+    monkeypatch.setattr(session_stream, "_runner_binding_for", binding)
+    monkeypatch.setattr(session_stream, "_runner_binding_changed", binding_changed)
+
+    async def run_in_dedicated_thread(callable_: Any, *args: Any) -> Any:
+        loop = asyncio.get_running_loop()
+        result: asyncio.Future[Any] = loop.create_future()
+
+        def run() -> None:
+            try:
+                value = callable_(*args)
+            except BaseException as exc:
+                loop.call_soon_threadsafe(result.set_exception, exc)
+            else:
+                loop.call_soon_threadsafe(result.set_result, value)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            return await result
+        finally:
+            thread.join()
+
+    monkeypatch.setattr(session_stream.asyncio, "to_thread", run_in_dedicated_thread)
+    gen = session_stream.subscribe("conv_binding", heartbeat_interval_s=0.01)
+    try:
+        assert await asyncio.wait_for(gen.__anext__(), timeout=1.0) == {
+            "type": "session.heartbeat"
+        }
+        assert binding_threads
+        assert all(thread_id != event_loop_thread for thread_id in binding_threads)
+    finally:
+        await gen.aclose()
 
 
 @pytest.mark.asyncio
