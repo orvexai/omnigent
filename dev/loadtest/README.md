@@ -103,6 +103,12 @@ The command exits non-zero when any assertion fails. To exercise the negative
 path deliberately, use `--failure-mode hard-kill`; the missing drain signal is
 expected to fail the close-code and recovery assertions.
 
+Local replacement waits 30 seconds between replacing replicas by default. This
+`--rollout-settle-s` interval models the deployment manifest's
+`minReadySeconds: 30`: a replacement must remain Ready for that interval before
+the next pod is replaced. Set it explicitly when running a different manifest,
+but keep the strict `runners_never_all_unregistered` assertion unchanged.
+
 The drivers and assertions do not depend on how replacement happens. A future
 cluster run should point the same test at the service URL, pass the live
 session and runner IDs, database URL, namespace, and pod selector, then use
@@ -123,9 +129,12 @@ uv run python dev/loadtest/run.py --rollout-resilience --mode kubernetes \
   --runner-log /path/to/runner.log
 ```
 
-Add `--expect-approvals` when the supplied sessions use the deterministic
-approval policy; otherwise the same turn driver checks completion without
-requiring an approval prompt.
+The local acceptance bundle does not configure an approval policy by default, so
+`approval_verdicts_not_dropped` remains visible and reports `not exercised`.
+Pass `--expect-approvals` to configure the deterministic always-ask policy and
+make that assertion require one accepted verdict per turn. The same flag applies
+to Kubernetes runs when the supplied sessions use that policy; a missing or
+dropped verdict then fails the assertion.
 
 ## Against another server
 

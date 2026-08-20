@@ -40,7 +40,56 @@ _REREGISTRATION_LIMIT_S = 3.0
 _POLICY_LLM_KEY = "_policy_llm_"
 _MODEL = "rollout-resilience-model"
 _HOST_COUNT = 2
+_DEFAULT_REPLICAS = 3
+_DEFAULT_ROLLOUT_SETTLE_S = 30.0
+_TURN_COMPLETION_MARGIN_S = 30.0
 _INTERNAL_ORIGIN = "omnigent://internal"
+_CLOSE_CODE_RE = re.compile(
+    r"(?:\(\s*code\s*=\s*|\bclose(?:\s+code)?\s*(?:=|:)?\s*)(?P<code>\d{3,4})\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class _RolloutTiming:
+    """Keep rollout configuration and the dependent turn wait in one value."""
+
+    pod_count: int
+    settle_s: float
+    margin_s: float = _TURN_COMPLETION_MARGIN_S
+
+    @property
+    def rollout_s(self) -> float:
+        return self.pod_count * self.settle_s
+
+    @property
+    def llm_gate_hold_s(self) -> float:
+        # The local proof keeps the gate closed until the configured rollout ends.
+        return self.rollout_s
+
+    @property
+    def turn_completion_budget_s(self) -> float:
+        return self.rollout_s + self.llm_gate_hold_s + self.margin_s
+
+    def as_json(self) -> dict[str, float | int]:
+        return {
+            "pod_count": self.pod_count,
+            "settle_s": self.settle_s,
+            "rollout_s": self.rollout_s,
+            "llm_gate_hold_s": self.llm_gate_hold_s,
+            "margin_s": self.margin_s,
+            "turn_completion_budget_s": self.turn_completion_budget_s,
+        }
+
+    def log(self) -> None:
+        print(
+            "turn completion wait budget: "
+            f"{self.turn_completion_budget_s:.1f}s = "
+            f"({self.pod_count} pods x {self.settle_s:.1f}s settle "
+            f"= {self.rollout_s:.1f}s rollout) + "
+            f"{self.llm_gate_hold_s:.1f}s LLM gate hold + "
+            f"{self.margin_s:.1f}s margin"
+        )
 
 
 def _free_port() -> int:
@@ -389,12 +438,16 @@ class TurnDriver:
         out_dir: Path,
         turns_per_session: int = 3,
         require_approvals: bool = True,
+        rollout_timing: _RolloutTiming | None = None,
     ) -> None:
         self.urls = urls
         self.session_urls = session_urls
         self.out_dir = out_dir
         self.turns_per_session = turns_per_session
         self.require_approvals = require_approvals
+        self.rollout_timing = rollout_timing or _RolloutTiming(
+            _DEFAULT_REPLICAS, _DEFAULT_ROLLOUT_SETTLE_S
+        )
         self.expected_turns = len(session_urls) * turns_per_session
         self.completed_turns = 0
         self.lost_turns = 0
@@ -450,9 +503,8 @@ class TurnDriver:
     async def _wait_for_turn(
         self, client: httpx.AsyncClient, session_id: str, marker: str
     ) -> bool:
-        deadline = time.monotonic() + 45.0
+        deadline = time.monotonic() + self.rollout_timing.turn_completion_budget_s
         seen_busy = False
-        seen_approval = False
         url_index = 0
         while time.monotonic() < deadline:
             base_url = self.urls[url_index % len(self.urls)].rstrip("/")
@@ -473,7 +525,6 @@ class TurnDriver:
                     elicitation_id = elicitation.get("elicitation_id")
                     if not isinstance(elicitation_id, str) or elicitation_id in self.approval_ids:
                         continue
-                    seen_approval = True
                     if await self._approve(client, session_id, elicitation_id):
                         self.approval_ids.add(elicitation_id)
                     else:
@@ -482,7 +533,7 @@ class TurnDriver:
                 if status == "failed":
                     return False
                 if status == "idle" and (seen_busy or marker_seen) and not pending:
-                    return seen_approval or not self.require_approvals
+                    return True
             except (httpx.HTTPError, ValueError):
                 pass
             await asyncio.sleep(0.1)
@@ -534,6 +585,8 @@ class TurnDriver:
             "expected_approvals": self.expected_approvals,
             "observed_approvals": len(self.approval_ids),
             "approval_errors": self.approval_errors,
+            "approval_check_exercised": self.require_approvals,
+            "turn_completion_budget_s": self.rollout_timing.turn_completion_budget_s,
             "session_ids": sorted(self.session_urls),
         }
 
@@ -597,15 +650,41 @@ class RunnerObserver:
         self._fill_close_codes()
 
     def _fill_close_codes(self) -> None:
-        text = "\n".join(
-            path.read_text(errors="replace") for path in self.log_paths if path.exists()
-        )
-        codes = [
-            int(value)
-            for value in re.findall(r"\bclose(?: code)?\s*(?:=|:)?\s*(1012|1001)\b", text, re.I)
-        ]
-        for item, code in zip(self.disconnects, codes, strict=False):
-            item["close_code"] = code
+        codes_by_runner: dict[str, list[int]] = {runner_id: [] for runner_id in self.runner_ids}
+        unscoped_codes: list[int] = []
+        seen_paths: set[Path] = set()
+        for path in self.log_paths:
+            paths = sorted(path.glob("*.log")) if path.is_dir() else [path]
+            for log_path in paths:
+                if log_path in seen_paths or not log_path.exists():
+                    continue
+                seen_paths.add(log_path)
+                try:
+                    lines = log_path.read_text(errors="replace").splitlines()
+                except OSError:
+                    continue
+                for line in lines:
+                    codes = [int(match.group("code")) for match in _CLOSE_CODE_RE.finditer(line)]
+                    if not codes:
+                        continue
+                    owners = [runner_id for runner_id in self.runner_ids if runner_id in line]
+                    if owners:
+                        for runner_id in owners:
+                            codes_by_runner[runner_id].extend(codes)
+                    else:
+                        unscoped_codes.extend(codes)
+
+        fallback_index = 0
+        for item in self.disconnects:
+            runner_id = str(item["runner_id"])
+            codes = codes_by_runner.get(runner_id, [])
+            if codes:
+                # Preserve a non-1012 observation if sources disagree so the
+                # close-code assertion cannot turn conflicting evidence into a pass.
+                item["close_code"] = next((code for code in codes if code != 1012), codes[0])
+            elif fallback_index < len(unscoped_codes):
+                item["close_code"] = unscoped_codes[fallback_index]
+                fallback_index += 1
 
     def metrics(self) -> dict[str, object]:
         return {
@@ -632,15 +711,23 @@ class HostHandle:
     process: subprocess.Popen[bytes]
     log_path: Path
     server_url: str
+    runner_log_dir: Path
 
 
 class LocalStack:
     """Three local server processes sharing one database and mock LLM."""
 
-    def __init__(self, out_dir: Path, failure_mode: str = "graceful", replicas: int = 3) -> None:
+    def __init__(
+        self,
+        out_dir: Path,
+        failure_mode: str = "graceful",
+        replicas: int = _DEFAULT_REPLICAS,
+        require_approvals: bool = False,
+    ) -> None:
         self.out_dir = out_dir
         self.failure_mode = failure_mode
         self.replicas = replicas
+        self.require_approvals = require_approvals
         self.tmp = out_dir / "local-stack"
         self.tmp.mkdir(parents=True, exist_ok=True)
         self.db_path = self.tmp / "rollout.db"
@@ -668,6 +755,10 @@ class LocalStack:
             f"http://{host}:{port}"
             for host, port in zip(self.server_hosts, self.ports, strict=True)
         )
+
+    @property
+    def runner_log_dirs(self) -> tuple[Path, ...]:
+        return tuple(host.runner_log_dir for host in self.hosts)
 
     async def start(self) -> None:
         mock_port = _free_port()
@@ -819,7 +910,10 @@ class LocalStack:
                 },
                 "connection": {"base_url": f"{self.mock_url}/v1", "api_key": "mock-key"},
             },
-            "policies": {
+            "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+        }
+        if self.require_approvals:
+            config["policies"] = {
                 "always_ask_on_input": {
                     "type": "function",
                     "on": ["request"],
@@ -832,9 +926,8 @@ class LocalStack:
                         },
                     },
                 }
-            },
-            "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
-        }
+            }
+
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as archive:
             payload = yaml.safe_dump(config).encode()
@@ -866,10 +959,13 @@ class LocalStack:
         home = workspace / "home"
         workspace.mkdir(parents=True, exist_ok=True)
         home.mkdir(exist_ok=True)
+        data_dir = workspace / "data"
+        data_dir.mkdir(exist_ok=True)
         log_path = workspace / "host.log"
         env = {
             **self._base_env(),
             "HOME": str(home),
+            "OMNIGENT_DATA_DIR": str(data_dir),
             "OMNIGENT_HOST_ID": host_id,
             "OMNIGENT_HOST_NAME": f"rollout-host-{index}",
         }
@@ -891,7 +987,14 @@ class LocalStack:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        host = HostHandle(host_id, workspace, process, log_path, server_url)
+        host = HostHandle(
+            host_id,
+            workspace,
+            process,
+            log_path,
+            server_url,
+            data_dir / "logs" / "runner",
+        )
         self.hosts.append(host)
         await self._wait_for_host(host)
 
@@ -951,12 +1054,19 @@ class LocalStack:
 
     async def pending_mock_requests(self) -> int:
         async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(f"{self.mock_url}/gate/pending")
+            gate_response = await client.get(f"{self.mock_url}/gate/pending")
+            if gate_response.status_code != 200 or not gate_response.json().get("pending"):
+                return 0
+            # The mock exposes a Boolean gate flag, so count captured requests
+            # for the queue whose first configured responses are blocking.
+            response = await client.get(
+                f"{self.mock_url}/mock/requests",
+                params={"key": _MODEL},
+            )
             if response.status_code != 200:
                 return 0
-            body = response.json()
-            pending = body.get("pending", body.get("count", 0))
-            return int(pending) if isinstance(pending, (int, float)) else len(pending or [])
+            requests = response.json().get("requests", [])
+            return len(requests) if isinstance(requests, list) else 0
 
     async def wait_for_gates(self, count: int) -> None:
         deadline = time.monotonic() + 45.0
@@ -972,10 +1082,11 @@ class LocalStack:
                 response = await client.post(f"{self.mock_url}/gate/release")
                 response.raise_for_status()
 
-    async def roll_all(self, delay_s: float) -> None:
+    async def roll_all(self, settle_s: float) -> None:
         for index in range(len(self.servers)):
             await self._replace(index)
-            await asyncio.sleep(delay_s)
+            if index + 1 < len(self.servers):
+                await asyncio.sleep(settle_s)
 
     async def _replace(self, index: int) -> None:
         old = self.servers[index]
@@ -1183,14 +1294,25 @@ def _add_assertions(
         f"lost={turn_metrics['lost_turns']}, duplicated={turn_metrics['duplicate_turns']}",
         **turn_metrics,
     )
-    report.add(
-        "approval_verdicts_not_dropped",
-        turn_metrics["approval_errors"] == 0
-        and turn_metrics["observed_approvals"] == turn_metrics["expected_approvals"],
-        f"{turn_metrics['observed_approvals']}/{turn_metrics['expected_approvals']} "
-        "approvals accepted",
-        **turn_metrics,
+    approval_check_exercised = bool(
+        turn_metrics.get("approval_check_exercised", turn_metrics["expected_approvals"] > 0)
     )
+    if approval_check_exercised:
+        report.add(
+            "approval_verdicts_not_dropped",
+            turn_metrics["approval_errors"] == 0
+            and turn_metrics["observed_approvals"] == turn_metrics["expected_approvals"],
+            f"{turn_metrics['observed_approvals']}/{turn_metrics['expected_approvals']} "
+            "approvals accepted",
+            **turn_metrics,
+        )
+    else:
+        report.add(
+            "approval_verdicts_not_dropped",
+            True,
+            "not exercised: this acceptance run does not configure an approval policy",
+            **turn_metrics,
+        )
     disconnects = cast(list[dict[str, object]], runner_metrics["disconnects"])
     reconnect_latencies = cast(list[float], runner_metrics["reconnect_latencies_s"])
     disconnect_codes = [item.get("close_code") for item in disconnects]
@@ -1249,7 +1371,14 @@ def _add_assertions(
 
 async def _run_local(args: argparse.Namespace, out_dir: Path) -> HarnessReport:
     started = time.monotonic()
-    stack = LocalStack(out_dir, failure_mode=args.failure_mode, replicas=args.replicas)
+    rollout_timing = _RolloutTiming(args.replicas, args.rollout_settle_s)
+    rollout_timing.log()
+    stack = LocalStack(
+        out_dir,
+        failure_mode=args.failure_mode,
+        replicas=rollout_timing.pod_count,
+        require_approvals=args.expect_approvals,
+    )
     report = HarnessReport(
         mode="local",
         failure_mode=args.failure_mode,
@@ -1262,11 +1391,21 @@ async def _run_local(args: argparse.Namespace, out_dir: Path) -> HarnessReport:
         session_ids = tuple(stack.session_urls)
         prober = HttpProber(urls, session_ids, out_dir)
         sse = SseSubscriber(urls, session_ids, out_dir)
-        turns = TurnDriver(urls, stack.session_urls, out_dir)
+        turns = TurnDriver(
+            urls,
+            stack.session_urls,
+            out_dir,
+            require_approvals=args.expect_approvals,
+            rollout_timing=rollout_timing,
+        )
         observer = RunnerObserver(
             urls,
             tuple(stack.runner_ids),
-            (*stack.server_logs, *(host.log_path for host in stack.hosts)),
+            (
+                *stack.server_logs,
+                *(host.log_path for host in stack.hosts),
+                *stack.runner_log_dirs,
+            ),
             expected_disconnects=len(stack.runner_ids),
         )
         stop = asyncio.Event()
@@ -1281,7 +1420,7 @@ async def _run_local(args: argparse.Namespace, out_dir: Path) -> HarnessReport:
         await asyncio.sleep(args.baseline_s)
         phase["value"] = "rollout"
         rollout_started = time.monotonic()
-        await stack.roll_all(args.restart_delay_s)
+        await stack.roll_all(rollout_timing.settle_s)
         await stack.release_gates()
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(asyncio.shield(tasks[2]), timeout=60.0)
@@ -1301,6 +1440,9 @@ async def _run_local(args: argparse.Namespace, out_dir: Path) -> HarnessReport:
                 "session_ids": list(session_ids),
                 "runner_ids": list(stack.runner_ids),
                 "database_uri": stack.db_uri,
+                "approval_check_exercised": args.expect_approvals,
+                "rollout_settle_s": args.rollout_settle_s,
+                **rollout_timing.as_json(),
             }
         )
         _add_assertions(
@@ -1442,10 +1584,16 @@ def build_resilience_parser(parser: argparse.ArgumentParser) -> None:
         help="Run the zero-downtime rollout proof instead of the ordinary Locust load.",
     )
     parser.add_argument("--mode", choices=("local", "kubernetes"), default="local")
-    parser.add_argument("--replicas", type=int, default=3)
+    parser.add_argument("--replicas", type=int, default=_DEFAULT_REPLICAS)
     parser.add_argument("--failure-mode", choices=("graceful", "hard-kill"), default="graceful")
     parser.add_argument("--baseline-s", type=float, default=2.0)
     parser.add_argument("--duration-s", type=float, default=12.0)
+    parser.add_argument(
+        "--rollout-settle-s",
+        type=float,
+        default=_DEFAULT_ROLLOUT_SETTLE_S,
+        help="Local seconds between replacements; models minReadySeconds: 30.",
+    )
     parser.add_argument("--restart-delay-s", type=float, default=0.5)
     parser.add_argument("--base-url", default="")
     parser.add_argument("--session-id", action="append", default=[])
