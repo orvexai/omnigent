@@ -3,30 +3,93 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Event
 
+from sqlalchemy import event, update
+from sqlalchemy.orm import Session
+
+from omnigent.db.db_models import SqlRunnerTunnel
+from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.stores.host_store import HostStore
 
 
-def test_simultaneous_runner_claims_are_atomic_and_keep_a_live_owner(db_uri: str) -> None:
-    """Two pods can claim one runner without an integrity or stale-write error."""
-    runner_id = "runner_token_concurrent_claim_b0c8ab2431"
+def test_delayed_older_generation_cannot_overwrite_newer_claim(db_uri: str) -> None:
+    """A delayed worker commit cannot steal ownership from a newer connection."""
+    runner_id = "runner_token_delayed_claim_fence_b0c8ab2431"
     store = HostStore(db_uri).runner_tunnel_store
-    barrier = Barrier(2)
+    old_generation = store.allocate_generation(runner_id)
+    claim_started = Event()
+    allow_old_claim = Event()
+    engine = get_or_create_engine(db_uri)
 
-    def claim(owner_addr: str) -> None:
-        barrier.wait()
-        HostStore(db_uri).runner_tunnel_store.claim(runner_id, owner_addr)
+    def pause_old_claim(
+        _conn,
+        _cursor,
+        _statement,
+        parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        if "pod-a:8000" in repr(parameters) and not claim_started.is_set():
+            claim_started.set()
+            assert allow_old_claim.wait(timeout=10)
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(claim, owner) for owner in ("pod-a:8000", "pod-b:8000")]
-        for future in futures:
-            future.result()
+    event.listen(engine, "before_cursor_execute", pause_old_claim)
+    try:
 
-    assert store.owner_addr(runner_id) in {"pod-a:8000", "pod-b:8000"}
+        def delayed_claim() -> None:
+            store.claim(
+                runner_id,
+                "pod-a:8000",
+                generation=old_generation,
+            )
 
-    store.claim(runner_id, "pod-live:8000")
-    assert store.owner_addr(runner_id) == "pod-live:8000"
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            old_claim = executor.submit(delayed_claim)
+            assert claim_started.wait(timeout=10)
+
+            new_generation = store.allocate_generation(runner_id)
+            store.claim(
+                runner_id,
+                "pod-b:8000",
+                generation=new_generation,
+            )
+            allow_old_claim.set()
+            old_claim.result()
+    finally:
+        event.remove(engine, "before_cursor_execute", pause_old_claim)
+
+    assert store.owner_addr(runner_id) == "pod-b:8000"
+
+
+def test_older_generation_cannot_heartbeat_or_release_newer_connection(
+    db_uri: str,
+) -> None:
+    """Heartbeat and teardown are fenced even when the pod address is reused."""
+    runner_id = "runner_token_generation_guarded_cleanup_b0c8ab2431"
+    store = HostStore(db_uri).runner_tunnel_store
+    old_generation = store.allocate_generation(runner_id)
+    store.claim(runner_id, "pod-a:8000", generation=old_generation)
+    new_generation = store.allocate_generation(runner_id)
+    store.claim(runner_id, "pod-a:8000", generation=new_generation)
+
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        session.execute(
+            update(SqlRunnerTunnel)
+            .where(SqlRunnerTunnel.runner_id == runner_id)
+            .values(updated_at=now_epoch() - 1000)
+        )
+        session.commit()
+
+    store.heartbeat(runner_id, "pod-a:8000", generation=old_generation)
+    store.release(runner_id, "pod-a:8000", generation=old_generation)
+
+    assert store.owner(runner_id) is None
+    assert store.owner_addr(runner_id) == "pod-a:8000"
+
+    store.heartbeat(runner_id, "pod-a:8000", generation=new_generation)
+    assert store.owner(runner_id) == "pod-a:8000"
 
 
 def test_runner_claim_persists_host_attribution_across_release(db_uri: str) -> None:

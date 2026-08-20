@@ -396,14 +396,10 @@ class RunnerRouter:
         return RoutedRunner(runner_id=runner_id, client=self._client_for_runner(runner_id))
 
     def runner_owner_addr(self, runner_id: str) -> str | None:
-        """Return recorded runner ownership when Stage 1 is active.
-
-        Routing needs the raw address even after its lease expires so a
-        forwardable miss remains ``WRONG_REPLICA`` instead of becoming a 503.
-        """
+        """Return fresh durable runner ownership when Stage 1 is active."""
         if self._runner_tunnel_store is None or self._pod_addr is None:
             return None
-        owner_addr = self._runner_tunnel_store.owner_addr(runner_id)
+        owner_addr = self._runner_tunnel_store.owner(runner_id)
         _logger.info(
             "runner routing ownership decision: runner_id=%s local_addr=%s owner_addr=%s",
             runner_id,
@@ -417,15 +413,11 @@ class RunnerRouter:
         Classify a "bound runner, but its tunnel isn't on this replica" miss.
 
         With durable ownership wired, the runner table tells the two failure
-        modes apart:
+        modes apart while applying its lease TTL:
 
         - row present with a different owner address → ``WRONG_REPLICA``;
-        - row absent, or owned by this pod but missing locally →
+        - row absent or expired, or owned by this pod but missing locally →
           ``RUNNER_UNAVAILABLE``.
-
-        A stale row still identifies which replica should be tried. The
-        forwarding middleware can then retry there and let that replica
-        re-evaluate the lease with its local tunnel.
 
         When the durable store is not wired, retain the existing host
         liveness fallback so single-replica and mixed-version deployments

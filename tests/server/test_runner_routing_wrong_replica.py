@@ -158,8 +158,8 @@ def test_runner_absent_code_no_store_registry_only_returns_wrong_replica():
     assert code == ErrorCode.WRONG_REPLICA
 
 
-def test_stale_durable_owner_remains_wrong_replica_for_forwarding(db_uri: str) -> None:
-    """A stale remote row still identifies the replica to retry."""
+def test_routing_hot_path_applies_durable_owner_ttl(db_uri: str) -> None:
+    """An expired durable owner is not used to forward a request."""
     runner_id = "runner_token_stale_durable_route_b0c8ab2431"
     tunnels = HostStore(db_uri).runner_tunnel_store
     tunnels.claim(runner_id, REMOTE)
@@ -177,9 +177,35 @@ def test_stale_durable_owner_remains_wrong_replica_for_forwarding(db_uri: str) -
         router.client_for_existing_conversation("conv-stale")
 
     error = exc_info.value
-    assert error.code == ErrorCode.WRONG_REPLICA
-    assert error.owner_addr == REMOTE
-    assert error.http_status == 400
+    assert error.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert error.owner_addr is None
+    assert error.http_status == 503
+
+
+def test_expired_durable_owner_does_not_override_live_local_tunnel(db_uri: str) -> None:
+    """A confirmed local tunnel wins over an expired remote ownership row."""
+    runner_id = "runner_token_expired_remote_local_route_b0c8ab2431"
+    tunnels = HostStore(db_uri).runner_tunnel_store
+    tunnels.claim(runner_id, REMOTE)
+    _set_runner_updated_at(db_uri, runner_id, now_epoch() - RUNNER_LIVENESS_TTL_S - 1)
+    router = RunnerRouter(
+        registry=MockTunnelRegistry(
+            {
+                runner_id: SimpleNamespace(
+                    hello=SimpleNamespace(harnesses=["codex"]),
+                ),
+            }
+        ),
+        conversation_store=MockConversationStore(
+            SimpleNamespace(id="conv-expired-local", runner_id=runner_id, host_id=None)
+        ),
+        runner_tunnel_store=tunnels,
+        pod_addr=LOCAL,
+    )
+
+    routed = router.client_for_session_resources("conv-expired-local")
+
+    assert routed.runner_id == runner_id
 
 
 def test_half_open_local_tunnel_does_not_override_durable_owner(db_uri: str) -> None:

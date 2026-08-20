@@ -458,6 +458,15 @@ def create_runner_tunnel_router(
         )
 
         await ws.accept()
+        connection_generation: int | None = None
+        if runner_tunnel_store is not None:
+            # Allocate before any blocking claim work. If this handler is
+            # cancelled, a worker thread may finish later, but its token is
+            # already fenced by any newer accepted connection.
+            connection_generation = await asyncio.to_thread(
+                runner_tunnel_store.allocate_generation,
+                runner_id,
+            )
         session: RunnerSession | None = None
         try:
             # 3. Receive hello frame.
@@ -494,13 +503,19 @@ def create_runner_tunnel_router(
                     host_id,
                 )
                 if host_id is None:
-                    await asyncio.to_thread(runner_tunnel_store.claim, runner_id, pod_addr)
+                    await asyncio.to_thread(
+                        runner_tunnel_store.claim,
+                        runner_id,
+                        pod_addr,
+                        generation=connection_generation,
+                    )
                 else:
                     await asyncio.to_thread(
                         runner_tunnel_store.claim,
                         runner_id,
                         pod_addr,
                         host_id=host_id,
+                        generation=connection_generation,
                     )
             _logger.info(
                 "Runner %s connected (version=%s, harnesses=%s)",
@@ -528,6 +543,7 @@ def create_runner_tunnel_router(
                     registry,
                     runner_tunnel_store,
                     pod_addr,
+                    connection_generation,
                 ),
                 name=f"tunnel-ping:{runner_id}",
             )
@@ -611,8 +627,13 @@ def create_runner_tunnel_router(
                     return_exceptions=True,
                 )
                 registry.deregister(runner_id, session)
-                if runner_tunnel_store is not None:
-                    await asyncio.to_thread(runner_tunnel_store.release, runner_id, pod_addr)
+                if runner_tunnel_store is not None and connection_generation is not None:
+                    await asyncio.to_thread(
+                        runner_tunnel_store.release,
+                        runner_id,
+                        pod_addr,
+                        generation=connection_generation,
+                    )
                 if on_runner_disconnect is not None:
                     try:
                         await on_runner_disconnect(runner_id)
@@ -643,8 +664,13 @@ def create_runner_tunnel_router(
                 registry.deregister(runner_id, session)
             else:
                 registry.deregister(runner_id)
-            if runner_tunnel_store is not None:
-                await asyncio.to_thread(runner_tunnel_store.release, runner_id, pod_addr)
+            if runner_tunnel_store is not None and connection_generation is not None:
+                await asyncio.to_thread(
+                    runner_tunnel_store.release,
+                    runner_id,
+                    pod_addr,
+                    generation=connection_generation,
+                )
             if on_runner_disconnect is not None:
                 try:
                     await on_runner_disconnect(runner_id)
@@ -760,6 +786,7 @@ async def _ping_loop(
     registry: TunnelRegistry,
     runner_tunnel_store: RunnerTunnelStore | None = None,
     pod_addr: str | None = None,
+    connection_generation: int | None = None,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
@@ -808,7 +835,12 @@ async def _ping_loop(
         # inherits this handler's workspace scope via copy_context.
         session_live_state.touch_runner_liveness([runner_id])
         if runner_tunnel_store is not None:
-            await asyncio.to_thread(runner_tunnel_store.heartbeat, runner_id, pod_addr)
+            await asyncio.to_thread(
+                runner_tunnel_store.heartbeat,
+                runner_id,
+                pod_addr,
+                generation=connection_generation,
+            )
         try:
             await registry.send_text(
                 session,
