@@ -18,6 +18,7 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -2442,12 +2443,30 @@ def create_runner_app(
     resource_registry.set_terminal_exit_publisher(_publish_terminal_exit)
 
     from omnigent.runtime.filesystem_registry import (
+        AgentEditFilesystemRegistry,
         FilesystemRegistry,
+        GitFilesystemRegistry,
         create_filesystem_registry,
     )
 
+    def _create_workspace_registry(watch_path: Path) -> FilesystemRegistry:
+        registry = create_filesystem_registry(watch_path=watch_path)
+        if isinstance(registry, GitFilesystemRegistry):
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(watch_path), "rev-parse", "--show-toplevel"],
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                result = None
+            if result is None or result.returncode != 0:
+                return AgentEditFilesystemRegistry(watch_path)
+        return registry
+
     if runner_workspace is not None:
-        filesystem_registry = create_filesystem_registry(watch_path=runner_workspace)
+        filesystem_registry = _create_workspace_registry(runner_workspace)
         filesystem_registry.start()
     else:
         filesystem_registry = None
@@ -2601,7 +2620,7 @@ def create_runner_app(
         if runner_ws_resolved is not None and session_ws_path == runner_ws_resolved:
             return filesystem_registry
 
-        registry = create_filesystem_registry(watch_path=session_ws_path)
+        registry = _create_workspace_registry(session_ws_path)
         registry.start()
         _session_fs_registries[session_id] = registry
         return registry
@@ -7962,25 +7981,15 @@ def create_runner_app(
         session_id: str,
         environment_id: str,  # noqa: ARG001
     ) -> JSONResponse:
-        import asyncio as _asyncio
-
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
         await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
         session_registry = await _resolve_session_fs_registry(session_id)
         try:
-            # ``list_changed_files`` shells out to ``git status`` synchronously,
-            # which on a large repo (cold untracked cache) can take seconds.
-            # Offload to a thread so it never blocks the event loop — a blocked
-            # loop can't answer the server's runner-stream relay probe and the
-            # session's first turn 503s with runner_unavailable.
+            # Keep in-memory edit tracking available for non-git workspaces.
             raw_changes = (
-                await _asyncio.to_thread(
-                    session_registry.list_changed_files,
-                    session_id,
-                    limit=10_000,
-                )
+                session_registry.list_changed_files(session_id, limit=10_000)
                 if session_registry is not None
                 else []
             )
@@ -8046,17 +8055,11 @@ def create_runner_app(
                 },
             )
 
-        import asyncio as _asyncio
-
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
         try:
-            # Offloaded like list_filesystem_changes: get_changed_file shells out
-            # to git (status + show) synchronously, so keep it off the loop.
             record = (
-                await _asyncio.to_thread(
-                    session_registry.get_changed_file, session_id, relative_path
-                )
+                session_registry.get_changed_file(session_id, relative_path)
                 if session_registry is not None
                 else None
             )
@@ -8081,9 +8084,7 @@ def create_runner_app(
         is_deleted = record.get("status") == "deleted"
 
         before: str | None = (
-            await _asyncio.to_thread(session_registry.get_baseline, relative_path)
-            if session_registry is not None
-            else None
+            session_registry.get_baseline(relative_path) if session_registry is not None else None
         )
 
         from omnigent.runner.environment_filesystem import CallerProcessFilesystem

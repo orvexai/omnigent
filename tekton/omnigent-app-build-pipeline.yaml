@@ -1,5 +1,5 @@
 ---
-# Tekton Pipeline: build the Omnigent server image and roll it out.
+# Tekton Pipeline: build the Omnigent server image and run migrations.
 #
 # Dockerfile-based build (deploy/docker/Dockerfile, context = repo root) via
 # the shared buildah-with-args Task. Pushes to the in-cluster Harbor bypass
@@ -19,7 +19,7 @@ metadata:
     app.kubernetes.io/component: ci-cd
     app.kubernetes.io/part-of: omnigent
 spec:
-  description: Build and push the Omnigent server image, then restart its consumers.
+  description: Build and push the Omnigent server image, then run database migrations.
   params:
     - name: repo-url
       type: string

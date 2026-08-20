@@ -3488,6 +3488,7 @@ def test_run_without_agent_claude_alias_dispatches_generated_yaml_headlessly(
     # (config defaults and ambient creds must not leak into the generated YAML
     # or the dispatch kwargs asserted below).
     monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -3679,6 +3680,7 @@ def test_attach_without_conversation_errors_loud(monkeypatch: pytest.MonkeyPatch
 def test_run_with_agent_still_dispatches_existing_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """Existing ``run AGENT --harness`` behavior still passes through."""
     monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
     run_chat = Mock()
     monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
 
@@ -3720,6 +3722,7 @@ def test_run_with_agent_still_dispatches_existing_path(monkeypatch: pytest.Monke
 def test_run_resume_picker_forwards_to_run_chat(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bare ``--resume`` forwards as ``resume_picker=True``."""
     monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
     run_chat = Mock()
     monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
 
@@ -3767,6 +3770,7 @@ def test_run_resume_with_conversation_id_forwards_to_run_chat(
 ) -> None:
     """``--resume <id>`` forwards as ``resume_conversation_id`` (not picker)."""
     monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
     run_chat = Mock()
     monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
 
@@ -3858,6 +3862,7 @@ def test_resume_flags_with_prompt_dispatch_to_session_path(
 ) -> None:
     """Headless ``-p`` can resume by routing through the session-backed chat path."""
     monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
     run_chat = Mock()
     run_prompt = Mock()
     monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
@@ -3894,6 +3899,7 @@ def test_run_with_agent_prompt_dispatches_headlessly(monkeypatch: pytest.MonkeyP
     (daemon-backed), not the legacy in-process ``run_prompt``.
     """
     monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
     run_chat = Mock()
     run_prompt = Mock()
     monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
@@ -4477,6 +4483,7 @@ def test_config_set_global_writes_file(
     """
     config_path = tmp_path / "config.yaml"
     monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
 
     result = CliRunner().invoke(
         cli,
@@ -4913,6 +4920,7 @@ def test_run_cli_arg_overrides_global_config(
     """
     config_path = tmp_path / "config.yaml"
     monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
     _save_global_config({"model": "global-model", "server": "https://global.example.com"})
 
     dispatched: dict[str, object] = {}

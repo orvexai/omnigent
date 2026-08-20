@@ -46,19 +46,16 @@ def _trigger_pipeline_run() -> dict:
     raise AssertionError("trigger.yaml has no PipelineRun resource template")
 
 
-def test_migration_task_runs_after_build_and_gates_rollout() -> None:
+def test_migration_task_runs_after_build_without_rollout() -> None:
     pipeline = _pipeline()
     migration = _task("run-migrations")
-    rollout = _task("rollout-restart")
 
     assert migration["runAfter"] == ["build-and-push"]
-    conditions = rollout["when"]
-    assert {condition["input"] for condition in conditions} == {
-        "$(tasks.build-and-push.status)",
-        "$(tasks.run-migrations.status)",
+    task_names = {
+        task["name"]
+        for task in pipeline["spec"].get("tasks", []) + pipeline["spec"].get("finally", [])
     }
-    assert all(condition["values"] == ["Succeeded"] for condition in conditions)
-    assert pipeline["spec"]["finally"][0]["name"] == "rollout-restart"
+    assert "rollout-restart" not in task_names
 
 
 def test_job_image_is_digest_pinned() -> None:
@@ -138,23 +135,15 @@ def test_migration_task_observes_success_and_failure_and_preserves_status() -> N
     assert 'kubectl delete --namespace omnigent "${JOB}" --ignore-not-found || true' in script
 
 
-def test_rollout_waits_for_completion() -> None:
-    script = _task_script("rollout-restart")
-    assert "kubectl rollout restart" in script
-    assert "kubectl rollout status" in script
-    assert "--timeout=630s" in script
-    assert "kubectl rollout status" in script and "|| rc=1" in script
+def test_pipeline_does_not_wait_for_rollout() -> None:
+    pipeline = _pipeline()["spec"]
+    task_names = {task["name"] for task in pipeline.get("tasks", []) + pipeline.get("finally", [])}
+    assert "rollout-restart" not in task_names
 
 
-def test_rollout_rbac_permits_watch() -> None:
-    documents = list(yaml.safe_load_all((ROOT / "tekton/rollout-rbac.yaml").open()))
-    rule = next(
-        rule
-        for document in documents
-        for rule in document.get("rules", [])
-        if "deployments" in rule.get("resources", [])
-    )
-    assert {"get", "patch", "list", "watch"} <= set(rule["verbs"])
+def test_rollout_rbac_is_removed() -> None:
+    assert not (ROOT / "tekton/rollout-rbac.yaml").exists()
+    assert "rollout-rbac.yaml" not in (ROOT / "tekton/kustomization.yaml").read_text()
 
 
 def test_every_kubectl_task_has_a_service_account_mapping() -> None:
@@ -169,7 +158,7 @@ def test_every_kubectl_task_has_a_service_account_mapping() -> None:
         spec["pipelineTaskName"] for spec in pipeline_run["spec"].get("taskRunSpecs", [])
     }
     assert mapped_tasks == kubectl_tasks
-    assert mapped_tasks == {"run-migrations", "rollout-restart"}
+    assert mapped_tasks == {"run-migrations"}
 
 
 def test_job_command_matches_dockerfile_entrypoint_path() -> None:
