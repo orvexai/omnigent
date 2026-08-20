@@ -20,7 +20,8 @@ sentinel, no snapshot hooks, and no side-channels. Events emitted while a user
 has no stream connected are deleted with the short retention window — that
 user's next page load fetches the list over HTTP anyway. When runtime database
 wiring is unavailable, the in-process path remains available for embedded and
-unit-test deployments.
+unit-test deployments. A configured database whose schema is unavailable is an
+error, not a reason to silently fall back to per-pod delivery.
 """
 
 from __future__ import annotations
@@ -31,9 +32,9 @@ import logging
 import secrets
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import (
     BigInteger,
@@ -43,8 +44,8 @@ from sqlalchemy import (
     String,
     Table,
     Text,
-    and_,
     delete,
+    func,
     insert,
     select,
 )
@@ -64,6 +65,7 @@ _shared_events = Table(
     Column("sequence", Integer, primary_key=True, autoincrement=True),
     Column("workspace_id", Integer, nullable=False),
     Column("event_id", String(32), nullable=False),
+    Column("publisher_id", String(32), nullable=False),
     Column("user_key", String(512), nullable=False),
     Column("published_at", BigInteger, nullable=False),
     Column("payload", Text, nullable=False),
@@ -75,23 +77,19 @@ class _SharedEventBus:
     """Database-backed announcement transport shared by all replicas."""
 
     session_maker: Any
+    storage_location: str
+    publisher_id: str
 
     def cursor(self, user_key: str, workspace_id: int) -> int:
         with self.session_maker("cursor_user_session_events") as session:
             row = session.execute(
-                select(_shared_events.c.sequence)
-                .where(
-                    and_(
-                        _shared_events.c.workspace_id == workspace_id,
-                        _shared_events.c.user_key == user_key,
-                    )
+                select(func.max(_shared_events.c.sequence)).where(
+                    _shared_events.c.workspace_id == workspace_id
                 )
-                .order_by(_shared_events.c.sequence.desc())
-                .limit(1)
             ).first()
-        return 0 if row is None else int(row[0])
+        return 0 if row is None or row[0] is None else int(row[0])
 
-    def append(self, user_key: str, event: dict[str, Any], workspace_id: int) -> None:
+    def append(self, user_key: str, event: dict[str, Any], workspace_id: int) -> str:
         now = time.time_ns()
         event_id = secrets.token_hex(16)
         payload = json.dumps(event, separators=(",", ":"), ensure_ascii=False)
@@ -100,6 +98,7 @@ class _SharedEventBus:
                 insert(_shared_events).values(
                     workspace_id=workspace_id,
                     event_id=event_id,
+                    publisher_id=self.publisher_id,
                     user_key=user_key,
                     published_at=now,
                     payload=payload,
@@ -111,27 +110,29 @@ class _SharedEventBus:
                     < now - int(_SHARED_EVENT_RETENTION_S * 1_000_000_000),
                 )
             )
+        return event_id
 
-    def read_after(
+    def read_after_all(
         self,
-        user_key: str,
-        workspace_id: int,
         cursor: int,
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[tuple[int, int, str, str, dict[str, Any]]], int]:
         with self.session_maker("read_user_session_events") as session:
             rows = session.execute(
-                select(_shared_events.c.sequence, _shared_events.c.payload)
-                .where(
-                    and_(
-                        _shared_events.c.workspace_id == workspace_id,
-                        _shared_events.c.user_key == user_key,
-                        _shared_events.c.sequence > cursor,
-                    )
+                select(
+                    _shared_events.c.sequence,
+                    _shared_events.c.workspace_id,
+                    _shared_events.c.publisher_id,
+                    _shared_events.c.user_key,
+                    _shared_events.c.payload,
                 )
+                .where(_shared_events.c.sequence > cursor)
                 .order_by(_shared_events.c.sequence)
                 .limit(128)
             ).all()
-        events = [json.loads(str(row[1])) for row in rows]
+        events = [
+            (int(row[0]), int(row[1]), str(row[2]), str(row[3]), json.loads(str(row[4])))
+            for row in rows
+        ]
         if not rows:
             return events, cursor
         return events, int(rows[-1][0])
@@ -139,6 +140,15 @@ class _SharedEventBus:
 
 _bus_lock = threading.Lock()
 _buses: dict[str, _SharedEventBus] = {}
+_pollers: dict[tuple[str, asyncio.AbstractEventLoop], asyncio.Task[None]] = {}
+
+
+@dataclass(frozen=True)
+class _Subscriber:
+    queue: asyncio.Queue[dict[str, Any]]
+    loop: asyncio.AbstractEventLoop
+    workspace_id: int
+    storage_location: str | None
 
 
 def _shared_bus() -> _SharedEventBus | None:
@@ -155,30 +165,114 @@ def _shared_bus() -> _SharedEventBus | None:
         bus = _buses.get(storage_location)
         if bus is not None:
             return bus
-        try:
-            engine = get_or_create_engine(storage_location)
-            _shared_events.create(engine, checkfirst=True)
-            bus = _SharedEventBus(
-                make_named_managed_session_maker(
-                    engine,
-                    query_name_prefix="omnigent.runtime.user_session_stream",
-                )
-            )
-        except Exception:
-            _logger.debug("shared user-session event bus unavailable", exc_info=True)
-            return None
+        engine = get_or_create_engine(storage_location)
+        bus = _SharedEventBus(
+            make_named_managed_session_maker(
+                engine,
+                query_name_prefix="omnigent.runtime.user_session_stream",
+            ),
+            storage_location,
+            secrets.token_hex(16),
+        )
         _buses[storage_location] = bus
         return bus
 
 
-# Subscriber registry: user_key -> set of (queue, event_loop) pairs. The loop
-# reference lets a publisher running on a different thread/loop deliver into the
-# queue's owning loop via ``call_soon_threadsafe`` (matches session_stream).
+# Subscriber registry: user_key -> queue/event-loop records. The loop reference
+# lets a publisher on a different thread/loop use ``call_soon_threadsafe``.
 _subscribers: dict[
     str,
-    set[tuple[asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop]],
+    set[_Subscriber],
 ] = {}
 _lock = threading.Lock()
+
+
+def _bus_storage_location(bus: object) -> str:
+    storage_location = getattr(bus, "storage_location", None)
+    if isinstance(storage_location, str) and storage_location:
+        return storage_location
+    return f"bus:{id(bus)}"
+
+
+def _deliver_local(
+    user_key: str,
+    event: dict[str, Any],
+    workspace_id: int,
+    storage_location: str | None,
+) -> None:
+    with _lock:
+        subscribers = list(_subscribers.get(user_key, ()))
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    for subscriber in subscribers:
+        if (
+            subscriber.workspace_id != workspace_id
+            or subscriber.storage_location != storage_location
+        ):
+            continue
+        if subscriber.loop is running_loop:
+            subscriber.queue.put_nowait(event)
+        else:
+            subscriber.loop.call_soon_threadsafe(subscriber.queue.put_nowait, event)
+
+
+async def _poll_shared_events(
+    bus: Any,
+    storage_location: str,
+    initial_cursor: int,
+) -> None:
+    """Read the shared stream once per interval for all local subscribers."""
+    loop = asyncio.get_running_loop()
+    key = (storage_location, loop)
+    cursor = initial_cursor
+    try:
+        read_after_all = getattr(bus, "read_after_all", None)
+        if not callable(read_after_all):
+            return
+        read_after_all = cast(
+            Callable[
+                [int],
+                tuple[list[tuple[int, int, str, str, dict[str, Any]]], int],
+            ],
+            read_after_all,
+        )
+        while True:
+            await asyncio.sleep(_SHARED_EVENT_POLL_INTERVAL_S)
+            with _lock:
+                active = any(
+                    subscriber.storage_location == storage_location
+                    for subscribers in _subscribers.values()
+                    for subscriber in subscribers
+                )
+            if not active:
+                return
+            try:
+                rows, cursor = await asyncio.to_thread(read_after_all, cursor)
+            except Exception:
+                _logger.exception("shared user-session event poll failed")
+                raise
+            publisher_id = getattr(bus, "publisher_id", None)
+            for _sequence, workspace_id, row_publisher_id, user_key, event in rows:
+                if row_publisher_id == publisher_id:
+                    continue
+                _deliver_local(user_key, event, workspace_id, storage_location)
+    finally:
+        if _pollers.get(key) is asyncio.current_task():
+            _pollers.pop(key, None)
+
+
+def _ensure_shared_poller(bus: Any, initial_cursor: int) -> None:
+    loop = asyncio.get_running_loop()
+    storage_location = _bus_storage_location(bus)
+    key = (storage_location, loop)
+    task = _pollers.get(key)
+    if task is None or task.done():
+        _pollers[key] = asyncio.create_task(
+            _poll_shared_events(bus, storage_location, initial_cursor),
+            name="user-session-shared-event-poller",
+        )
 
 
 def publish(user_key: str, event: dict[str, Any]) -> None:
@@ -194,20 +288,15 @@ def publish(user_key: str, event: dict[str, Any]) -> None:
     :param event: The event dict to deliver, e.g.
         ``{"type": "session_added", "session_id": "conv_abc123"}``.
     """
+    workspace_id = current_workspace_id()
     bus = _shared_bus()
+    storage_location = _bus_storage_location(bus) if bus is not None else None
+    _deliver_local(user_key, event, workspace_id, storage_location)
     if bus is not None:
-        try:
-            bus.append(user_key, event, current_workspace_id())
-            return
-        except Exception:
-            _logger.warning(
-                "shared user-session event publish failed; using local delivery",
-                exc_info=True,
-            )
-    with _lock:
-        subs = list(_subscribers.get(user_key, ()))
-    for queue, loop in subs:
-        loop.call_soon_threadsafe(queue.put_nowait, event)
+        # Local delivery is queued first so a slow database cannot add latency
+        # to same-process subscribers. A configured schema failure still
+        # propagates; it never degrades into local-only delivery.
+        bus.append(user_key, event, workspace_id)
 
 
 async def subscribe(user_key: str) -> AsyncIterator[dict[str, Any]]:
@@ -224,34 +313,22 @@ async def subscribe(user_key: str) -> AsyncIterator[dict[str, Any]]:
         :func:`publish`).
     :returns: An async iterator of event dicts, each yielded verbatim.
     """
+    workspace_id = current_workspace_id()
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     loop = asyncio.get_running_loop()
-    entry = (queue, loop)
-    bus = _shared_bus()
-    workspace_id = current_workspace_id()
-    cursor = bus.cursor(user_key, workspace_id) if bus is not None else None
+    bus = await asyncio.to_thread(_shared_bus)
+    storage_location = _bus_storage_location(bus) if bus is not None else None
+    cursor = (
+        await asyncio.to_thread(bus.cursor, user_key, workspace_id) if bus is not None else None
+    )
+    entry = _Subscriber(queue, loop, workspace_id, storage_location)
     with _lock:
         _subscribers.setdefault(user_key, set()).add(entry)
+    if bus is not None and cursor is not None:
+        _ensure_shared_poller(bus, cursor)
     try:
         while True:
-            if bus is None or cursor is None:
-                yield await queue.get()
-                continue
-            try:
-                event = await asyncio.wait_for(
-                    queue.get(),
-                    timeout=_SHARED_EVENT_POLL_INTERVAL_S,
-                )
-            except asyncio.TimeoutError:
-                try:
-                    events, cursor = bus.read_after(user_key, workspace_id, cursor)
-                except Exception:
-                    _logger.debug("shared user-session event poll failed", exc_info=True)
-                    continue
-                for event in events:
-                    queue.put_nowait(event)
-                continue
-            yield event
+            yield await queue.get()
     finally:
         with _lock:
             subs = _subscribers.get(user_key)

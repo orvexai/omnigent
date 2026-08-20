@@ -72,6 +72,35 @@ async def test_runner_rehome_ends_stream_without_done_for_client_reconnect(
 
 
 @pytest.mark.asyncio
+async def test_managed_launch_remote_binding_ends_stream_for_client_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = {"value": None}
+
+    monkeypatch.setattr(
+        session_stream, "_runner_binding_for", lambda _conversation_id: binding["value"]
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.get_runner_router",
+        lambda: SimpleNamespace(_pod_addr="10.0.0.9:8000"),
+    )
+    monkeypatch.setattr(helpers, "_SESSION_STREAM_HEARTBEAT_INTERVAL_S", 0.001)
+    session_stream._subscribers.clear()
+
+    stream = _stream_live_events(_ConnectedRequest(), "conv_managed")
+    first = await asyncio.wait_for(stream.__anext__(), timeout=2.0)
+    assert "session.heartbeat" in first
+
+    # Managed provisioning commits the runner after the browser subscribed,
+    # and this replica is not the durable owner.
+    binding["value"] = ("runner_managed", "10.0.0.7:8000")
+    frames = [frame async for frame in stream]
+
+    assert all("[DONE]" not in frame for frame in frames)
+    assert "conv_managed" not in session_stream._subscribers
+
+
+@pytest.mark.asyncio
 async def test_unbound_session_uses_host_owner_fallback() -> None:
     host = SimpleNamespace(owner_addr="10.0.0.7:8000", updated_at=10**18, status="online")
     conversation = SimpleNamespace(runner_id=None, host_id="host_remote")

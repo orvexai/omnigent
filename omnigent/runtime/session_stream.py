@@ -118,26 +118,27 @@ def _runner_binding_changed(
     initial_binding: tuple[str, str | None] | None,
 ) -> bool:
     """Detect a runner rebinding or a durable owner moving to another pod."""
-    if initial_binding is None:
-        return False
     current_binding = _runner_binding_for(conversation_id)
     if current_binding is None:
         return False
-    initial_runner_id, initial_owner_addr = initial_binding
     current_runner_id, current_owner_addr = current_binding
-    if current_runner_id != initial_runner_id:
+    if initial_binding is not None and current_runner_id != initial_binding[0]:
         return True
-    if initial_owner_addr is not None:
-        return current_owner_addr is not None and current_owner_addr != initial_owner_addr
     if current_owner_addr is None:
         return False
+    if initial_binding is not None and initial_binding[1] is not None:
+        return current_owner_addr != initial_binding[1]
     try:
         from omnigent.runtime import get_runner_router
 
         local_addr = getattr(get_runner_router(), "_pod_addr", None)
     except Exception:
         local_addr = None
-    return isinstance(local_addr, str) and current_owner_addr != local_addr
+    if not isinstance(local_addr, str):
+        return False
+    # Managed launch can bind the runner after the browser has subscribed.
+    # A first remote owner, like a durable owner move, requires reconnect.
+    return current_owner_addr != local_addr
 
 
 def publish(conversation_id: str, event: dict[str, Any]) -> None:
