@@ -18,6 +18,7 @@ exit removes the slot in its ``finally`` block.
 Producer (workflow thread, sync):
     publish(conversation_id, event)  — thread-safe broadcast
     close(conversation_id)           — broadcasts end-of-stream
+    reconnect(conversation_id)       — drops subscribers for reconnect
                                        to all active subscribers
 
 Consumer (SSE endpoint, async):
@@ -42,10 +43,15 @@ _SUBSCRIBER_QUEUE_MAX_EVENTS = 1024
 # Sentinel objects that signal terminal subscriber states.
 _DONE = object()
 _OVERFLOW = object()
+_RECONNECT = object()
 
 
 class SubscriberOverflowError(RuntimeError):
     """Raised when a subscriber falls behind the bounded live-event queue."""
+
+
+class SubscriberReconnectError(SubscriberOverflowError):
+    """Raised when a subscriber must reconnect to refresh replica ownership."""
 
 
 # Subscriber registry: conversation_id -> set of
@@ -76,6 +82,62 @@ def _enqueue_or_overflow(
         except asyncio.QueueEmpty:
             break
     queue.put_nowait(_OVERFLOW)
+
+
+def _enqueue_reconnect(queue: asyncio.Queue[dict[str, Any] | object]) -> None:
+    """Replace queued events with a reconnect signal."""
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+    queue.put_nowait(_RECONNECT)
+
+
+def _runner_binding_for(conversation_id: str) -> tuple[str, str | None] | None:
+    """Read the runner and durable owner observed by this server process."""
+    try:
+        from omnigent.runtime import get_conversation_store, get_runner_router
+
+        router = get_runner_router()
+        if router is None:
+            return None
+        conversation = get_conversation_store().get_conversation(conversation_id)
+        runner_id = getattr(conversation, "runner_id", None)
+        if not isinstance(runner_id, str) or not runner_id:
+            return None
+        owner_lookup = getattr(router, "runner_owner_addr", None)
+        owner_addr = owner_lookup(runner_id) if callable(owner_lookup) else None
+        return runner_id, owner_addr if isinstance(owner_addr, str) else None
+    except Exception:
+        return None
+
+
+def _runner_binding_changed(
+    conversation_id: str,
+    initial_binding: tuple[str, str | None] | None,
+) -> bool:
+    """Detect a runner rebinding or a durable owner moving to another pod."""
+    if initial_binding is None:
+        return False
+    current_binding = _runner_binding_for(conversation_id)
+    if current_binding is None:
+        return False
+    initial_runner_id, initial_owner_addr = initial_binding
+    current_runner_id, current_owner_addr = current_binding
+    if current_runner_id != initial_runner_id:
+        return True
+    if initial_owner_addr is not None:
+        return current_owner_addr is not None and current_owner_addr != initial_owner_addr
+    if current_owner_addr is None:
+        return False
+    try:
+        from omnigent.runtime import get_runner_router
+
+        local_addr = getattr(get_runner_router(), "_pod_addr", None)
+    except Exception:
+        local_addr = None
+    return isinstance(local_addr, str) and current_owner_addr != local_addr
 
 
 def publish(conversation_id: str, event: dict[str, Any]) -> None:
@@ -136,21 +198,24 @@ def close(conversation_id: str) -> None:
         loop.call_soon_threadsafe(_enqueue_or_overflow, queue, _DONE)
 
 
+def reconnect(conversation_id: str) -> None:
+    """Terminate active subscribers without a normal-completion sentinel."""
+    with _lock:
+        subs = list(_subscribers.get(conversation_id, ()))
+    for queue, loop in subs:
+        loop.call_soon_threadsafe(_enqueue_reconnect, queue)
+
+
 def shutdown_all() -> None:
     """Signal all active subscribers across every conversation to exit.
 
-    Broadcasts the end-of-stream sentinel to every queued subscriber so
-    SSE generators return at their next iteration without waiting for a
-    heartbeat timeout or forced task cancellation. Called from the asyncio
-    event loop (``_ShutdownSignalingServer.shutdown`` in ``cli.py``) before
-    uvicorn's graceful-shutdown wait starts, so streams drain within the
-    window rather than being force-cancelled. Sync callers should use
-    :func:`close` per-conversation instead.
+    Signals every subscriber to reconnect before the pod drains. The
+    reconnect path deliberately avoids the normal-completion sentinel.
     """
     with _lock:
         all_subs = [entry for subs in _subscribers.values() for entry in subs]
-    for queue, _ in all_subs:
-        _enqueue_or_overflow(queue, _DONE)
+    for queue, loop in all_subs:
+        loop.call_soon_threadsafe(_enqueue_reconnect, queue)
 
 
 async def subscribe(
@@ -254,6 +319,7 @@ async def subscribe(
             exc_info=True,
         )
         pre_ready_events = []
+    initial_runner_binding = _runner_binding_for(conversation_id)
     try:
         if ready_event is not None:
             yield ready_event
@@ -283,6 +349,10 @@ async def subscribe(
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=heartbeat_interval_s)
                 except asyncio.TimeoutError:
+                    if _runner_binding_changed(conversation_id, initial_runner_binding):
+                        raise SubscriberReconnectError(
+                            f"session stream for {conversation_id!r} moved to another replica"
+                        ) from None
                     # Queue was idle past the heartbeat deadline. Emit
                     # a synthetic keepalive. Its wire bytes give the
                     # route's ``request.is_disconnected()`` check and
@@ -293,6 +363,10 @@ async def subscribe(
                     continue
             if item is _DONE:
                 return
+            if item is _RECONNECT:
+                raise SubscriberReconnectError(
+                    f"session stream for {conversation_id!r} requires reconnect"
+                )
             if item is _OVERFLOW:
                 raise SubscriberOverflowError(
                     f"session stream subscriber for {conversation_id!r} "

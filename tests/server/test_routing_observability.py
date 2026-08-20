@@ -166,8 +166,13 @@ async def test_wrong_replica_handler_counts_and_stats_endpoint_has_no_identifier
     assert response.status_code == 400
     assert app.state.routing_stats.snapshot()["wrong_replica_total"] == 1
     record = next(
-        record for record in caplog.records if record.message == "wrong_replica routing failure"
+        record
+        for record in caplog.records
+        if record.message.startswith("wrong_replica routing failure:")
     )
+    assert "owner_addr=None" in record.message
+    assert "owner_resolvable=False" in record.message
+    assert "forward_attempted=False" in record.message
     assert record.routing == {
         "path": "/test-routing/conv-secret",
         "session_id": "conv-secret",

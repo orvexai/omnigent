@@ -35,11 +35,12 @@ import contextlib
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Protocol
 
+from omnigent.db.db_models import normalize_uuid
 from omnigent.runner.transports.ws_tunnel.frames import (
     Frame,
     HelloFrame,
@@ -51,6 +52,32 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+def _runner_host_attribution(
+    ws: WebSocketLike,
+    runner_id: str,
+) -> tuple[object, str, int] | None:
+    """Resolve a runner's host registry attribution, if available."""
+    scope = getattr(ws, "scope", None)
+    app = scope.get("app") if isinstance(scope, dict) else None
+    host_registry = getattr(getattr(app, "state", None), "host_registry", None)
+    resolve_attribution = getattr(host_registry, "runner_host_attribution", None)
+    if callable(resolve_attribution):
+        resolved = resolve_attribution(runner_id)
+        if (
+            isinstance(resolved, tuple)
+            and len(resolved) == 2
+            and isinstance(resolved[0], str)
+            and isinstance(resolved[1], int)
+        ):
+            return host_registry, resolved[0], resolved[1]
+    resolve_runner_host = getattr(host_registry, "runner_host_id", None)
+    if callable(resolve_runner_host):
+        resolved = resolve_runner_host(runner_id)
+        if isinstance(resolved, str):
+            return host_registry, resolved, 0
+    return None
 
 
 class WebSocketLike(Protocol):
@@ -91,6 +118,10 @@ class RunnerSession:
         disabled (single-user mode). Used to enforce runner
         ownership: only the owner (or an admin) may bind sessions
         to this runner.
+    :param host_id: Host that owns this runner when local launch or hello
+        attribution is available.
+    :param host_generation: Server-assigned host connection generation that
+        launched or advertised this runner.
     :param in_flight: Per-req_id reassembly state. Each entry holds
         a head Future + body queue + end Event so the transport can
         await heads, iterate body chunks, and detect end.
@@ -104,6 +135,9 @@ class RunnerSession:
     connected_at: float
     last_frame_at: float
     owner: str | None
+    host_id: str | None
+    host_generation: int | None
+    connected_sequence: int = 0
     in_flight: dict[str, RequestState] = field(default_factory=dict)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
     # 8-char hex channel ids; values hold the inbound queue consumed
@@ -236,6 +270,7 @@ class TunnelRegistry:
         self._max_connect_waiters_per_runner = max_connect_waiters_per_runner
         self._max_connect_waiters_total = max_connect_waiters_total
         self._connect_waiter_total = 0
+        self._sequence = 0
         self._lock = threading.RLock()
 
     # ── Session lifecycle ────────────────────────────────
@@ -267,6 +302,7 @@ class TunnelRegistry:
         """
         loop = asyncio.get_running_loop()
         now = time.time()
+        attribution = _runner_host_attribution(ws, runner_id)
         session = RunnerSession(
             runner_id=runner_id,
             ws=ws,
@@ -276,8 +312,12 @@ class TunnelRegistry:
             connected_at=now,
             last_frame_at=now,
             owner=owner,
+            host_id=attribution[1] if attribution is not None else None,
+            host_generation=attribution[2] if attribution is not None else None,
         )
         with self._lock:
+            self._sequence += 1
+            session.connected_sequence = self._sequence
             old = self._sessions.pop(runner_id, None)
             if old is not None:
                 self._abort_session_inflight(
@@ -337,7 +377,116 @@ class TunnelRegistry:
                 ConnectionError("tunnel closed before request completed"),
             )
         _retire_session_writer(removed, code=4003, reason="tunnel closed")
+        self._forget_session_attribution(removed)
         return removed
+
+    def update_runner_attribution(
+        self,
+        runner_id: str,
+        host_id: str,
+        host_generation: int,
+    ) -> None:
+        """Move a live runner session to its current host generation."""
+        normalized_host_id = normalize_uuid(host_id) or host_id
+        with self._lock:
+            session = self._sessions.get(runner_id)
+            if session is not None:
+                session.host_id = normalized_host_id
+                session.host_generation = host_generation
+
+    def observation_sequence(self) -> int:
+        """Return the registration sequence observed by a host hello."""
+        with self._lock:
+            return self._sequence
+
+    def _forget_session_attribution(self, session: RunnerSession) -> None:
+        if session.host_id is None or session.host_generation is None:
+            return
+        scope = getattr(session.ws, "scope", None)
+        app = scope.get("app") if isinstance(scope, dict) else None
+        host_registry = getattr(getattr(app, "state", None), "host_registry", None)
+        forget = getattr(host_registry, "forget_runner_attribution", None)
+        if callable(forget):
+            forget(
+                session.runner_id,
+                host_id=session.host_id,
+                host_generation=session.host_generation,
+            )
+
+    def reconcile_host(
+        self,
+        host_id: str,
+        advertised_runner_ids: Collection[str],
+        *,
+        observed_sequence: int,
+        attributed_runner_generations: Mapping[str, int] | None = None,
+        inventory_generation: int = 0,
+    ) -> list[str]:
+        """Remove old runner tunnels absent from a host's hello inventory.
+
+        A runner registered after ``observed_sequence`` raced the host hello and is
+        preserved; older absent sessions are retired atomically with the
+        registry removal so new requests cannot select them.
+
+        :param host_id: Canonical host identifier, e.g. ``"a1b2..."``.
+        :param advertised_runner_ids: Runner IDs the host currently reports.
+        :param observed_sequence: Runner-registry sequence captured when the
+            host hello was received.
+        :param attributed_runner_generations: Runner IDs and the host
+            generation that launched or advertised them.
+        :param inventory_generation: Server-assigned generation for this hello.
+        :returns: Runner IDs removed from the live registry.
+        """
+        normalized_host_id = normalize_uuid(host_id) or host_id
+        advertised = set(advertised_runner_ids)
+        attributed = dict(attributed_runner_generations or {})
+        removed: list[RunnerSession] = []
+        with self._lock:
+            unattributed_count = sum(
+                1
+                for runner_id, session in self._sessions.items()
+                if session.host_id is None
+                and runner_id not in attributed
+                and runner_id not in advertised
+                and session.connected_sequence <= observed_sequence
+            )
+            if unattributed_count:
+                _logger.warning(
+                    "Host hello %s could not be reconciled against %d "
+                    "unattributed runner(s); leaving them connected",
+                    host_id,
+                    unattributed_count,
+                )
+            for runner_id, session in list(self._sessions.items()):
+                owned_by_host = (
+                    session.host_id == normalized_host_id
+                    and (session.host_generation or 0) <= inventory_generation
+                ) or (
+                    session.host_id is None
+                    and runner_id in attributed
+                    and attributed[runner_id] <= inventory_generation
+                )
+                if (
+                    not owned_by_host
+                    or runner_id in advertised
+                    or session.connected_sequence > observed_sequence
+                ):
+                    continue
+                self._sessions.pop(runner_id)
+                self._abort_session_inflight(
+                    session,
+                    ConnectionError("runner absent from owning host inventory"),
+                )
+                removed.append(session)
+
+        for session in removed:
+            _logger.warning(
+                "Deregistering runner %s; absent from host %s inventory",
+                session.runner_id,
+                host_id,
+            )
+            _retire_session_writer(session, code=4003, reason="runner absent from host")
+        return [session.runner_id for session in removed]
 
     @staticmethod
     def _abort_session_inflight(session: RunnerSession, error: BaseException) -> None:

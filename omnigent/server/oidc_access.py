@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Protocol
 
 from omnigent.server.admin_list import AdminList, MtimeCachedIdentitySet, resolve_data_dir
+from omnigent.server.sharing_settings import read_runtime_setting
 
 
 def resolve_allowed_domains_path() -> Path:
@@ -94,9 +95,30 @@ class OidcAdmissionPolicy:
         self._config_domains: frozenset[str] = frozenset(
             d.strip().lower() for d in (config_allowed_domains or frozenset()) if d.strip()
         )
-        self._file_domains = MtimeCachedIdentitySet(domains_file_path)
+        self._domains_file_path = domains_file_path
+        self._use_shared_domains = (
+            not os.environ.get("OMNIGENT_OIDC_ALLOWED_DOMAINS_PATH", "").strip()
+            and domains_file_path == resolve_data_dir() / "allowed_domains"
+        )
+        self._file_domains = (
+            None if self._use_shared_domains else MtimeCachedIdentitySet(domains_file_path)
+        )
         self._admin_list = admin_list
         self._invited_lookup = invited_lookup
+
+    def _runtime_domains(self) -> frozenset[str]:
+        """Read default runtime additions from the shared DB or legacy file."""
+        if self._use_shared_domains:
+            raw = read_runtime_setting("oidc_allowed_domains", self._domains_file_path)
+            if raw is None:
+                return frozenset()
+            return frozenset(
+                token
+                for line in raw.splitlines()
+                if (token := line.split("#", 1)[0].strip().lower())
+            )
+        assert self._file_domains is not None
+        return self._file_domains.snapshot()
 
     def effective_domains(self) -> frozenset[str]:
         """Return the union of env, config, and file allowed domains.
@@ -104,7 +126,7 @@ class OidcAdmissionPolicy:
         :returns: All currently-configured allowed domains (lowercased).
             Empty when no domain restriction is configured.
         """
-        return self._env_domains | self._config_domains | self._file_domains.snapshot()
+        return self._env_domains | self._config_domains | self._runtime_domains()
 
     def is_admitted(self, email: str) -> bool:
         """Whether ``email`` may sign in.

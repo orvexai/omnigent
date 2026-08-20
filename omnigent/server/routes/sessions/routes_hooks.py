@@ -867,6 +867,13 @@ def register_hooks_routes(
                         Phase.LLM_REQUEST,
                         Phase.REQUEST,
                     ):
+                        await record_hook_park_if_off_owner(
+                            request,
+                            session_id=session_id,
+                            conversation_store=conversation_store,
+                            runner_router=getattr(request.app.state, "runner_router", None),
+                            conversation=access.conversation,
+                        )
                         try:
                             approved = await _hold_native_ask_gate(
                                 request,

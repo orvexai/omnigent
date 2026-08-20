@@ -1684,6 +1684,28 @@ async def _resolve_elicitation(
         resolved signal into ancestor streams when ``session_id`` is
         a child session. ``None`` keeps the signal scoped locally.
     """
+    # Classify approval before touching this replica's Future/tombstone state.
+    # The event route shares this resolver but cannot provide a Request object.
+    if runner_router is not None and conversation_store is not None:
+        conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        runner_id = getattr(conversation, "runner_id", None)
+        owner_lookup = getattr(runner_router, "runner_owner_addr", None)
+        online_check = getattr(runner_router, "runner_is_online", None)
+        pod_addr = getattr(runner_router, "_pod_addr", None)
+        if (
+            runner_id
+            and callable(owner_lookup)
+            and callable(online_check)
+            and not online_check(runner_id)
+            and pod_addr is not None
+        ):
+            owner_addr = owner_lookup(runner_id)
+            if isinstance(owner_addr, str) and owner_addr != pod_addr:
+                raise OmnigentError(
+                    "session elicitation is on another replica; retry",
+                    code=ErrorCode.WRONG_REPLICA,
+                    owner_addr=owner_addr,
+                )
     # Empty-string default is intentional, NOT a fail-loud miss: the
     # resolve-URL caller always supplies the id (it comes from the URL
     # path), but the public ``approval`` event caller may post a
@@ -9134,7 +9156,14 @@ async def _get_session_snapshot(
         try:
             routed = runner_router.client_for_session_resources(session_id)
             runner_client = routed.client
-        except (LookupError, httpx.HTTPError, OmnigentError):
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.WRONG_REPLICA:
+                raise
+            _logger.debug(
+                "No runner bound for session=%s on snapshot build",
+                session_id,
+            )
+        except (LookupError, httpx.HTTPError):
             _logger.debug(
                 "No runner bound for session=%s on snapshot build",
                 session_id,

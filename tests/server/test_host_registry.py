@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.host.frames import HostHelloFrame
+from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 
 
@@ -41,7 +45,10 @@ class FakeWebSocket:
         return ""  # pragma: no cover
 
 
-def _make_hello(name: str = "test-host") -> HostHelloFrame:
+def _make_hello(
+    name: str = "test-host",
+    runners: list[str] | None = None,
+) -> HostHelloFrame:
     """Build a minimal HostHelloFrame for tests.
 
     :param name: Human-readable host name.
@@ -51,7 +58,20 @@ def _make_hello(name: str = "test-host") -> HostHelloFrame:
         version="0.1.0",
         frame_protocol_version=1,
         name=name,
+        runners=list(runners or []),
     )
+
+
+def _make_runner_hello() -> HelloFrame:
+    """Build a minimal runner hello for inventory reconciliation tests."""
+    return HelloFrame(runner_version="0.1.0", frame_protocol_version=1)
+
+
+def _scoped_runner_ws(host_registry: HostRegistry) -> FakeWebSocket:
+    """Build a runner fake with the real app-scoped host registry."""
+    ws = FakeWebSocket()
+    ws.scope = {"app": SimpleNamespace(state=SimpleNamespace(host_registry=host_registry))}
+    return ws
 
 
 def test_register_and_get() -> None:
@@ -491,3 +511,411 @@ def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
     # Deregistering by any spelling removes the entry.
     registry.deregister(prefixed)
     assert registry.get(bare) is None
+
+
+@pytest.mark.asyncio
+async def test_host_hello_reconciles_absent_runner_tunnel_immediately() -> None:
+    """An old runner absent from a reconnect hello is removed at once."""
+    host_registry = HostRegistry()
+    runner_registry = TunnelRegistry()
+    first_conn = host_registry.register("host_a", FakeWebSocket(), _make_hello(), owner="alice")
+    assert host_registry.record_runner_attribution(
+        "host_a",
+        "runner_stale",
+        conn=first_conn,
+    )
+    host_registry.deregister("host_a")
+    conn = host_registry.register("host_a", FakeWebSocket(), _make_hello(), owner="alice")
+
+    runner_registry.register(
+        "runner_stale",
+        FakeWebSocket(),
+        _make_runner_hello(),
+    )
+    other_host_runner = runner_registry.register(
+        "runner_other_host",
+        FakeWebSocket(),
+        _make_runner_hello(),
+    )
+    removed = host_registry.reconcile_runner_inventory(
+        conn,
+        runner_registry,
+        observed_sequence=runner_registry.observation_sequence(),
+    )
+
+    assert removed == ["runner_stale"]
+    assert runner_registry.get("runner_stale") is None
+    assert runner_registry.get("runner_other_host") is other_host_runner
+
+
+@pytest.mark.asyncio
+async def test_unattributed_runner_is_left_in_place_and_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A restart-era attribution miss never tears down an unknown runner."""
+    host_registry = HostRegistry()
+    runner_registry = TunnelRegistry()
+    conn = host_registry.register("host_a", FakeWebSocket(), _make_hello(), owner="alice")
+    runner = runner_registry.register(
+        "runner_unknown",
+        FakeWebSocket(),
+        _make_runner_hello(),
+    )
+    with caplog.at_level("WARNING"):
+        removed = host_registry.reconcile_runner_inventory(
+            conn,
+            runner_registry,
+            observed_sequence=runner_registry.observation_sequence(),
+        )
+
+    assert removed == []
+    assert runner_registry.get("runner_unknown") is runner
+    assert "could not be reconciled against 1 unattributed runner(s)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_host_hello_keeps_runner_that_connected_after_hello_observation() -> None:
+    """A live runner reconnect racing the hello is not torn down."""
+    host_registry = HostRegistry()
+    runner_registry = TunnelRegistry()
+    conn = host_registry.register(
+        "host_a",
+        FakeWebSocket(),
+        _make_hello(),
+        owner="alice",
+    )
+    assert host_registry.record_runner_attribution("host_a", "runner_racing", conn=conn)
+    observed_sequence = runner_registry.observation_sequence()
+    live = runner_registry.register(
+        "runner_racing",
+        _scoped_runner_ws(host_registry),
+        _make_runner_hello(),
+    )
+
+    removed = host_registry.reconcile_runner_inventory(
+        conn,
+        runner_registry,
+        observed_sequence=observed_sequence,
+    )
+
+    assert removed == []
+    assert runner_registry.get("runner_racing") is live
+
+
+@pytest.mark.asyncio
+async def test_delayed_empty_hello_does_not_remove_newer_runner() -> None:
+    """An older accepted hello cannot supersede a newer host generation."""
+    host_registry = HostRegistry()
+    runner_registry = TunnelRegistry()
+    old_generation = host_registry.allocate_generation("host_a")
+    new_generation = host_registry.allocate_generation("host_a")
+    newer_conn = host_registry.register(
+        "host_a",
+        FakeWebSocket(),
+        _make_hello(runners=["runner_live"]),
+        owner="alice",
+        generation=new_generation,
+        runner_registry=runner_registry,
+    )
+    live = runner_registry.register(
+        "runner_live",
+        _scoped_runner_ws(host_registry),
+        _make_runner_hello(),
+    )
+
+    delayed_empty_conn = host_registry.register(
+        "host_a",
+        FakeWebSocket(),
+        _make_hello(),
+        owner="alice",
+        generation=old_generation,
+        runner_registry=runner_registry,
+    )
+
+    removed = host_registry.reconcile_runner_inventory(
+        delayed_empty_conn,
+        runner_registry,
+        observed_sequence=runner_registry.observation_sequence(),
+    )
+
+    assert removed == []
+    assert host_registry.get("host_a") is newer_conn
+    assert runner_registry.get("runner_live") is live
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_and_supersession_share_one_coordinator() -> None:
+    """A host replacement cannot slip between reconciliation's checks."""
+
+    class BlockingTunnelRegistry(TunnelRegistry):
+        """Pause while the host coordinator owns both registry locks."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def reconcile_host(self, *args: object, **kwargs: object) -> list[str]:
+            self.entered.set()
+            assert self.release.wait(timeout=1.0)
+            return super().reconcile_host(*args, **kwargs)
+
+    host_registry = HostRegistry()
+    runner_registry = BlockingTunnelRegistry()
+    conn = host_registry.register(
+        "host_a",
+        FakeWebSocket(),
+        _make_hello(runners=["runner_live"]),
+        owner="alice",
+        runner_registry=runner_registry,
+    )
+    runner_registry.register(
+        "runner_live",
+        _scoped_runner_ws(host_registry),
+        _make_runner_hello(),
+    )
+    observed_sequence = runner_registry.observation_sequence()
+    next_generation = host_registry.allocate_generation("host_a")
+    reconciliation_result: dict[str, list[str]] = {}
+
+    reconcile_thread = threading.Thread(
+        target=lambda: reconciliation_result.setdefault(
+            "removed",
+            host_registry.reconcile_runner_inventory(
+                conn,
+                runner_registry,
+                observed_sequence=observed_sequence,
+            ),
+        ),
+    )
+    reconcile_thread.start()
+    assert runner_registry.entered.wait(timeout=1.0)
+
+    replacement_done = threading.Event()
+
+    def replace_host() -> None:
+        host_registry.register(
+            "host_a",
+            FakeWebSocket(),
+            _make_hello(),
+            owner="alice",
+            generation=next_generation,
+            runner_registry=runner_registry,
+        )
+        replacement_done.set()
+
+    replacement_thread = threading.Thread(target=replace_host)
+    replacement_thread.start()
+    assert not replacement_done.wait(timeout=0.05)
+    runner_registry.release.set()
+    reconcile_thread.join(timeout=1.0)
+    replacement_thread.join(timeout=1.0)
+
+    assert reconciliation_result == {"removed": []}
+    assert replacement_done.is_set()
+    assert host_registry.get("host_a") is not conn
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_uses_sequence_not_equal_or_rolled_back_clock() -> None:
+    """Wall-clock equality or rollback cannot change the race decision."""
+    host_registry = HostRegistry()
+    runner_registry = TunnelRegistry()
+    conn = host_registry.register(
+        "host_a",
+        FakeWebSocket(),
+        _make_hello(),
+        owner="alice",
+        runner_registry=runner_registry,
+    )
+    assert host_registry.record_runner_attribution(
+        "host_a",
+        "runner_old",
+        conn=conn,
+        runner_registry=runner_registry,
+    )
+    assert host_registry.record_runner_attribution(
+        "host_a",
+        "runner_new",
+        conn=conn,
+        runner_registry=runner_registry,
+    )
+    old = runner_registry.register(
+        "runner_old",
+        _scoped_runner_ws(host_registry),
+        _make_runner_hello(),
+    )
+    observed_sequence = runner_registry.observation_sequence()
+    old.connected_at = 10**12
+    new = runner_registry.register(
+        "runner_new",
+        _scoped_runner_ws(host_registry),
+        _make_runner_hello(),
+    )
+    new.connected_at = 0.0
+
+    removed = host_registry.reconcile_runner_inventory(
+        conn,
+        runner_registry,
+        observed_sequence=observed_sequence,
+    )
+
+    assert removed == ["runner_old"]
+    assert runner_registry.get("runner_old") is None
+    assert runner_registry.get("runner_new") is new
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_aborts_in_flight_request_for_absent_runner() -> None:
+    """Removing an absent runner wakes its request waiter with an error."""
+    host_registry = HostRegistry()
+    runner_registry = TunnelRegistry()
+    conn = host_registry.register(
+        "host_a",
+        FakeWebSocket(),
+        _make_hello(runners=["runner_stale"]),
+        owner="alice",
+        runner_registry=runner_registry,
+    )
+    runner_registry.register(
+        "runner_stale",
+        _scoped_runner_ws(host_registry),
+        _make_runner_hello(),
+    )
+    conn.hello.runners = []
+    state = runner_registry.open_request("runner_stale", "req-stale")
+
+    removed = host_registry.reconcile_runner_inventory(
+        conn,
+        runner_registry,
+        observed_sequence=runner_registry.observation_sequence(),
+    )
+
+    assert removed == ["runner_stale"]
+    with pytest.raises(ConnectionError, match="absent from owning host"):
+        await state.head_future
+
+
+def test_attribution_cleanup_is_bounded_after_successful_reconciliation() -> None:
+    """An absent pending launch does not leave historical ownership behind."""
+    host_registry = HostRegistry()
+    runner_registry = TunnelRegistry()
+    conn = host_registry.register(
+        "host_a",
+        FakeWebSocket(),
+        _make_hello(runners=["runner_pending"]),
+        owner="alice",
+    )
+
+    assert host_registry.runner_host_attribution("runner_pending") == (
+        "host_a",
+        conn.generation,
+    )
+    conn.hello.runners = []
+    assert (
+        host_registry.reconcile_runner_inventory(
+            conn,
+            runner_registry,
+            observed_sequence=runner_registry.observation_sequence(),
+        )
+        == []
+    )
+    assert host_registry.runner_host_attribution("runner_pending") is None
+
+
+@pytest.mark.asyncio
+async def test_launch_attribution_updates_existing_runner_session_atomically() -> None:
+    """A launch result repairs a runner tunnel that connected just before it."""
+    host_registry = HostRegistry()
+    runner_registry = TunnelRegistry()
+    conn = host_registry.register("host_a", FakeWebSocket(), _make_hello(), owner="alice")
+    session = runner_registry.register(
+        "runner_launched",
+        _scoped_runner_ws(host_registry),
+        _make_runner_hello(),
+    )
+    assert session.host_id is None
+
+    assert host_registry.record_runner_attribution(
+        "host_a",
+        "runner_launched",
+        conn=conn,
+        runner_registry=runner_registry,
+    )
+
+    assert session.host_id == "host_a"
+    assert session.host_generation == conn.generation
+
+
+@pytest.mark.asyncio
+async def test_runner_move_updates_live_owner_before_old_host_reconciles() -> None:
+    """A recycled runner id cannot remain owned by its former host."""
+    host_registry = HostRegistry()
+    runner_registry = TunnelRegistry()
+    host_a = host_registry.register(
+        "host_a",
+        FakeWebSocket(),
+        _make_hello(),
+        owner="alice",
+    )
+    assert host_registry.record_runner_attribution("host_a", "runner_moved", conn=host_a)
+    session = runner_registry.register(
+        "runner_moved",
+        _scoped_runner_ws(host_registry),
+        _make_runner_hello(),
+    )
+    host_b = host_registry.register(
+        "host_b",
+        FakeWebSocket(),
+        _make_hello(),
+        owner="alice",
+    )
+    assert host_registry.record_runner_attribution(
+        "host_b",
+        "runner_moved",
+        conn=host_b,
+        runner_registry=runner_registry,
+    )
+
+    current_host_a = host_registry.register(
+        "host_a",
+        FakeWebSocket(),
+        _make_hello(),
+        owner="alice",
+    )
+    assert (
+        host_registry.reconcile_runner_inventory(
+            current_host_a,
+            runner_registry,
+            observed_sequence=runner_registry.observation_sequence(),
+        )
+        == []
+    )
+    assert runner_registry.get("runner_moved") is session
+    assert session.host_id == "host_b"
+
+
+@pytest.mark.asyncio
+async def test_runner_deregister_cleans_generation_attribution() -> None:
+    """Runner tunnel shutdown removes its retained host ownership."""
+    host_registry = HostRegistry()
+    runner_registry = TunnelRegistry()
+    conn = host_registry.register(
+        "host_a",
+        FakeWebSocket(),
+        _make_hello(runners=["runner_live"]),
+        owner="alice",
+        runner_registry=runner_registry,
+    )
+    session = runner_registry.register(
+        "runner_live",
+        _scoped_runner_ws(host_registry),
+        _make_runner_hello(),
+    )
+
+    assert host_registry.runner_host_attribution("runner_live") == (
+        "host_a",
+        conn.generation,
+    )
+    assert runner_registry.deregister("runner_live", session=session) is session
+    assert host_registry.runner_host_attribution("runner_live") is None

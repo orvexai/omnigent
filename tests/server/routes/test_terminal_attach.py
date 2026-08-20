@@ -720,8 +720,7 @@ async def test_attach_terminal_owner_drop_is_distinguishable() -> None:
 
     assert exc_info.value.code == 1011
     assert owner_connector.calls[0][0] == (
-        "ws://10.20.30.40:8000/v1/sessions/conv_ws/resources/terminals/"
-        "terminal_bash_s1/attach"
+        "ws://10.20.30.40:8000/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach"
     )
     assert ("X-Omnigent-Forwarded-By", "10.20.30.41:8000") in owner_connector.calls[0][1][
         "additional_headers"

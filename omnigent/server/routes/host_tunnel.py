@@ -53,6 +53,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import (
     HostConnection,
@@ -228,6 +229,14 @@ def create_host_tunnel_router(
                 return
 
         await ws.accept()
+        connection_generation = host_registry.allocate_generation(host_id)
+        ws_scope = getattr(ws, "scope", {})
+        app = ws_scope.get("app") if isinstance(ws_scope, dict) else None
+        runner_registry = getattr(
+            getattr(app, "state", None),
+            "tunnel_registry",
+            None,
+        )
         conn: HostConnection | None = None
         try:
             raw = await ws.receive_text()
@@ -236,6 +245,9 @@ def create_host_tunnel_router(
                 await ws.close(code=4001, reason="expected host.hello frame")
                 return
 
+            hello_observed_sequence = (
+                runner_registry.observation_sequence() if runner_registry is not None else 0
+            )
             remote_major = frame.frame_protocol_version
             if remote_major != SUPPORTED_FRAME_PROTOCOL_MAJOR:
                 await ws.close(
@@ -263,11 +275,28 @@ def create_host_tunnel_router(
                 ws,
                 frame,
                 owner=tunnel_owner,
+                generation=connection_generation,
+                runner_registry=runner_registry,
             )
+            if not host_registry.is_current(conn):
+                await ws.close(code=4003, reason="host connection superseded")
+                return
             # Delivered on the handshake, never persisted: a replica that just
             # started learns the host's gateway backing here, so a server
             # restart converges as soon as each host reconnects.
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
+            if runner_registry is not None:
+                removed_runner_ids = host_registry.reconcile_runner_inventory(
+                    conn,
+                    runner_registry,
+                    observed_sequence=hello_observed_sequence,
+                )
+                if removed_runner_ids:
+                    _logger.warning(
+                        "Host %s hello removed absent runner tunnel(s): %s",
+                        host_id,
+                        removed_runner_ids,
+                    )
             _logger.info(
                 "Host %s connected (version=%s, name=%s, runners=%s)",
                 host_id,
@@ -292,6 +321,7 @@ def create_host_tunnel_router(
                     host_store,
                     host_registry,
                     runner_exit_reports,
+                    runner_registry,
                     on_runner_exited,
                     on_host_update,
                 ),
@@ -420,6 +450,27 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
         await ws.send_text(data)
 
 
+def _cleanup_host_runner(
+    conn: HostConnection,
+    host_registry: HostRegistry,
+    runner_registry: TunnelRegistry | None,
+    runner_id: str,
+) -> None:
+    """Forget and retire a runner still owned by this host generation."""
+    if runner_registry is not None:
+        session = runner_registry.get(runner_id)
+        if session is not None and (
+            session.host_id == conn.host_id and (session.host_generation or 0) <= conn.generation
+        ):
+            runner_registry.deregister(runner_id, session=session)
+    host_registry.forget_runner_attribution(
+        runner_id,
+        workspace_id=conn.workspace_id,
+        host_id=conn.host_id,
+        conn=conn,
+    )
+
+
 async def _receive_loop(
     ws: WebSocket,
     conn: HostConnection,
@@ -427,6 +478,7 @@ async def _receive_loop(
     host_store: HostStore,
     host_registry: HostRegistry,
     runner_exit_reports: RunnerExitReports | None,
+    runner_registry: TunnelRegistry | None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
 ) -> None:
@@ -442,6 +494,8 @@ async def _receive_loop(
         persisted).
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
+    :param runner_registry: Live runner registry used for stop/exit cleanup;
+        ``None`` in isolated route tests.
     :param on_runner_exited: Callback fired with ``(runner_id, error)``
         when a ``host.runner_exited`` frame arrives; ``None`` skips it.
     :param on_host_update: Callback fired after readiness changes persist;
@@ -516,6 +570,14 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostLaunchRunnerResultFrame):
+            if frame.status == "launched" and frame.runner_id is not None:
+                host_registry.record_runner_attribution(
+                    host_id,
+                    frame.runner_id,
+                    workspace_id=conn.workspace_id,
+                    conn=conn,
+                    runner_registry=runner_registry,
+                )
             future = conn.pending_launches.pop(frame.request_id, None)
             if future is not None and not future.done():
                 future.set_result(
@@ -529,6 +591,14 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostStopRunnerResultFrame):
+            runner_id = conn.pending_stop_runner_ids.pop(frame.request_id, None)
+            if frame.status == "stopped" and runner_id is not None:
+                _cleanup_host_runner(
+                    conn,
+                    host_registry,
+                    runner_registry,
+                    runner_id,
+                )
             future = conn.pending_stops.pop(frame.request_id, None)
             if future is not None and not future.done():
                 future.set_result({"status": frame.status, "error": frame.error})
@@ -544,6 +614,12 @@ async def _receive_loop(
                 host_id,
                 frame.runner_id,
                 frame.error,
+            )
+            _cleanup_host_runner(
+                conn,
+                host_registry,
+                runner_registry,
+                frame.runner_id,
             )
             if runner_exit_reports is not None:
                 runner_exit_reports.record(frame.runner_id, frame.error, conn.owner)

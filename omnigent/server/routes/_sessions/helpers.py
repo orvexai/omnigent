@@ -8745,14 +8745,14 @@ def _child_session_summary_from_conversation(
         tool = display_title or None
         session_name = None
 
-    # Derive busy from the relay-fed cache; tasks table is gone.
-    cached_status = _session_status_cache.get(conv.id)
-    if cached_status in ("running", "waiting"):
+    # Prefer the local relay cache, then the cross-replica live-status mirror.
+    status = _session_status_from_cache(conv.id, conv.live_status)
+    if status == "running":
         busy = True
     else:
         busy = False
     last_task_error = _last_task_error_from_labels(labels)
-    current_task_status = _child_session_current_task_status_from_cached_status(cached_status)
+    current_task_status = _child_session_current_task_status_from_cached_status(status)
     if last_task_error is not None:
         current_task_status = "failed"
 
@@ -8786,10 +8786,12 @@ def _child_session_summary_from_conversation(
         labels=labels,
         last_task_error=last_task_error,
         last_message_preview=last_message_preview,
-        # Surface the sub-agent's parked-elicitation count from the same
-        # in-memory index that feeds the sidebar badge, so the Agents
-        # rail can flag a child that's awaiting user input.
-        pending_elicitations_count=pending_elicitations.count_for(conv.id),
+        # Prefer the local pending index and use the durable mirror off-owner.
+        pending_elicitations_count=(
+            max(pending_elicitations.count_for(conv.id), conv.pending_elicitation_count or 0)
+            if conv.runner_id is not None
+            else pending_elicitations.count_for(conv.id)
+        ),
         # The model routing picked for this child, reported only when a
         # decision actually produced it: a user-pinned model_override is not a
         # routed model, and reporting one with a null decision id makes the

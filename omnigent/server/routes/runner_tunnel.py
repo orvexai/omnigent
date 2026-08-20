@@ -39,12 +39,15 @@ from omnigent.server import session_live_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.stores.runner_tunnel_store import RunnerTunnelStore
+from omnigent.stores.runner_tunnel_store import (
+    RUNNER_TUNNEL_HEARTBEAT_INTERVAL_S,
+    RunnerTunnelStore,
+)
 
 _logger = logging.getLogger(__name__)
 
 SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
-PING_INTERVAL_S = 30.0
+PING_INTERVAL_S = RUNNER_TUNNEL_HEARTBEAT_INTERVAL_S
 PING_MISS_THRESHOLD = 3
 RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
 _ON_RUNNER_CONNECT_TIMEOUT_SEC = 30.0
@@ -441,6 +444,15 @@ def create_runner_tunnel_router(
                 await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
                 return
 
+        _logger.info(
+            "runner tunnel owner resolved: runner_id=%s tunnel_owner=%s pod_addr=%s "
+            "is_loopback=%s",
+            runner_id,
+            tunnel_owner,
+            pod_addr,
+            is_loopback,
+        )
+
         await ws.accept()
         session: RunnerSession | None = None
         try:
@@ -470,7 +482,22 @@ def create_runner_tunnel_router(
             #    checks can enforce ownership.
             session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
             if runner_tunnel_store is not None:
-                await asyncio.to_thread(runner_tunnel_store.claim, runner_id, pod_addr)
+                host_id = getattr(session, "host_id", None)
+                _logger.info(
+                    "runner tunnel ownership claim requested: runner_id=%s pod_addr=%s host_id=%s",
+                    runner_id,
+                    pod_addr,
+                    host_id,
+                )
+                if host_id is None:
+                    await asyncio.to_thread(runner_tunnel_store.claim, runner_id, pod_addr)
+                else:
+                    await asyncio.to_thread(
+                        runner_tunnel_store.claim,
+                        runner_id,
+                        pod_addr,
+                        host_id=host_id,
+                    )
             _logger.info(
                 "Runner %s connected (version=%s, harnesses=%s)",
                 runner_id,

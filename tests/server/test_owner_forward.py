@@ -4,16 +4,66 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Awaitable, Callable
 
 import httpx
 import pytest
 
-from omnigent.server.owner_forward import OwnerForwardMiddleware
+from omnigent.server.owner_forward import OwnerForwardMiddleware, _owner_url
 from omnigent.server.routing_stats import RoutingStats
 
 OWNER = "10.20.30.40:8000"
 LOCAL = "10.20.30.41:8000"
+
+
+def test_owner_url_uses_configured_non_default_port_and_rejects_mismatch() -> None:
+    scope = {
+        "raw_path": b"/v1/sessions/session/events",
+        "query_string": b"x=1",
+    }
+
+    assert (
+        _owner_url("10.20.30.40:51459", scope, 51459)
+        == "http://10.20.30.40:51459/v1/sessions/session/events?x=1"
+    )
+    assert _owner_url("10.20.30.40:8000", scope, 51459) is None
+
+
+def test_owner_url_brackets_ipv6_literal() -> None:
+    scope = {"raw_path": b"/v1/events", "query_string": b""}
+
+    assert _owner_url("[::1]:51459", scope, 51459) == "http://[::1]:51459/v1/events"
+
+
+@pytest.mark.anyio
+async def test_owner_forwarding_startup_log_reports_active_or_inactive(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200))
+    caplog.set_level(logging.INFO, logger="omnigent.server.owner_forward")
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        OwnerForwardMiddleware(
+            _wrong_replica_app(OWNER),
+            pod_addr="10.20.30.41:51459",
+            client=client,
+            enabled=True,
+            server_port=51459,
+        )
+        OwnerForwardMiddleware(
+            _wrong_replica_app(OWNER),
+            pod_addr="not-an-ip-address",
+            client=client,
+            enabled=True,
+            server_port=51459,
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("owner forwarding active" in message for message in messages)
+    assert any(
+        "owner forwarding inactive" in message and "invalid" in message for message in messages
+    )
 
 
 class _StaticOwnerStream(httpx.AsyncByteStream):
@@ -28,9 +78,7 @@ def _wrong_replica_app(owner: str) -> Callable[..., Awaitable[None]]:
             message = await receive()
             if message["type"] != "http.request" or not message.get("more_body", False):
                 break
-        body = json.dumps(
-            {"error": {"code": "wrong_replica", "message": "retry"}}
-        ).encode()
+        body = json.dumps({"error": {"code": "wrong_replica", "message": "retry"}}).encode()
         await send(
             {
                 "type": "http.response.start",
@@ -157,6 +205,7 @@ async def test_forward_replays_request_and_pipes_owner_response() -> None:
         seen["url"] = str(request.url)
         seen["body"] = await request.aread()
         seen["marker"] = request.headers.get("x-omnigent-forwarded-by")
+
         class OwnerBody(httpx.AsyncByteStream):
             async def __aiter__(self):
                 yield b"owner-"

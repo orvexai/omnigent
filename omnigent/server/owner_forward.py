@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import os
 from typing import TYPE_CHECKING, Any, cast
 
@@ -24,6 +25,7 @@ from omnigent.server.routing_stats import RoutingStats
 _FORWARDED_BY_HEADER = b"x-omnigent-forwarded-by"
 _DEFAULT_BODY_MAX_BYTES = 1 << 20
 _DEFAULT_SERVER_PORT = 8000
+_logger = logging.getLogger(__name__)
 
 
 def _env_enabled() -> bool:
@@ -51,15 +53,46 @@ def _header(scope: Scope, name: bytes) -> bytes | None:
     return None
 
 
-def _owner_url(owner_addr: str, scope: Scope, server_port: int) -> str | None:
-    """Build a pod-local URL only for a validated IPv4 address and port."""
-    host, separator, raw_port = owner_addr.rpartition(":")
-    if not separator or not host or not raw_port:
+def _parse_host_port(address: str | None) -> tuple[str, int, int] | None:
+    """Parse an IP literal plus port, returning host, port, and IP version."""
+    if not address:
+        return None
+
+    if address.startswith("["):
+        close_bracket = address.find("]")
+        if close_bracket < 0 or address[close_bracket + 1 : close_bracket + 2] != ":":
+            return None
+        host = address[1:close_bracket]
+        raw_port = address[close_bracket + 2 :]
+    else:
+        host, separator, raw_port = address.rpartition(":")
+        if not separator:
+            return None
+
+    if not host or not raw_port:
         return None
     try:
-        if ipaddress.ip_address(host).version != 4 or int(raw_port) != server_port:
-            return None
+        ip = ipaddress.ip_address(host)
+        port = int(raw_port)
     except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    return host, port, ip.version
+
+
+def _format_host_port(host: str, port: int, version: int) -> str:
+    """Format an IP literal and port for an HTTP URL or ownership marker."""
+    return f"[{host}]:{port}" if version == 6 else f"{host}:{port}"
+
+
+def _owner_url(owner_addr: str, scope: Scope, server_port: int) -> str | None:
+    """Build a pod-local URL only for a validated IP literal and port."""
+    parsed = _parse_host_port(owner_addr)
+    if parsed is None:
+        return None
+    host, port, version = parsed
+    if port != server_port:
         return None
 
     raw_path = scope.get("raw_path")
@@ -68,7 +101,8 @@ def _owner_url(owner_addr: str, scope: Scope, server_port: int) -> str | None:
     query = scope.get("query_string", b"")
     if not isinstance(query, bytes):
         query = str(query).encode("utf-8")
-    url = f"http://{owner_addr}{raw_path.decode('ascii', 'surrogateescape')}"
+    formatted_addr = _format_host_port(host, port, version)
+    url = f"http://{formatted_addr}{raw_path.decode('ascii', 'surrogateescape')}"
     if query:
         url += f"?{query.decode('ascii', 'surrogateescape')}"
     return url
@@ -95,6 +129,18 @@ class OwnerForwardMiddleware:
         self._server_port = server_port
         self._body_max_bytes = body_max_bytes or _body_max_bytes()
         self._client = client
+        address_reason = self._pod_addr_reason(pod_addr, server_port)
+        if not self._enabled:
+            _logger.warning("owner forwarding inactive: disabled by configuration")
+        elif address_reason is not None:
+            self._enabled = False
+            _logger.warning("owner forwarding inactive: %s", address_reason)
+        else:
+            _logger.info(
+                "owner forwarding active: pod_addr=%s server_port=%d",
+                pod_addr,
+                server_port,
+            )
         self._owns_client = client is None and self._enabled and pod_addr is not None
         if self._client is None and self._owns_client:
             self._client = httpx.AsyncClient(
@@ -102,6 +148,49 @@ class OwnerForwardMiddleware:
                 limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
                 timeout=httpx.Timeout(5.0, read=None),
             )
+
+    @staticmethod
+    def resolve_server_port(
+        pod_addr: str | None,
+        server_config: dict[str, Any] | None = None,
+    ) -> int:
+        """Resolve the port used by the server before middleware construction.
+
+        Container entrypoints resolve ``port`` from server config, then
+        ``PORT``. The pod address is the app-level fallback used by the CLI,
+        whose resolved Click port is not part of ``create_app``'s arguments.
+        """
+        candidates: list[Any] = []
+        if isinstance(server_config, dict):
+            candidates.append(server_config.get("port"))
+        candidates.extend(os.environ.get(name) for name in ("PORT", "DATABRICKS_APP_PORT"))
+        parsed = _parse_host_port(pod_addr)
+        if parsed is not None:
+            candidates.append(parsed[1])
+        for raw_port in candidates:
+            try:
+                port = int(raw_port)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= port <= 65535:
+                return port
+        return _DEFAULT_SERVER_PORT
+
+    @staticmethod
+    def _pod_addr_reason(pod_addr: str | None, server_port: int) -> str | None:
+        """Return the startup diagnostic for an unusable pod address."""
+        if pod_addr is None:
+            return "OMNIGENT_POD_ADDR is unset"
+        parsed = _parse_host_port(pod_addr)
+        if parsed is None:
+            return f"OMNIGENT_POD_ADDR={pod_addr!r} is invalid; expected an IP literal and port"
+        _host, pod_port, _version = parsed
+        if pod_port != server_port:
+            return (
+                f"OMNIGENT_POD_ADDR port {pod_port} does not match configured server port "
+                f"{server_port}"
+            )
+        return None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Handle HTTP scopes and leave WebSocket/lifespan scopes unchanged."""
@@ -192,7 +281,21 @@ class OwnerForwardMiddleware:
 
         owner_addr = state["omnigent_owner_addr"]
         owner_url = _owner_url(owner_addr, scope, self._server_port)
+        _logger.info(
+            "owner forwarding attempt: owner_addr=%s owner_url=%s path=%s",
+            owner_addr,
+            owner_url,
+            scope.get("path"),
+        )
         if owner_url is None or self._client is None:
+            _logger.warning(
+                "owner forwarding failed before request: owner_addr=%s owner_url=%s "
+                "local_server_port=%s client=%s",
+                owner_addr,
+                owner_url,
+                self._server_port,
+                self._client is not None,
+            )
             await self._forward_failed(original_start, original_body, send)
             return
 
@@ -221,22 +324,35 @@ class OwnerForwardMiddleware:
                 )
                 response_started = True
                 await self._pipe_response(response, receive, send)
-        except (httpx.HTTPError, OSError, RuntimeError):
+        except (httpx.HTTPError, OSError, RuntimeError) as exc:
             # The owner may have died after the durable lookup.  Keep the
             # original classified response so the caller can retry through
             # ingress and ownership can be resolved again.
+            _logger.warning(
+                "owner forwarding transport failure: owner_addr=%s owner_url=%s "
+                "response_started=%s error=%s",
+                owner_addr,
+                owner_url,
+                response_started,
+                exc,
+                exc_info=True,
+            )
             if not response_started:
                 await self._forward_failed(original_start, original_body, send)
             return
 
         state["omnigent_forward_succeeded"] = True
+        _logger.info(
+            "owner forwarding succeeded: owner_addr=%s owner_url=%s path=%s",
+            owner_addr,
+            owner_url,
+            scope.get("path"),
+        )
         if self._routing_stats is not None:
             self._routing_stats.record_forward_succeeded()
 
     def _can_forward(self, scope: Scope, body: bytes, body_replayable: bool) -> bool:
         """Check the complete forwarding conjunction without any network I/O."""
-        if not self._enabled or not self._pod_addr or self._client is None or not body_replayable:
-            return False
         try:
             payload = json.loads(body)
         except (TypeError, ValueError):
@@ -248,11 +364,79 @@ class OwnerForwardMiddleware:
             return False
         state = scope.get("state")
         owner_addr = state.get("omnigent_owner_addr") if isinstance(state, dict) else None
-        if not isinstance(owner_addr, str) or owner_addr == self._pod_addr:
+        if not self._enabled:
+            _logger.warning(
+                "owner forwarding skipped: reason=disabled owner_addr=%s path=%s",
+                owner_addr,
+                scope.get("path"),
+            )
+            return False
+        if not self._pod_addr:
+            _logger.warning(
+                "owner forwarding skipped: reason=missing_local_address owner_addr=%s path=%s",
+                owner_addr,
+                scope.get("path"),
+            )
+            return False
+        if self._client is None:
+            _logger.warning(
+                "owner forwarding skipped: reason=missing_client owner_addr=%s path=%s",
+                owner_addr,
+                scope.get("path"),
+            )
+            return False
+        if not body_replayable:
+            _logger.warning(
+                "owner forwarding skipped: reason=body_not_replayable owner_addr=%s path=%s",
+                owner_addr,
+                scope.get("path"),
+            )
+            return False
+        if not isinstance(owner_addr, str):
+            _logger.warning(
+                "owner forwarding skipped: reason=missing_owner_address owner_addr=%s path=%s",
+                owner_addr,
+                scope.get("path"),
+            )
+            return False
+        if self._same_address(owner_addr, self._pod_addr):
+            _logger.warning(
+                "owner forwarding skipped: reason=owner_is_local owner_addr=%s "
+                "local_addr=%s path=%s",
+                owner_addr,
+                self._pod_addr,
+                scope.get("path"),
+            )
             return False
         # The marker is intentionally untrusted.  It only lets a caller
         # suppress its own replay; it can never select an owner or add trust.
-        return _header(scope, _FORWARDED_BY_HEADER) is None
+        if _header(scope, _FORWARDED_BY_HEADER) is not None:
+            _logger.warning(
+                "owner forwarding skipped: reason=already_forwarded owner_addr=%s path=%s",
+                owner_addr,
+                scope.get("path"),
+            )
+            return False
+        _logger.info(
+            "owner forwarding eligible: owner_addr=%s local_addr=%s path=%s",
+            owner_addr,
+            self._pod_addr,
+            scope.get("path"),
+        )
+        return True
+
+    @staticmethod
+    def _same_address(left: str, right: str | None) -> bool:
+        """Compare ownership addresses after normalizing IPv4/IPv6 notation."""
+        if right is None:
+            return False
+        left_parsed = _parse_host_port(left)
+        right_parsed = _parse_host_port(right)
+        if left_parsed is None or right_parsed is None:
+            return left == right
+        return left_parsed[1:] == right_parsed[1:] and ipaddress.ip_address(
+            left_parsed[0]
+        ) == ipaddress.ip_address(right_parsed[0])
 
     async def _forward_failed(
         self,

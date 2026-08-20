@@ -1326,27 +1326,37 @@ def create_app(
                 file_store=file_store,
                 artifact_store=artifact_store,
             )
-            on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
             # preflight / in-flight guard) as the scheduler; it only differs in
             # allowing a paused task to fire. Exposed on app.state for the
             # POST /v1/scheduled-tasks/{id}/run route.
             app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
-            scheduled_task_scheduler = ScheduledTaskScheduler(
-                store=scheduled_task_store,
-                on_fire=on_fire,
-            )
-            app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
-            # Scheduled tasks are a non-critical subsystem: a failure loading the
-            # schedule (e.g. a DB error listing active tasks) must not take
-            # down server boot. Log and continue with the scheduler unstarted.
-            try:
-                await scheduled_task_scheduler.start()
-            except Exception as exc:
-                _logger.exception(
-                    "scheduled task scheduler failed to start; continuing "
-                    "without recurring tasks (%s)",
-                    exc,
+            # OMNIGENT_SCHEDULED_TASKS_ENABLED defaults to true for backward
+            # compatibility; set it to 0/false/no to disable recurring timers.
+            from omnigent.server.auth import env_var_is_truthy as _scheduler_enabled
+
+            if _scheduler_enabled("OMNIGENT_SCHEDULED_TASKS_ENABLED", default=True):
+                on_fire = build_on_fire(fire_deps)
+                scheduled_task_scheduler = ScheduledTaskScheduler(
+                    store=scheduled_task_store,
+                    on_fire=on_fire,
+                )
+                app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
+                # Scheduled tasks are a non-critical subsystem: a failure loading the
+                # schedule (e.g. a DB error listing active tasks) must not take
+                # down server boot. Log and continue with the scheduler unstarted.
+                try:
+                    await scheduled_task_scheduler.start()
+                except Exception as exc:
+                    _logger.exception(
+                        "scheduled task scheduler failed to start; continuing "
+                        "without recurring tasks (%s)",
+                        exc,
+                    )
+            else:
+                _logger.info(
+                    "recurring scheduled tasks are disabled by "
+                    "OMNIGENT_SCHEDULED_TASKS_ENABLED; scheduler not started"
                 )
 
             # Run completion is event-driven (persist_scheduled_run_completion
@@ -1495,6 +1505,7 @@ def create_app(
         OwnerForwardMiddleware,
         pod_addr=pod_addr,
         routing_stats=app.state.routing_stats,
+        server_port=OwnerForwardMiddleware.resolve_server_port(pod_addr, server_config),
     )
     app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)
     # CSWSH guard: reject cross-origin WebSocket handshakes before any
@@ -1598,11 +1609,19 @@ def create_app(
         if exc.code == ErrorCode.WRONG_REPLICA:
             if exc.owner_addr is not None:
                 request.state.omnigent_owner_addr = exc.owner_addr
-            owner_resolvable = bool(getattr(request.state, "omnigent_owner_addr", None))
+            owner_addr = getattr(request.state, "omnigent_owner_addr", None)
+            owner_resolvable = bool(owner_addr)
             forward_attempted = bool(getattr(request.state, "omnigent_forward_attempted", False))
             app.state.routing_stats.record_wrong_replica()
             _logger.warning(
-                "wrong_replica routing failure",
+                "wrong_replica routing failure: owner_addr=%s owner_resolvable=%s "
+                "forward_attempted=%s path=%s session_id=%s host_id=%s",
+                owner_addr,
+                owner_resolvable,
+                forward_attempted,
+                request.url.path,
+                request.path_params.get("session_id"),
+                request.path_params.get("host_id"),
                 extra={
                     "routing": {
                         "path": request.url.path,

@@ -26,12 +26,15 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from cachetools import TTLCache
 
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import HostHelloFrame, HostStopRunnerFrame, decode_host_frame
+
+if TYPE_CHECKING:
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 
 _logger = logging.getLogger(__name__)
 
@@ -67,6 +70,7 @@ def _canonical_host_id(host_id: str) -> str:
 # invalidation — the TTL is purely a memory bound.
 _EXIT_REPORT_TTL_S = 600.0
 _EXIT_REPORT_MAX_ENTRIES = 1024
+_RUNNER_ATTRIBUTION_MAX_ENTRIES = 4096
 
 
 @dataclass
@@ -168,6 +172,14 @@ class WebSocketLike(Protocol):
 
 
 @dataclass
+class RunnerAttribution:
+    """Host generation that launched or advertised a runner."""
+
+    host_id: str
+    host_generation: int
+
+
+@dataclass
 class HostConnection:
     """Per-host state while the tunnel is open.
 
@@ -178,6 +190,8 @@ class HostConnection:
         reading request context from the long-lived sender loop.
     :param host_id: Stable host identifier, e.g.
         ``"host_a1b2c3d4..."``.
+    :param generation: Server-assigned connection generation. It is allocated
+        before the hello is read so delayed hellos cannot become current.
     :param ws: The live WebSocket to this host.
     :param hello: The hello frame the host sent on connect.
     :param owner: Authenticated user who established the tunnel,
@@ -263,6 +277,7 @@ class HostConnection:
 
     workspace_id: int
     host_id: str
+    generation: int
     ws: WebSocketLike
     hello: HostHelloFrame
     owner: str | None
@@ -275,6 +290,7 @@ class HostConnection:
     pending_stops: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
+    pending_stop_runner_ids: dict[str, str] = field(default_factory=dict)
     pending_runner_status: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -323,6 +339,11 @@ class HostRegistry:
     All public methods acquire ``_lock`` so callers on different
     threads (e.g. REST route handlers vs. WebSocket event loops)
     don't race.
+
+    When host and runner state must be coordinated, the lock order is
+    ``HostRegistry._lock`` then ``TunnelRegistry._lock``. The host lock is
+    held through inventory reconciliation, so supersession and runner
+    retirement form one generation-fenced operation.
     """
 
     def __init__(self) -> None:
@@ -338,6 +359,33 @@ class HostRegistry:
         # answer) and lost with the process, which is the point — a restarted
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
+        # Retain launch/hello attribution so a runner tunnel can be reconciled
+        # after its host reconnects while this server process is warm. Entries
+        # are removed by runner lifecycle cleanup or successful reconciliation.
+        self._runner_hosts: dict[tuple[int, str], RunnerAttribution] = {}
+        self._next_generations: dict[tuple[int, str], int] = {}
+
+    def allocate_generation(self, host_id: str, workspace_id: int | None = None) -> int:
+        """Allocate a connection generation before reading a host hello."""
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        key = (ws_id, _canonical_host_id(host_id))
+        with self._lock:
+            return self._allocate_generation_locked(key)
+
+    def _allocate_generation_locked(self, key: tuple[int, str]) -> int:
+        generation = self._next_generations.get(key, 0) + 1
+        self._next_generations[key] = generation
+        return generation
+
+    def _remember_runner_attribution_locked(
+        self,
+        key: tuple[int, str],
+        attribution: RunnerAttribution,
+    ) -> None:
+        self._runner_hosts.pop(key, None)
+        self._runner_hosts[key] = attribution
+        while len(self._runner_hosts) > _RUNNER_ATTRIBUTION_MAX_ENTRIES:
+            self._runner_hosts.pop(next(iter(self._runner_hosts)))
 
     def register(
         self,
@@ -346,6 +394,9 @@ class HostRegistry:
         hello: HostHelloFrame,
         owner: str | None,
         workspace_id: int | None = None,
+        *,
+        generation: int | None = None,
+        runner_registry: TunnelRegistry | None = None,
     ) -> HostConnection:
         """Register a host connection (newest wins).
 
@@ -369,25 +420,39 @@ class HostRegistry:
             (``0`` in single-tenant deployments); captured into the
             connection so ``send_text`` need not read request context
             from the sender loop.
+        :param generation: Generation allocated at WebSocket acceptance.
+            When omitted, tests and in-process callers allocate one here.
+        :param runner_registry: Optional runner registry used to atomically
+            update a live session when this hello changes its host generation.
         :returns: The new :class:`HostConnection`. Its ``host_id`` is
             the canonical form (see :func:`_canonical_host_id`).
         """
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
         host_id = _canonical_host_id(host_id)
         now = time.time()
-        conn = HostConnection(
-            workspace_id=ws_id,
-            host_id=host_id,
-            ws=ws,
-            hello=hello,
-            owner=owner,
-            outbound_queue=asyncio.Queue(),
-            connected_at=now,
-            last_frame_at=now,
-        )
         with self._lock:
             key = (ws_id, host_id)
+            if generation is None:
+                generation = self._allocate_generation_locked(key)
+            else:
+                self._next_generations[key] = max(
+                    self._next_generations.get(key, 0),
+                    generation,
+                )
+            conn = HostConnection(
+                workspace_id=ws_id,
+                host_id=host_id,
+                generation=generation,
+                ws=ws,
+                hello=hello,
+                owner=owner,
+                outbound_queue=asyncio.Queue(),
+                connected_at=now,
+                last_frame_at=now,
+            )
             old = self._hosts.get(key)
+            if old is not None and generation <= old.generation:
+                return conn
             if old is not None:
                 _logger.info(
                     "replacing stale host connection: ws=%s host=%s",
@@ -396,7 +461,157 @@ class HostRegistry:
                 )
                 old.outbound_queue.put_nowait(None)
             self._hosts[key] = conn
+            for runner_id in hello.runners:
+                self._remember_runner_attribution_locked(
+                    (ws_id, runner_id),
+                    RunnerAttribution(
+                        host_id=host_id,
+                        host_generation=generation,
+                    ),
+                )
+                if runner_registry is not None:
+                    runner_registry.update_runner_attribution(
+                        runner_id,
+                        host_id,
+                        generation,
+                    )
         return conn
+
+    def record_runner_attribution(
+        self,
+        host_id: str,
+        runner_id: str,
+        *,
+        workspace_id: int | None = None,
+        conn: HostConnection | None = None,
+        runner_registry: TunnelRegistry | None = None,
+    ) -> bool:
+        """Remember that a host launched or advertised ``runner_id``.
+
+        :param host_id: Host identifier, in any accepted spelling.
+        :param runner_id: Stable runner identifier, e.g. ``"runner_abc"``.
+        :param workspace_id: Tenant partition; defaults to the current one.
+        :param conn: Optional host generation guard.
+        :returns: ``True`` when the attribution was recorded.
+        """
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        canonical_host_id = _canonical_host_id(host_id)
+        with self._lock:
+            current = self._hosts.get((ws_id, canonical_host_id))
+            if current is None or (conn is not None and current is not conn):
+                return False
+            self._remember_runner_attribution_locked(
+                (ws_id, runner_id),
+                RunnerAttribution(
+                    host_id=canonical_host_id,
+                    host_generation=current.generation,
+                ),
+            )
+            if runner_registry is not None:
+                runner_registry.update_runner_attribution(
+                    runner_id,
+                    canonical_host_id,
+                    current.generation,
+                )
+            return True
+
+    def runner_host_id(self, runner_id: str, workspace_id: int | None = None) -> str | None:
+        """Return the locally known host attribution for a runner."""
+        attribution = self.runner_host_attribution(runner_id, workspace_id)
+        return attribution[0] if attribution is not None else None
+
+    def runner_host_attribution(
+        self,
+        runner_id: str,
+        workspace_id: int | None = None,
+    ) -> tuple[str, int] | None:
+        """Return the host and connection generation for a runner."""
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        with self._lock:
+            attribution = self._runner_hosts.get((ws_id, runner_id))
+            if attribution is None:
+                return None
+            return attribution.host_id, attribution.host_generation
+
+    def forget_runner_attribution(
+        self,
+        runner_id: str,
+        *,
+        workspace_id: int | None = None,
+        host_id: str | None = None,
+        host_generation: int | None = None,
+        conn: HostConnection | None = None,
+    ) -> bool:
+        """Remove attribution if it still belongs to the expected owner."""
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        canonical_host_id = _canonical_host_id(host_id) if host_id is not None else None
+        with self._lock:
+            if conn is not None and self._hosts.get((ws_id, conn.host_id)) is not conn:
+                return False
+            key = (ws_id, runner_id)
+            attribution = self._runner_hosts.get(key)
+            if attribution is None:
+                return False
+            if canonical_host_id is not None and attribution.host_id != canonical_host_id:
+                return False
+            if host_generation is not None and attribution.host_generation != host_generation:
+                return False
+            self._runner_hosts.pop(key, None)
+            return True
+
+    def reconcile_runner_inventory(
+        self,
+        conn: HostConnection,
+        runner_registry: TunnelRegistry,
+        *,
+        observed_sequence: int,
+    ) -> list[str]:
+        """Reconcile this current host generation against its hello frame.
+
+        :param conn: Host connection that received the hello frame.
+        :param runner_registry: Live runner-tunnel registry on this replica.
+        :param observed_sequence: Runner-registry sequence captured when the
+            hello was received.
+        :returns: Runner IDs removed from the live registry.
+        """
+        with self._lock:
+            if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
+                return []
+            attributed = {
+                runner_id: attribution.host_generation
+                for (workspace_id, runner_id), attribution in self._runner_hosts.items()
+                if (
+                    workspace_id == conn.workspace_id
+                    and attribution.host_id == conn.host_id
+                    and attribution.host_generation <= conn.generation
+                )
+            }
+            removed = runner_registry.reconcile_host(
+                conn.host_id,
+                conn.hello.runners,
+                observed_sequence=observed_sequence,
+                attributed_runner_generations=attributed,
+                inventory_generation=conn.generation,
+            )
+            for runner_id in removed:
+                attribution = self._runner_hosts.get((conn.workspace_id, runner_id))
+                if (
+                    attribution is not None
+                    and attribution.host_id == conn.host_id
+                    and attribution.host_generation <= conn.generation
+                ):
+                    self._runner_hosts.pop((conn.workspace_id, runner_id), None)
+            advertised = set(conn.hello.runners)
+            for key, attribution in list(self._runner_hosts.items()):
+                workspace_id, runner_id = key
+                if (
+                    workspace_id == conn.workspace_id
+                    and attribution.host_id == conn.host_id
+                    and attribution.host_generation <= conn.generation
+                    and runner_id not in advertised
+                ):
+                    self._runner_hosts.pop(key, None)
+            return removed
 
     def deregister(
         self,
@@ -458,6 +673,11 @@ class HostRegistry:
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
         with self._lock:
             return self._hosts.get((ws_id, _canonical_host_id(host_id)))
+
+    def is_current(self, conn: HostConnection) -> bool:
+        """Return whether this connection is the highest accepted generation."""
+        with self._lock:
+            return self._hosts.get((conn.workspace_id, conn.host_id)) is conn
 
     def online_host_ids(self, workspace_id: int | None = None) -> list[str]:
         """Return IDs of all hosts connected in one workspace.
@@ -557,5 +777,11 @@ class HostRegistry:
             current = self._hosts.get((conn.workspace_id, conn.host_id))
             if current is not conn:
                 raise ConnectionError(f"host {conn.host_id!r} connection was replaced")
+            try:
+                outbound_frame = decode_host_frame(data)
+            except ValueError:
+                outbound_frame = None
+            if isinstance(outbound_frame, HostStopRunnerFrame):
+                conn.pending_stop_runner_ids[outbound_frame.request_id] = outbound_frame.runner_id
 
         conn.outbound_queue.put_nowait(data)

@@ -45,6 +45,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import (
     _resolve_elicitation,
 )
+from omnigent.server.routing_stats import record_elicitation_resolution_if_off_owner
 from omnigent.server.schemas import (
     ElicitationResult,
 )
@@ -121,6 +122,7 @@ def register_elicitations_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
+        await record_elicitation_resolution_if_off_owner(request, conv, runner_router)
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
         await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
         # Apply any policy writes deferred by the relay tool-call ASK gate

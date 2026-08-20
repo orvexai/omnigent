@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
+import omnigent.runner.routing as routing
 from omnigent.db.db_models import SqlRunnerTunnel
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
@@ -54,8 +57,11 @@ class MockHostStore:
 class MockTunnelRegistry:
     """Mock tunnel registry."""
 
+    def __init__(self, sessions=None):
+        self.sessions = sessions or {}
+
     def get(self, runner_id):
-        return None
+        return self.sessions.get(runner_id)
 
 
 class MockConversationStore:
@@ -152,8 +158,8 @@ def test_runner_absent_code_no_store_registry_only_returns_wrong_replica():
     assert code == ErrorCode.WRONG_REPLICA
 
 
-def test_stale_durable_owner_is_unavailable_and_unforwardable(db_uri: str) -> None:
-    """A stale remote row cannot classify or forward a request cross-replica."""
+def test_stale_durable_owner_remains_wrong_replica_for_forwarding(db_uri: str) -> None:
+    """A stale remote row still identifies the replica to retry."""
     runner_id = "runner_token_stale_durable_route_b0c8ab2431"
     tunnels = HostStore(db_uri).runner_tunnel_store
     tunnels.claim(runner_id, REMOTE)
@@ -171,9 +177,71 @@ def test_stale_durable_owner_is_unavailable_and_unforwardable(db_uri: str) -> No
         router.client_for_existing_conversation("conv-stale")
 
     error = exc_info.value
-    assert error.code == ErrorCode.RUNNER_UNAVAILABLE
-    assert error.owner_addr is None
-    assert error.http_status == 503
+    assert error.code == ErrorCode.WRONG_REPLICA
+    assert error.owner_addr == REMOTE
+    assert error.http_status == 400
+
+
+def test_half_open_local_tunnel_does_not_override_durable_owner(db_uri: str) -> None:
+    """A local registry entry loses when durable ownership points elsewhere."""
+    runner_id = "runner_token_half_open_local_route_b0c8ab2431"
+    tunnels = HostStore(db_uri).runner_tunnel_store
+    tunnels.claim(runner_id, REMOTE)
+    router = RunnerRouter(
+        registry=MockTunnelRegistry(
+            {
+                runner_id: SimpleNamespace(hello=SimpleNamespace(harnesses=["codex"])),
+            }
+        ),
+        conversation_store=MockConversationStore(
+            SimpleNamespace(id="conv-half-open", runner_id=runner_id, host_id=None)
+        ),
+        runner_tunnel_store=tunnels,
+        pod_addr=LOCAL,
+    )
+
+    with pytest.raises(OmnigentError) as exc_info:
+        router.client_for_session_resources("conv-half-open")
+
+    error = exc_info.value
+    assert error.code == ErrorCode.WRONG_REPLICA
+    assert error.owner_addr == REMOTE
+
+
+@pytest.mark.asyncio
+async def test_runner_tunnel_client_has_bounded_read_timeout() -> None:
+    """Tunnel response reads must not wait for the full lease indefinitely."""
+    router = RunnerRouter(
+        registry=MockTunnelRegistry(),
+        conversation_store=MockConversationStore(),
+    )
+    client = router._client_for_runner("runner-timeout")
+
+    assert client.timeout.read == 30.0
+    await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runner_tunnel_read_timeout_interrupts_a_stalled_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A custom tunnel transport cannot leave its response head pending forever."""
+
+    class _NeverResponds(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(60)
+            return httpx.Response(200, request=request)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(routing, "RUNNER_TUNNEL_READ_TIMEOUT_S", 0.01)
+    transport = routing._BoundedWSTunnelTransport("runner-timeout", _NeverResponds())
+    request = httpx.Request("GET", "http://runner/health")
+
+    with pytest.raises(httpx.ReadTimeout):
+        await transport.handle_async_request(request)
+    await transport.aclose()
 
 
 def test_released_runner_is_unavailable_during_disconnect_grace(db_uri: str) -> None:

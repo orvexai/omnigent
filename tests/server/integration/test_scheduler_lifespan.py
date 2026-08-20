@@ -58,9 +58,11 @@ async def test_lifespan_starts_and_stops_scheduler(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With a store containing an active task, the lifespan starts a scheduler
-    with one armed job and stops it (dropping the job) on exit."""
+    with one armed job by default and stops it (dropping the job) on exit."""
+    monkeypatch.delenv("OMNIGENT_SCHEDULED_TASKS_ENABLED", raising=False)
     store = SqlAlchemyScheduledTaskStore(db_uri)
     store.create(
         scheduled_task_id=_uid("nightly"),
@@ -141,6 +143,44 @@ async def test_lifespan_without_store_has_no_scheduler(
     app = _build_app(db_uri, tmp_path, scheduled_task_store=None)
     async with app.router.lifespan_context(app):
         assert getattr(app.state, "scheduled_task_scheduler", None) is None
+
+
+async def test_lifespan_disabled_scheduler_is_not_constructed(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Disabling recurring tasks leaves the scheduler absent and unarmed."""
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    store.create(
+        scheduled_task_id=_uid("disabled-nightly"),
+        name="disabled nightly triage",
+        prompt="triage the queue",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        user_id=None,
+        agent_id=_uid("agent-disabled"),
+        timezone="UTC",
+    )
+    monkeypatch.setenv("OMNIGENT_SCHEDULED_TASKS_ENABLED", "0")
+
+    def _unexpected_scheduler(*args: object, **kwargs: object) -> None:
+        raise AssertionError("scheduler must not be constructed when disabled")
+
+    monkeypatch.setattr("omnigent.server.app.ScheduledTaskScheduler", _unexpected_scheduler)
+    app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
+
+    with caplog.at_level("INFO", logger="omnigent.server.app"):
+        async with app.router.lifespan_context(app):
+            assert getattr(app.state, "scheduled_task_scheduler", None) is None
+
+    matches = [
+        record
+        for record in caplog.records
+        if "recurring scheduled tasks are disabled" in record.getMessage()
+    ]
+    assert len(matches) == 1
 
 
 async def test_lifespan_skips_paused_task(

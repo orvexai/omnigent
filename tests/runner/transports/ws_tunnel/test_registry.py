@@ -14,9 +14,12 @@ import asyncio
 import threading
 import time
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 
+from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+from omnigent.host.frames import HostHelloFrame
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     ResponseBodyFrame,
@@ -37,6 +40,21 @@ class _NoopWS:
         # path; this fake exists so the registry has something to
         # hold.
         return await asyncio.Future()
+
+
+class _HeaderWS(_NoopWS):
+    """Runner fake carrying a browser routing header."""
+
+    headers = {OMNIGENT_SLICE_KEY_HEADER: "host_a"}
+
+
+class _AppScopedWS(_NoopWS):
+    """Runner fake carrying the real app-scoped host registry."""
+
+    def __init__(self, host_registry: object) -> None:
+        self.scope = {
+            "app": SimpleNamespace(state=SimpleNamespace(host_registry=host_registry)),
+        }
 
 
 def _hello() -> HelloFrame:
@@ -68,6 +86,37 @@ async def test_register_then_get_returns_session() -> None:
     fetched = reg.get("r1")
     assert fetched is session
     assert fetched.ws is ws
+
+
+@pytest.mark.asyncio
+async def test_register_does_not_use_browser_slice_header_for_attribution() -> None:
+    """A routing selector cannot establish runner ownership."""
+    reg = TunnelRegistry()
+
+    session = reg.register("r1", _HeaderWS(), _hello())
+
+    assert session.host_id is None
+
+
+@pytest.mark.asyncio
+async def test_register_captures_app_scoped_host_generation() -> None:
+    """A runner tunnel records the host generation that advertised it."""
+    from omnigent.server.host_registry import HostRegistry
+
+    host_registry = HostRegistry()
+    host_registry.register(
+        "host_a",
+        _NoopWS(),
+        HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="host"),
+        owner="alice",
+    )
+    host_registry.record_runner_attribution("host_a", "r1")
+    registry = TunnelRegistry()
+
+    session = registry.register("r1", _AppScopedWS(host_registry), _hello())
+
+    assert session.host_id == "host_a"
+    assert session.host_generation == host_registry.get("host_a").generation
 
 
 def test_get_returns_none_for_unknown() -> None:

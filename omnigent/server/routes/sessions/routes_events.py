@@ -345,6 +345,56 @@ async def _retry_session_single_flight(
     return await asyncio.shield(task)
 
 
+async def _ensure_stream_owner(
+    request: Request,
+    conv: Any,
+    runner_client: httpx.AsyncClient | None,
+    runner_router: RunnerRouter | None,
+) -> None:
+    """Reject a stream landing away from its runner or host owner."""
+    if runner_client is not None:
+        return
+    runner_id = getattr(conv, "runner_id", None)
+    if isinstance(runner_id, str) and runner_id:
+        owner_addr: str | None = None
+        owner_lookup = getattr(runner_router, "runner_owner_addr", None)
+        if callable(owner_lookup):
+            try:
+                resolved = owner_lookup(runner_id)
+            except Exception:
+                resolved = None
+            if isinstance(resolved, str) and resolved:
+                owner_addr = resolved
+        local_addr = getattr(request.app.state, "pod_addr", None)
+        if owner_addr is not None and (local_addr is None or owner_addr != local_addr):
+            raise OmnigentError(
+                "session stream is on another runner replica; retry",
+                code=ErrorCode.WRONG_REPLICA,
+                owner_addr=owner_addr,
+            )
+        raise OmnigentError(
+            "session runner is unavailable on this replica; retry",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+
+    host_id = getattr(conv, "host_id", None)
+    if not isinstance(host_id, str) or not host_id:
+        return
+    host_registry_state = getattr(request.app.state, "host_registry", None)
+    host_store_state = getattr(request.app.state, "host_store", None)
+    if host_registry_state is None or host_store_state is None:
+        return
+    if host_registry_state.get(host_id) is not None:
+        return
+    host = host_store_state.get_host(host_id)
+    if host is not None and host_is_live(host):
+        raise OmnigentError(
+            "session stream is on another host replica; retry",
+            code=ErrorCode.WRONG_REPLICA,
+            owner_addr=host.owner_addr,
+        )
+
+
 def register_events_routes(
     router: APIRouter,
     *,
@@ -1801,21 +1851,7 @@ def register_events_routes(
             session_id,
             runner_router,
         )
-        # Check for wrong-replica routing miss before streaming.
-        # If the host is wired and the runner is on another replica, signal 400
-        # so setups that don't wire hosts are unaffected.
-        if runner_client is None and conv.runner_id and conv.host_id:
-            host_registry_state = getattr(request.app.state, "host_registry", None)
-            host_store_state = getattr(request.app.state, "host_store", None)
-            if host_registry_state is not None and host_store_state is not None:
-                if host_registry_state.get(conv.host_id) is None:
-                    host = await asyncio.to_thread(host_store_state.get_host, conv.host_id)
-                    if host is not None and host_is_live(host):
-                        raise OmnigentError(
-                            "session stream is on another replica; retry",
-                            code=ErrorCode.WRONG_REPLICA,
-                            owner_addr=host.owner_addr,
-                        )
+        await _ensure_stream_owner(request, conv, runner_client, runner_router)
         await _ensure_runner_relay_ready(
             session_id,
             conv.runner_id,

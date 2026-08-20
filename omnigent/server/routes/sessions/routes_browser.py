@@ -42,6 +42,7 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
+from omnigent.server.routing_stats import record_hook_park_if_off_owner
 from omnigent.server.schemas import (
     BrowserActionRequestEvent,
 )
@@ -87,8 +88,15 @@ def register_browser_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
-        await _require_access_and_level(
+        access = await _require_access_and_level(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        await record_hook_park_if_off_owner(
+            request,
+            session_id=session_id,
+            conversation_store=conversation_store,
+            runner_router=get_server_runner_router(),
+            conversation=access.conversation,
         )
         action = body.get("action")
         args = body.get("args")
@@ -158,8 +166,15 @@ def register_browser_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
-        await _require_access_and_level(
+        access = await _require_access_and_level(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        await record_hook_park_if_off_owner(
+            request,
+            session_id=session_id,
+            conversation_store=conversation_store,
+            runner_router=get_server_runner_router(),
+            conversation=access.conversation,
         )
         # Unknown / already-resolved action: nothing to claim.
         if _browser_action_owners.get(action_id) != session_id:
@@ -203,8 +218,15 @@ def register_browser_routes(
             mismatched claim token or an owner mismatch.
         """
         user_id = _get_user_id(request, auth_provider)
-        await _require_access_and_level(
+        access = await _require_access_and_level(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        await record_hook_park_if_off_owner(
+            request,
+            session_id=session_id,
+            conversation_store=conversation_store,
+            runner_router=get_server_runner_router(),
+            conversation=access.conversation,
         )
         claim_token = body.get("claim_token")
         expected = _browser_action_claims.get(action_id)

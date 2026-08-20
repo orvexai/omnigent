@@ -9,9 +9,12 @@ tunnel.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import threading
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import httpx
 
@@ -21,6 +24,8 @@ from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import telemetry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec import AgentSpec
+
+_logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from omnigent.entities import Conversation
@@ -32,6 +37,89 @@ if TYPE_CHECKING:
 
 
 _EXECUTOR_TYPE_TO_HARNESS: dict[str, str] = {"claude_sdk": "claude-sdk"}
+RUNNER_TUNNEL_READ_TIMEOUT_S = 30.0
+
+
+class _TimeoutByteStream(httpx.AsyncByteStream):
+    """Apply read-idle deadlines to a custom tunnel response stream."""
+
+    def __init__(
+        self,
+        stream: httpx.AsyncByteStream,
+        timeout_s: float,
+        request: httpx.Request,
+    ) -> None:
+        self._stream = stream
+        self._timeout_s = timeout_s
+        self._request = request
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        iterator = self._stream.__aiter__()
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        anext(iterator),
+                        timeout=self._timeout_s,
+                    )
+                except StopAsyncIteration:
+                    return
+                except TimeoutError as exc:
+                    raise httpx.ReadTimeout(
+                        "runner tunnel response read timed out",
+                        request=self._request,
+                    ) from exc
+                yield chunk
+        finally:
+            await self._stream.aclose()
+
+    async def aclose(self) -> None:
+        """Close the underlying tunnel response stream."""
+        await self._stream.aclose()
+
+
+class _BoundedWSTunnelTransport(httpx.AsyncBaseTransport):
+    """Enforce read deadlines that httpx cannot apply to custom transports."""
+
+    def __init__(self, runner_id: str, inner: WSTunnelTransport) -> None:
+        self._runner_id = runner_id
+        self._inner = inner
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        timeout_s = _request_read_timeout(request)
+        try:
+            response = await asyncio.wait_for(
+                self._inner.handle_async_request(request),
+                timeout=timeout_s,
+            )
+        except TimeoutError as exc:
+            raise httpx.ReadTimeout(
+                f"runner tunnel response head timed out for {self._runner_id!r}",
+                request=request,
+            ) from exc
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=response.headers,
+            stream=_TimeoutByteStream(
+                cast(httpx.AsyncByteStream, response.stream), timeout_s, request
+            ),
+            request=request,
+            extensions=response.extensions,
+        )
+
+    async def aclose(self) -> None:
+        """Close the wrapped transport."""
+        await self._inner.aclose()
+
+
+def _request_read_timeout(request: httpx.Request) -> float:
+    """Read the request's positive timeout or use the tunnel safety bound."""
+    timeout = request.extensions.get("timeout")
+    if isinstance(timeout, dict):
+        read_timeout = timeout.get("read")
+        if isinstance(read_timeout, (int, float)) and read_timeout > 0:
+            return float(read_timeout)
+    return RUNNER_TUNNEL_READ_TIMEOUT_S
 
 
 def runner_dispatch_harness(spec: AgentSpec) -> str | None:
@@ -169,12 +257,19 @@ class RunnerRouter:
         if conv is None:
             raise OmnigentError("conversation not found", code=ErrorCode.NOT_FOUND)
         if conv.runner_id:
+            owner_addr = self.runner_owner_addr(conv.runner_id)
+            if owner_addr is not None and owner_addr != self._pod_addr:
+                raise OmnigentError(
+                    f"runner {conv.runner_id!r} is owned by another replica",
+                    code=ErrorCode.WRONG_REPLICA,
+                    owner_addr=owner_addr,
+                )
             session = self._registry.get(conv.runner_id)
             if session is None:
                 raise OmnigentError(
                     f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
                     code=self._runner_absent_code(conv.host_id, conv.runner_id),
-                    owner_addr=self.runner_owner_addr(conv.runner_id),
+                    owner_addr=owner_addr,
                 )
             return RoutedRunner(
                 runner_id=conv.runner_id,
@@ -206,12 +301,19 @@ class RunnerRouter:
         conv = self._conversation_store.get_conversation(conversation_id)
         if conv is None or not conv.runner_id:
             return None
+        owner_addr = self.runner_owner_addr(conv.runner_id)
+        if owner_addr is not None and owner_addr != self._pod_addr:
+            raise OmnigentError(
+                f"runner {conv.runner_id!r} is owned by another replica",
+                code=ErrorCode.WRONG_REPLICA,
+                owner_addr=owner_addr,
+            )
         session = self._registry.get(conv.runner_id)
         if session is None:
             raise OmnigentError(
                 f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
                 code=self._runner_absent_code(conv.host_id, conv.runner_id),
-                owner_addr=self.runner_owner_addr(conv.runner_id),
+                owner_addr=owner_addr,
             )
         return RoutedRunner(
             runner_id=conv.runner_id,
@@ -226,7 +328,10 @@ class RunnerRouter:
             ``"runner_0123456789abcdef"``.
         :returns: ``True`` when the registry has a live session.
         """
-        return self._registry.get(runner_id) is not None
+        if self._registry.get(runner_id) is None:
+            return False
+        owner_addr = self.runner_owner_addr(runner_id)
+        return owner_addr is None or owner_addr == self._pod_addr
 
     def runner_owner(self, runner_id: str) -> str | None:
         """
@@ -269,12 +374,19 @@ class RunnerRouter:
         :raises OmnigentError: If the runner is offline or
             lacks the requested harness capability.
         """
+        owner_addr = self.runner_owner_addr(runner_id)
+        if owner_addr is not None and owner_addr != self._pod_addr:
+            raise OmnigentError(
+                f"runner {runner_id!r} is owned by another replica",
+                code=ErrorCode.WRONG_REPLICA,
+                owner_addr=owner_addr,
+            )
         session = self._registry.get(runner_id)
         if session is None:
             raise OmnigentError(
                 f"runner {runner_id!r} is offline; resume the session to bind a registered runner",
                 code=self._runner_absent_code(host_id, runner_id),
-                owner_addr=self.runner_owner_addr(runner_id),
+                owner_addr=owner_addr,
             )
         if not _runner_supports_harness(session, harness):
             raise OmnigentError(
@@ -284,14 +396,23 @@ class RunnerRouter:
         return RoutedRunner(runner_id=runner_id, client=self._client_for_runner(runner_id))
 
     def runner_owner_addr(self, runner_id: str) -> str | None:
-        """Return durable runner ownership when Stage 1 is active."""
+        """Return recorded runner ownership when Stage 1 is active.
+
+        Routing needs the raw address even after its lease expires so a
+        forwardable miss remains ``WRONG_REPLICA`` instead of becoming a 503.
+        """
         if self._runner_tunnel_store is None or self._pod_addr is None:
             return None
-        return self._runner_tunnel_store.owner(runner_id)
+        owner_addr = self._runner_tunnel_store.owner_addr(runner_id)
+        _logger.info(
+            "runner routing ownership decision: runner_id=%s local_addr=%s owner_addr=%s",
+            runner_id,
+            self._pod_addr,
+            owner_addr,
+        )
+        return owner_addr
 
-    def _runner_absent_code(
-        self, host_id: str | None, runner_id: str | None = None
-    ) -> str:
+    def _runner_absent_code(self, host_id: str | None, runner_id: str | None = None) -> str:
         """
         Classify a "bound runner, but its tunnel isn't on this replica" miss.
 
@@ -301,6 +422,10 @@ class RunnerRouter:
         - row present with a different owner address → ``WRONG_REPLICA``;
         - row absent, or owned by this pod but missing locally →
           ``RUNNER_UNAVAILABLE``.
+
+        A stale row still identifies which replica should be tried. The
+        forwarding middleware can then retry there and let that replica
+        re-evaluate the lease with its local tunnel.
 
         When the durable store is not wired, retain the existing host
         liveness fallback so single-replica and mixed-version deployments
@@ -344,9 +469,12 @@ class RunnerRouter:
             client = self._clients.get(runner_id)
             if client is None:
                 client = httpx.AsyncClient(
-                    transport=WSTunnelTransport(self._registry, runner_id),
+                    transport=_BoundedWSTunnelTransport(
+                        runner_id,
+                        WSTunnelTransport(self._registry, runner_id),
+                    ),
                     base_url="http://runner",
-                    timeout=httpx.Timeout(5.0, read=None),
+                    timeout=httpx.Timeout(5.0, read=RUNNER_TUNNEL_READ_TIMEOUT_S),
                 )
                 # The global httpx instrumentation can't see this client's
                 # custom WSTunnelTransport, so instrument the instance
