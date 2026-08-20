@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -16,11 +17,14 @@ from omnigent.db.utils import (
     _LAKEBASE_POOL_RECYCLE_SECONDS,
     _SERVER_POOL_RECYCLE_SECONDS,
     _build_alembic_config,
+    _connect_dbapi_with_retry,
     _create_engine,
     _get_current_db_revision,
     _get_head_db_revision,
     _initialize_or_verify_schema,
+    _install_connection_retry,
     _install_lakebase_token_refresh,
+    _is_transient_connection_error,
     _resolve_lakebase_token_provider,
     _resolve_migration_database_url,
     build_search_snippet,
@@ -39,6 +43,14 @@ from omnigent.entities.conversation import (
     ResourceEventData,
     SlashCommandData,
 )
+
+
+class _FakeDbapiError(Exception):
+    """Minimal DBAPI error with the psycopg SQLSTATE surface."""
+
+    def __init__(self, message: str, *, sqlstate: str | None = None) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +80,7 @@ def test_non_sqlite_engine_has_pool_settings(
         "omnigent.db.utils.create_engine",
         _capturing_create_engine,
     )
+    monkeypatch.setattr("omnigent.db.utils.event.listen", lambda *args, **kwargs: None)
     # Skip migrations -- we only care about engine creation kwargs.
     monkeypatch.setattr(
         "omnigent.db.utils._run_migrations",
@@ -90,6 +103,7 @@ def test_non_sqlite_engine_has_pool_settings(
     assert captured_kwargs["max_overflow"] == 32
     assert captured_kwargs["pool_timeout"] == 10
     assert captured_kwargs["connect_args"] == {"connect_timeout": 3}
+    assert captured_kwargs["pool_reset_on_return"] == "rollback"
 
 
 def test_prepare_threshold_is_disabled_only_under_opt_in(
@@ -103,6 +117,7 @@ def test_prepare_threshold_is_disabled_only_under_opt_in(
         return mock_engine
 
     monkeypatch.setattr("omnigent.db.utils.create_engine", _capturing_create_engine)
+    monkeypatch.setattr("omnigent.db.utils.event.listen", lambda *args, **kwargs: None)
     monkeypatch.delenv(_DISABLE_PREPARED_STATEMENTS_ENV, raising=False)
     _create_engine("postgresql://user:pass@localhost/testdb")
     monkeypatch.setenv(_DISABLE_PREPARED_STATEMENTS_ENV, "1")
@@ -126,6 +141,7 @@ def test_non_sqlite_pool_settings_are_environment_configurable(
         return mock_engine
 
     monkeypatch.setattr("omnigent.db.utils.create_engine", _capturing_create_engine)
+    monkeypatch.setattr("omnigent.db.utils.event.listen", lambda *args, **kwargs: None)
     monkeypatch.setattr("omnigent.db.utils._run_migrations", lambda engine, db_uri: None)
     monkeypatch.setenv("OMNIGENT_DB_POOL_SIZE", "7")
     monkeypatch.setenv("OMNIGENT_DB_MAX_OVERFLOW", "3")
@@ -157,6 +173,153 @@ def test_invalid_pool_setting_fails_loudly(
 
     with pytest.raises(RuntimeError, match=env_name):
         _create_engine("postgresql://user:pass@localhost/testdb")
+
+
+def test_transient_connection_failure_retries_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SQLAlchemy new-connection hook retries a refusal and then succeeds."""
+    clock = 0.0
+    sleeps: list[float] = []
+    attempts = 0
+
+    def monotonic() -> float:
+        return clock
+
+    def sleep(seconds: float) -> None:
+        nonlocal clock
+        sleeps.append(seconds)
+        clock += seconds
+
+    monkeypatch.setattr("omnigent.db.utils.time.monotonic", monotonic)
+    monkeypatch.setattr("omnigent.db.utils.time.sleep", sleep)
+    monkeypatch.setattr("omnigent.db.utils.random.uniform", lambda lower, upper: 1.0)
+    monkeypatch.setenv("OMNIGENT_DB_CONNECT_RETRY_MAX_SECONDS", "1")
+    monkeypatch.setenv("OMNIGENT_DB_CONNECT_RETRY_INITIAL_DELAY_SECONDS", "0.1")
+    monkeypatch.setenv("OMNIGENT_DB_CONNECT_RETRY_MAX_DELAY_SECONDS", "0.2")
+
+    def connect(*args: object, **kwargs: object) -> str:
+        nonlocal attempts
+        del args, kwargs
+        attempts += 1
+        if attempts <= 2:
+            raise _FakeDbapiError(
+                'connection failed: connection to server at "db" failed: Connection refused'
+            )
+        return "connected"
+
+    listeners: list[Any] = []
+    monkeypatch.setattr(
+        "omnigent.db.utils.event.listen",
+        lambda _engine, _identifier, listener: listeners.append(listener),
+    )
+    listener = _install_connection_retry(MagicMock())
+    dbapi = SimpleNamespace(Error=_FakeDbapiError, connect=connect)
+
+    assert listener(SimpleNamespace(dbapi=dbapi), None, [], {}) == "connected"
+    assert listeners == [listener]
+    assert attempts == 3
+    assert sleeps == [0.1, 0.2]
+
+
+@pytest.mark.parametrize(
+    ("message", "sqlstate"),
+    [
+        ("connection reset by peer", None),
+        ("could not connect now", "57P03"),
+        ("server closed the connection unexpectedly", None),
+        ("cannot execute INSERT in a read-only transaction", "25006"),
+    ],
+)
+def test_known_promotion_connection_failures_are_transient(
+    message: str,
+    sqlstate: str | None,
+) -> None:
+    error = _FakeDbapiError(message, sqlstate=sqlstate)
+    assert _is_transient_connection_error(error, dbapi_error_type=_FakeDbapiError)
+
+
+@pytest.mark.parametrize(
+    ("message", "sqlstate"),
+    [
+        ("password authentication failed for user", "28P01"),
+        ('database "missing" does not exist', "3D000"),
+        ("permission denied for database", "42501"),
+        ("syntax error at or near SELECT", "42601"),
+        ("duplicate key value violates unique constraint", "23505"),
+    ],
+)
+def test_permanent_connection_errors_are_not_retried(
+    message: str,
+    sqlstate: str,
+) -> None:
+    """Authentication, catalog, privilege, syntax, and constraint errors fail fast."""
+    error = _FakeDbapiError(message, sqlstate=sqlstate)
+    attempts = 0
+
+    def connect(*args: object, **kwargs: object) -> str:
+        nonlocal attempts
+        del args, kwargs
+        attempts += 1
+        raise error
+
+    with pytest.raises(_FakeDbapiError) as exc_info:
+        _connect_dbapi_with_retry(
+            connect,
+            [],
+            {},
+            dbapi_error_type=_FakeDbapiError,
+            max_seconds=30.0,
+            initial_delay_seconds=0.1,
+            max_delay_seconds=1.0,
+            jitter=0.2,
+        )
+
+    assert exc_info.value is error
+    assert attempts == 1
+
+
+def test_transient_connection_retry_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A continuously refused endpoint gets a clear bounded failure."""
+    clock = 0.0
+    attempts = 0
+
+    def monotonic() -> float:
+        return clock
+
+    def sleep(seconds: float) -> None:
+        nonlocal clock
+        clock += seconds
+
+    monkeypatch.setattr("omnigent.db.utils.time.monotonic", monotonic)
+    monkeypatch.setattr("omnigent.db.utils.time.sleep", sleep)
+    monkeypatch.setattr("omnigent.db.utils.random.uniform", lambda lower, upper: 1.0)
+
+    def connect(*args: object, **kwargs: object) -> str:
+        nonlocal attempts
+        del args, kwargs
+        attempts += 1
+        raise _FakeDbapiError("connection refused")
+
+    with pytest.raises(
+        ConnectionError,
+        match=re.escape("remained unavailable for 0.3s after 3 attempts"),
+    ):
+        _connect_dbapi_with_retry(
+            connect,
+            [],
+            {},
+            dbapi_error_type=_FakeDbapiError,
+            max_seconds=0.3,
+            initial_delay_seconds=0.1,
+            max_delay_seconds=0.2,
+            jitter=0.0,
+        )
+
+    assert attempts == 3
+    assert clock == 0.3
 
 
 def test_sqlite_pool_settings_are_not_read_or_forwarded(
@@ -195,6 +358,7 @@ def test_engine_configuration_log_is_secret_safe(
         "omnigent.db.utils.create_engine",
         lambda uri, **kwargs: mock_engine,
     )
+    monkeypatch.setattr("omnigent.db.utils.event.listen", lambda *args, **kwargs: None)
     monkeypatch.setattr("omnigent.db.utils._run_migrations", lambda engine, db_uri: None)
 
     with caplog.at_level("INFO", logger="omnigent.db.utils"):
@@ -282,10 +446,9 @@ def _clear_lakebase_override() -> Any:
 def test_static_postgres_uri_path_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     (a) Backward compatibility: with no Lakebase config, a Postgres engine is
-    created exactly as before — no token provider resolves, the standard
-    30-minute recycle window is used, and no ``do_connect`` token listener is
-    attached. A regression here would mean the opt-in path leaked into the
-    default static-password Postgres deploy.
+    created with the standard 30-minute recycle window and no token-refresh
+    listener. The always-on connection retry listener is separate from the
+    opt-in token path.
     """
     from omnigent.db import utils
 
@@ -298,30 +461,21 @@ def test_static_postgres_uri_path_unchanged(monkeypatch: pytest.MonkeyPatch) -> 
         # Standard (non-Lakebase) recycle window, unchanged from before.
         assert engine.pool._recycle == _SERVER_POOL_RECYCLE_SECONDS == 1800
 
-        # Positively assert NO ``do_connect`` listener is registered at all on
-        # the static-password engine. The token-refresh path is the only thing
-        # in this module that attaches a ``do_connect`` listener (see
-        # :func:`_install_lakebase_token_refresh`), so an empty listener set
-        # proves it did not run. Enumerating the engine's actual registered
-        # listeners (rather than checking ``event.contains`` for some specific
-        # function we happen to know about) means a regression that *always*
-        # installs the listener — under any function name — fails this test.
+        # Exactly one listener is expected: connection retry. The token-refresh
+        # path is opt-in and must not be attached to a static-password engine.
         registered = list(engine.dialect.dispatch.do_connect)
-        assert registered == [], (
-            "static-password Postgres engine must carry no do_connect "
-            f"token-refresh listener, found: {registered!r}"
+        assert len(registered) == 1, (
+            "static-password Postgres engine must carry only the connection "
+            f"retry listener, found: {registered!r}"
         )
 
-        # Cross-check with the real install helper: had it run on this engine,
-        # the listener it installs would be present. Confirm it is absent.
+        # Cross-check with the real token install helper: it adds a second
+        # listener only when explicitly requested.
         from sqlalchemy import event
 
         installed = _install_lakebase_token_refresh(engine, lambda: "tok")
         assert event.contains(engine, "do_connect", installed)
-        # And before that install, the count was zero (asserted above); after
-        # it, exactly one — proving the enumeration above is sensitive to a
-        # real listener rather than vacuously empty.
-        assert len(list(engine.dialect.dispatch.do_connect)) == 1
+        assert len(list(engine.dialect.dispatch.do_connect)) == 2
     finally:
         engine.dispose()
 

@@ -6,6 +6,11 @@ disables automatic upgrades while retaining the head-revision check.
 ``OMNIGENT_MIGRATION_LOCK_TIMEOUT_SECONDS`` bounds lock waits at 10 minutes by
 default, and ``OMNIGENT_DB_DISABLE_PREPARED_STATEMENTS=1`` disables psycopg3
 named preparation for transaction-pooling deployments.
+New PostgreSQL connections retry transient endpoint failures for up to 30
+seconds by default; ``OMNIGENT_DB_CONNECT_RETRY_MAX_SECONDS``,
+``OMNIGENT_DB_CONNECT_RETRY_INITIAL_DELAY_SECONDS``,
+``OMNIGENT_DB_CONNECT_RETRY_MAX_DELAY_SECONDS``, and
+``OMNIGENT_DB_CONNECT_RETRY_JITTER`` configure that bounded wait.
 """
 
 from __future__ import annotations
@@ -14,14 +19,15 @@ import hashlib
 import logging
 import math
 import os
+import random
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
 
@@ -73,6 +79,10 @@ _LAKEBASE_POOL_RECYCLE_SECONDS = 600
 _POOL_SIZE_ENV = "OMNIGENT_DB_POOL_SIZE"
 _MAX_OVERFLOW_ENV = "OMNIGENT_DB_MAX_OVERFLOW"
 _POOL_TIMEOUT_ENV = "OMNIGENT_DB_POOL_TIMEOUT_SECONDS"
+_DB_CONNECT_RETRY_MAX_SECONDS_ENV = "OMNIGENT_DB_CONNECT_RETRY_MAX_SECONDS"
+_DB_CONNECT_RETRY_INITIAL_DELAY_SECONDS_ENV = "OMNIGENT_DB_CONNECT_RETRY_INITIAL_DELAY_SECONDS"
+_DB_CONNECT_RETRY_MAX_DELAY_SECONDS_ENV = "OMNIGENT_DB_CONNECT_RETRY_MAX_DELAY_SECONDS"
+_DB_CONNECT_RETRY_JITTER_ENV = "OMNIGENT_DB_CONNECT_RETRY_JITTER"
 _MIGRATION_DATABASE_URL_ENV = "MIGRATION_DATABASE_URL"
 _RUN_MIGRATIONS_ON_BOOT_ENV = "OMNIGENT_RUN_MIGRATIONS_ON_BOOT"
 _MIGRATION_LOCK_TIMEOUT_ENV = "OMNIGENT_MIGRATION_LOCK_TIMEOUT_SECONDS"
@@ -80,7 +90,71 @@ _DISABLE_PREPARED_STATEMENTS_ENV = "OMNIGENT_DB_DISABLE_PREPARED_STATEMENTS"
 _DEFAULT_POOL_SIZE = 32
 _DEFAULT_MAX_OVERFLOW = 32
 _DEFAULT_POOL_TIMEOUT_SECONDS = 10
+_DEFAULT_DB_CONNECT_RETRY_MAX_SECONDS = 30.0
+_DEFAULT_DB_CONNECT_RETRY_INITIAL_DELAY_SECONDS = 0.25
+_DEFAULT_DB_CONNECT_RETRY_MAX_DELAY_SECONDS = 5.0
+_DEFAULT_DB_CONNECT_RETRY_JITTER = 0.2
 _DEFAULT_MIGRATION_LOCK_TIMEOUT_SECONDS = 600.0
+
+_TRANSIENT_CONNECTION_SQLSTATES = frozenset(
+    {
+        "08001",  # SQL-client unable to establish a connection
+        "08004",  # server rejected the connection
+        "08006",  # connection failure
+        "25006",  # read-only during promotion/recovery
+        "57P01",  # admin shutdown
+        "57P02",  # crash shutdown
+        "57P03",  # cannot connect now / starting up
+    }
+)
+_PERMANENT_CONNECTION_SQLSTATE_PREFIXES = ("23", "28")  # constraint/auth errors
+_PERMANENT_CONNECTION_SQLSTATES = frozenset(
+    {
+        "3D000",  # invalid catalog name / database does not exist
+        "42501",  # insufficient privilege
+        "42601",  # syntax error
+    }
+)
+_TRANSIENT_CONNECTION_MESSAGES = (
+    "connection refused",
+    "connection reset",
+    "could not connect now",
+    "cannot connect now",
+    "server closed the connection unexpectedly",
+    "database system is starting up",
+    "database system is shutting down",
+    "not yet accepting connections",
+    "database system is in recovery",
+    "during recovery",
+    "read-only transaction",
+)
+_PERMANENT_CONNECTION_MESSAGES = (
+    "authentication failed",
+    "password authentication failed",
+    "database does not exist",
+    "permission denied",
+    "syntax error",
+    "constraint violation",
+    "violates ",
+)
+
+
+class _DatabaseConnectionRetryError(ConnectionError):
+    """Raised when transient connection failures outlive the retry window."""
+
+
+class _DbapiWithConnect(Protocol):
+    """Small DBAPI typing surface used by SQLAlchemy's connect hook."""
+
+    connect: Callable[..., object]
+    Error: type[BaseException]
+
+
+class _DialectWithDbapi(Protocol):
+    """Small typing surface exposed by SQLAlchemy's ``do_connect`` hook."""
+
+    dbapi: _DbapiWithConnect
+
 
 # Process-wide override, primarily for tests and for callers that want to plug
 # in their own token source (e.g. a non-default Databricks auth flow) without
@@ -119,6 +193,57 @@ def _env_flag(env_name: str, default: bool) -> bool:
     if raw_value is None:
         return default
     return raw_value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _connection_retry_jitter() -> float:
+    """Resolve the fractional jitter applied to connection retry delays."""
+    raw_value = os.environ.get(_DB_CONNECT_RETRY_JITTER_ENV)
+    if raw_value is None:
+        return _DEFAULT_DB_CONNECT_RETRY_JITTER
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{_DB_CONNECT_RETRY_JITTER_ENV} must be a number between 0 and 1, got {raw_value!r}"
+        ) from exc
+    if not math.isfinite(value) or not 0 <= value <= 1:
+        raise RuntimeError(
+            f"{_DB_CONNECT_RETRY_JITTER_ENV} must be between 0 and 1, got {raw_value!r}"
+        )
+    return value
+
+
+def _connection_retry_settings() -> tuple[float, float, float, float]:
+    """Resolve and validate the bounded new-connection retry settings."""
+    return (
+        float(
+            _pool_setting(
+                _DB_CONNECT_RETRY_MAX_SECONDS_ENV,
+                _DEFAULT_DB_CONNECT_RETRY_MAX_SECONDS,
+                integer=False,
+                minimum=0.0,
+            )
+        ),
+        float(
+            _pool_setting(
+                _DB_CONNECT_RETRY_INITIAL_DELAY_SECONDS_ENV,
+                _DEFAULT_DB_CONNECT_RETRY_INITIAL_DELAY_SECONDS,
+                integer=False,
+                minimum=0.0,
+                inclusive=False,
+            )
+        ),
+        float(
+            _pool_setting(
+                _DB_CONNECT_RETRY_MAX_DELAY_SECONDS_ENV,
+                _DEFAULT_DB_CONNECT_RETRY_MAX_DELAY_SECONDS,
+                integer=False,
+                minimum=0.0,
+                inclusive=False,
+            )
+        ),
+        _connection_retry_jitter(),
+    )
 
 
 def _run_migrations_on_boot() -> bool:
@@ -266,6 +391,130 @@ _engine_cache: dict[str, Engine] = {}
 _engine_lock = threading.Lock()
 
 
+def _exception_sqlstate(exc: BaseException) -> str | None:
+    """Return a DBAPI exception's SQLSTATE, including psycopg diagnostics."""
+    sqlstate = getattr(exc, "sqlstate", None)
+    if isinstance(sqlstate, str):
+        return sqlstate.upper()
+    diagnostic = getattr(exc, "diag", None)
+    diagnostic_sqlstate = getattr(diagnostic, "sqlstate", None)
+    if isinstance(diagnostic_sqlstate, str):
+        return diagnostic_sqlstate.upper()
+    return None
+
+
+def _is_transient_connection_error(
+    exc: BaseException,
+    *,
+    dbapi_error_type: type[BaseException],
+) -> bool:
+    """Classify only known transient DBAPI connection failures as retryable.
+
+    This runs around ``dbapi.connect`` only, so message matching cannot turn a
+    failed SQL statement into a retried operation. Unknown SQLSTATEs fail fast.
+    """
+    if not isinstance(exc, dbapi_error_type):
+        return False
+
+    sqlstate = _exception_sqlstate(exc)
+    if sqlstate is not None:
+        if sqlstate in _PERMANENT_CONNECTION_SQLSTATES or sqlstate.startswith(
+            _PERMANENT_CONNECTION_SQLSTATE_PREFIXES
+        ):
+            return False
+        return sqlstate in _TRANSIENT_CONNECTION_SQLSTATES
+
+    message = str(exc).lower()
+    if any(marker in message for marker in _PERMANENT_CONNECTION_MESSAGES):
+        return False
+    return any(marker in message for marker in _TRANSIENT_CONNECTION_MESSAGES)
+
+
+def _connect_dbapi_with_retry(
+    connect: Callable[..., object],
+    cargs: Sequence[object],
+    cparams: dict[str, object],
+    *,
+    dbapi_error_type: type[BaseException],
+    max_seconds: float,
+    initial_delay_seconds: float,
+    max_delay_seconds: float,
+    jitter: float,
+) -> object:
+    """Open one physical connection, retrying only classified outages."""
+    started = time.monotonic()
+    deadline = started + max_seconds
+    attempt = 0
+    delay_seconds = initial_delay_seconds
+
+    while True:
+        attempt += 1
+        try:
+            return connect(*cargs, **cparams)
+        except Exception as exc:
+            if not _is_transient_connection_error(exc, dbapi_error_type=dbapi_error_type):
+                raise
+
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                elapsed_seconds = max(0.0, time.monotonic() - started)
+                message = (
+                    "database connection remained unavailable for "
+                    f"{elapsed_seconds:.1f}s after {attempt} attempts; "
+                    f"last transient error: {exc}"
+                )
+                _logger.warning("%s", message)
+                raise _DatabaseConnectionRetryError(message) from exc
+
+            jittered_delay = delay_seconds * random.uniform(1 - jitter, 1 + jitter)
+            sleep_seconds = min(jittered_delay, max_delay_seconds, remaining_seconds)
+            _logger.debug(
+                "Transient database connection failure on attempt %d; retrying in %.3fs",
+                attempt,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+            delay_seconds = min(delay_seconds * 2, max_delay_seconds)
+
+
+def _install_connection_retry(
+    engine: Engine,
+) -> Callable[[object, object, list[object], dict[str, object]], object]:
+    """Retry transient failures from SQLAlchemy's new-connection hook.
+
+    ``do_connect`` fires before a new DBAPI connection is opened, not when a
+    pooled connection is checked out. It therefore complements ``pool_pre_ping``
+    without retrying statements or migration work.
+    """
+    (
+        max_seconds,
+        initial_delay_seconds,
+        max_delay_seconds,
+        jitter,
+    ) = _connection_retry_settings()
+
+    def _connect_with_retry(
+        dialect: object,
+        _conn_rec: object,
+        cargs: list[object],
+        cparams: dict[str, object],
+    ) -> object:
+        dbapi = cast(_DialectWithDbapi, dialect).dbapi
+        return _connect_dbapi_with_retry(
+            dbapi.connect,
+            cargs,
+            cparams,
+            dbapi_error_type=dbapi.Error,
+            max_seconds=max_seconds,
+            initial_delay_seconds=initial_delay_seconds,
+            max_delay_seconds=max_delay_seconds,
+            jitter=jitter,
+        )
+
+    event.listen(engine, "do_connect", _connect_with_retry)
+    return _connect_with_retry
+
+
 def _create_engine(db_uri: str) -> Engine:
     """
     Create a SQLAlchemy engine with connection pool configuration.
@@ -280,12 +529,13 @@ def _create_engine(db_uri: str) -> Engine:
     a time and synchronous-write contention propagates immediately.
     WAL also lets readers proceed concurrently with a writer.
 
-    Non-SQLite databases use connection pooling with
-    ``pool_pre_ping`` to verify connections before use. When a Lakebase
-    token provider is active (see :func:`_resolve_lakebase_token_provider`),
-    the engine additionally re-mints its OAuth token per new connection and
-    uses a shorter ``pool_recycle`` window; otherwise the static URI (and its
-    baked-in password, if any) is used unchanged.
+    Non-SQLite databases use connection pooling with ``pool_pre_ping`` to
+    verify pooled connections before use and a bounded retry around new
+    physical connections. When a Lakebase token provider is active (see
+    :func:`_resolve_lakebase_token_provider`), the engine additionally
+    re-mints its OAuth token per new connection and uses a shorter
+    ``pool_recycle`` window; otherwise the static URI (and its baked-in
+    password, if any) is used unchanged.
 
     :param db_uri: SQLAlchemy database connection string, e.g.
         ``"sqlite:///mydb.db"`` or
@@ -361,7 +611,7 @@ def _create_engine(db_uri: str) -> Engine:
         connect_args=connect_args,
         # Verify connections are alive before checking them out
         # from the pool. Prevents "server has gone away" errors
-        # after idle periods.
+        # after idle periods; new connections use the retry hook below.
         pool_pre_ping=True,
         # Recycle connections older than this window. Prevents stale
         # connections when the database server restarts or closes idle
@@ -376,6 +626,8 @@ def _create_engine(db_uri: str) -> Engine:
         # blocking indefinitely; surfaces real saturation as an
         # error rather than a hang.
         pool_timeout=pool_timeout,
+        # Return sessions with no open transaction or session-local state.
+        pool_reset_on_return="rollback",
     )
     _logger.info(
         "database engine configured dialect=%s pool_size=%s max_overflow=%s "
@@ -388,6 +640,7 @@ def _create_engine(db_uri: str) -> Engine:
     )
     if token_provider:
         _install_lakebase_token_refresh(engine, token_provider)
+    _install_connection_retry(engine)
     return engine
 
 
