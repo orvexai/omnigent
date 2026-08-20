@@ -85,6 +85,48 @@ Writes a timestamped `results/` directory (git-ignored):
 Each host's own log (useful when a host fails to register) is at
 `results/.../host-workspaces/<host-name>/host.log`.
 
+## Zero-downtime rollout proof
+
+The acceptance harness runs the HTTP prober, one SSE subscriber per session,
+real host-bound multi-turn drivers, and the runner observer concurrently while
+three local server processes are replaced one at a time:
+
+```bash
+uv run python dev/loadtest/run.py --rollout-resilience \
+  --out-dir /tmp/omnigent-rollout-proof
+```
+
+The default local mode uses one shared SQLite database and the repository mock
+LLM; it does not need an LLM API key. It writes `rollout_resilience.json`,
+`rollout_resilience.md`, `http_samples.jsonl`, `sse_gaps.json`, and `turns.json`.
+The command exits non-zero when any assertion fails. To exercise the negative
+path deliberately, use `--failure-mode hard-kill`; the missing drain signal is
+expected to fail the close-code and recovery assertions.
+
+The drivers and assertions do not depend on how replacement happens. A future
+cluster run should point the same test at the service URL, pass the live
+session and runner IDs, database URL, namespace, and pod selector, then use
+`KubernetesTarget.roll_all()` to delete one pod with its normal grace period,
+wait for the replacement to be Ready, and continue to the next pod. The
+Kubernetes adapter is separate from the local process target so orchestration
+cannot change the measurements or assertion rules.
+
+The cluster CLI shape is:
+
+```bash
+uv run python dev/loadtest/run.py --rollout-resilience --mode kubernetes \
+  --base-url https://omnigent.example \
+  --session-id <session-a> --session-id <session-b> \
+  --runner-id <runner-a> --runner-id <runner-b> \
+  --database-uri "$DATABASE_URL" --namespace omnigent \
+  --selector app=omnigent --pod-address <pod-ip:8000> \
+  --runner-log /path/to/runner.log
+```
+
+Add `--expect-approvals` when the supplied sessions use the deterministic
+approval policy; otherwise the same turn driver checks completion without
+requiring an approval prompt.
+
 ## Against another server
 
 There is intentionally no `--server` flag: the mocked LLM only works on a stack

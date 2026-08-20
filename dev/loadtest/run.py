@@ -28,7 +28,8 @@ Writes a timestamped result set:
 Runs from a repo checkout only (imports ``dev.benchmarks`` + ``tests``), with
 the ``loadtest`` and ``agents-sdk`` extras. Knobs: ``--users`` (N hosts),
 ``--spawn-rate``, ``--run-time``, ``--sessions-per-user``, ``--turns-per-session``,
-``--reply-words``, ``--out-dir``.
+``--reply-words``, ``--out-dir``. ``--rollout-resilience`` selects the
+zero-downtime proof harness, which uses the same mocked host-turn substrate.
 """
 
 from __future__ import annotations
@@ -88,6 +89,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Result directory. Default: dev/loadtest/results/omnigent_load_test-<timestamp>.",
     )
+    from dev.loadtest.rollout_resilience import build_resilience_parser
+
+    build_resilience_parser(parser)
     return parser
 
 
@@ -357,6 +361,11 @@ def _os_environ() -> dict[str, str]:
 def main() -> int:
     """Parse inputs and run."""
     args = _build_parser().parse_args()
+    if args.rollout_resilience:
+        from dev.loadtest.rollout_resilience import resilience_main
+
+        out_dir = _resolve_out_dir(args.out_dir)
+        return resilience_main(args, out_dir)
     import importlib.util
 
     for pkg, mod in (("locust", "locust"), ("openai-agents", "agents")):
