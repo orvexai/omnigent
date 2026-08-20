@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+from typing import Any
 
 import pytest
 from fastapi import FastAPI, WebSocket
@@ -30,6 +31,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.serve import (
     _cancel_ws_channels,
+    _dispatch_ws_via_asgi,
     _handle_tunnel_frame,
     _RunnerWSChannel,
 )
@@ -263,6 +265,39 @@ async def test_frame_encode_decode_round_trip() -> None:
     ):
         round_tripped = decode_frame(encode_frame(frame))
         assert round_tripped == frame
+
+
+@pytest.mark.asyncio
+async def test_runner_ws_dispatch_ignores_send_after_close() -> None:
+    """A misbehaving ASGI app cannot emit a frame after its close."""
+    sent: list[str] = []
+    send_attempts = 0
+    close_sent = False
+
+    async def _send_text(data: str) -> None:
+        nonlocal close_sent, send_attempts
+        send_attempts += 1
+        frame = decode_frame(data)
+        if isinstance(frame, WSCloseFrame):
+            close_sent = True
+        elif close_sent:
+            raise RuntimeError('Cannot call "send" once a close message has been sent.')
+        sent.append(data)
+
+    async def _app(scope: object, receive: Any, send: Any) -> None:
+        del scope
+        await receive()
+        await send({"type": "websocket.accept"})
+        await send({"type": "websocket.close", "code": 1000, "reason": "done"})
+        await send({"type": "websocket.send", "text": "late"})
+
+    channel = _RunnerWSChannel(ch_id="close-race", send_text=_send_text)
+    frame = WSOpenFrame(ch_id="close-race", path="/attach")
+
+    await _dispatch_ws_via_asgi(_app, frame, channel)
+
+    assert send_attempts == 1
+    assert len(sent) == 1
 
 
 @pytest.mark.asyncio

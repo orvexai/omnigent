@@ -34,7 +34,11 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.registry import (
+    RunnerSession,
+    TunnelRegistry,
+    close_session_websocket,
+)
 from omnigent.server import session_live_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
@@ -665,7 +669,15 @@ async def _sender_loop(ws: WebSocket, session: RunnerSession) -> None:
         data = await session.outbound_queue.get()
         if data is None:
             return
-        await ws.send_text(data)
+        async with session.send_lock:
+            if session.writer_closing:
+                return
+            try:
+                await ws.send_text(data)
+            except (RuntimeError, WebSocketDisconnect):
+                session.writer_closing = True
+                session.writer_closed = True
+                return
 
 
 async def _receive_tunnel_text(ws: WebSocket, runner_id: str) -> str | None:
@@ -770,6 +782,7 @@ async def _ping_loop(
     :returns: None when the session goes stale or the runner is
         declared dead.
     """
+    del ws  # The session owns close/send ordering for the tunnel socket.
     while True:
         await asyncio.sleep(PING_INTERVAL_S)
         # Check if any frame arrived recently (not just pongs).
@@ -783,10 +796,11 @@ async def _ping_loop(
                 PING_MISS_THRESHOLD,
                 elapsed,
             )
-            try:
-                await ws.close(code=4003, reason="ping timeout")
-            except RuntimeError:
-                _logger.debug("Runner %s websocket already closed during ping timeout", runner_id)
+            await close_session_websocket(
+                session,
+                code=4003,
+                reason="ping timeout",
+            )
             return
         # Still within the liveness window — refresh the row so the
         # freshness gate keeps the runner in the online set cross-replica.

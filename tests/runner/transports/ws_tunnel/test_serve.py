@@ -11,7 +11,7 @@ from typing import Any, TypedDict
 
 import pytest
 from typing_extensions import Unpack
-from websockets.exceptions import InvalidStatus, InvalidURI, WebSocketException
+from websockets.exceptions import InvalidStatus, InvalidURI, ProtocolError, WebSocketException
 from websockets.http11 import Response
 
 from omnigent.runner.identity import (
@@ -98,6 +98,53 @@ def test_websocket_http_status_reads_invalid_status_response() -> None:
     exc = InvalidStatus(Response(401, "Unauthorized", [], b""))
 
     assert _websocket_http_status(exc) == 401
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_retries_protocol_error_from_rejected_handshake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed non-101 handshake is retried instead of escaping."""
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Reject the first upgrade, then stop the test on the retry."""
+        del app, tunnel_url, server_url, runner_id, runner_version, auth_token, tunnel_token
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ProtocolError("invalid status code")
+        raise asyncio.CancelledError
+
+    async def _sleep(delay: float) -> None:
+        """Record the retry delay without waiting."""
+        sleeps.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_args, **_kwargs: 0.0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_protocol_error",
+            runner_version="0.1.0",
+        )
+
+    assert attempts == 2
+    assert sleeps == [0.5]
 
 
 @pytest.mark.asyncio

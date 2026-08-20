@@ -19,7 +19,9 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.runner.transports.ws_tunnel.registry import (
     TunnelRegistry,
     WSChannelState,
+    close_session_websocket,
 )
+from omnigent.server.routes.runner_tunnel import _sender_loop
 
 
 class _NoopWS:
@@ -45,8 +47,55 @@ class _RecordingWS:
         return await asyncio.Future()
 
 
+class _CloseRaceWS(_RecordingWS):
+    """Fake socket that fails if close wins a send race."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.send_started = asyncio.Event()
+        self.release_send = asyncio.Event()
+        self.closed = False
+        self.close_codes: list[int] = []
+
+    async def send_text(self, data: str) -> None:
+        if self.closed:
+            raise RuntimeError('Cannot call "send" once a close message has been sent.')
+        self.sent.append(data)
+        self.send_started.set()
+        await self.release_send.wait()
+
+    async def close(self, *, code: int, reason: str) -> None:
+        del reason
+        self.close_codes.append(code)
+        self.closed = True
+
+
 def _hello() -> HelloFrame:
     return HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_inflight_send_without_send_after_close() -> None:
+    """A tunnel close waits for an in-flight frame instead of racing it."""
+    registry = TunnelRegistry()
+    ws = _CloseRaceWS()
+    session = registry.register("r-close-race", ws, _hello())
+    sender_task = asyncio.create_task(_sender_loop(ws, session))
+
+    await registry.send_text(session, "payload")
+    await ws.send_started.wait()
+    close_task = asyncio.create_task(
+        close_session_websocket(session, code=1012, reason="service restart")
+    )
+    await asyncio.sleep(0)
+    assert not close_task.done()
+
+    ws.release_send.set()
+    await asyncio.gather(close_task, sender_task)
+
+    assert ws.sent == ["payload"]
+    assert ws.closed is True
+    assert ws.close_codes == [1012]
 
 
 # ── runner_owner ────────────────────────────────────────

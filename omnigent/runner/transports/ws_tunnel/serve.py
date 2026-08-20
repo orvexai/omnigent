@@ -24,7 +24,7 @@ from typing import TypeAlias
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from starlette.types import ASGIApp, Message, Scope
-from websockets.exceptions import ConnectionClosedOK, InvalidURI, WebSocketException
+from websockets.exceptions import ConnectionClosedOK, InvalidURI, ProtocolError, WebSocketException
 
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -174,6 +174,18 @@ async def dispatch_via_asgi(
     response_status: list[int] = []
     response_headers_raw: list[tuple[bytes, bytes]] = []
     head_sent_to_ws: bool = False
+    outbound_failed = False
+
+    async def _send_frame(data: str) -> None:
+        """Send one response frame, suppressing follow-up sends after failure."""
+        nonlocal outbound_failed
+        if outbound_failed:
+            return
+        try:
+            await send_text(data)
+        except Exception:  # noqa: BLE001 -- any failed send means the tunnel is unavailable
+            outbound_failed = True
+            return
 
     async def receive() -> Message:
         nonlocal body_sent
@@ -200,7 +212,7 @@ async def dispatch_via_asgi(
         if ev_type == "http.response.start":
             response_status.append(event["status"])
             response_headers_raw[:] = list(event.get("headers", []))
-            await send_text(
+            await _send_frame(
                 encode_frame(
                     ResponseHeadFrame(
                         id=frame.id,
@@ -225,7 +237,7 @@ async def dispatch_via_asgi(
                         content_type = v.decode("latin-1", errors="replace")
                         break
                 body_str, encoding = encode_body(chunk, content_type)
-                await send_text(
+                await _send_frame(
                     encode_frame(
                         ResponseBodyFrame(
                             id=frame.id,
@@ -235,18 +247,22 @@ async def dispatch_via_asgi(
                     )
                 )
             if not event.get("more_body", False):
-                await send_text(encode_frame(ResponseEndFrame(id=frame.id)))
+                await _send_frame(encode_frame(ResponseEndFrame(id=frame.id)))
 
     try:
         await app(scope, receive, send)
     except Exception:
+        if outbound_failed:
+            # The tunnel is already unavailable; an error response would only
+            # produce a second send failure and obscure the original cause.
+            return
         # If the app crashed BEFORE sending head, surface a 500 so
         # the server's request-side awaiter doesn't hang. If it
         # crashed AFTER head, it's already streaming — best we can
         # do is end the response so the consumer doesn't wait
         # forever.
         if not head_sent_to_ws:
-            await send_text(
+            await _send_frame(
                 encode_frame(
                     ResponseHeadFrame(
                         id=frame.id,
@@ -255,7 +271,7 @@ async def dispatch_via_asgi(
                     )
                 )
             )
-            await send_text(
+            await _send_frame(
                 encode_frame(
                     ResponseBodyFrame(
                         id=frame.id,
@@ -264,7 +280,7 @@ async def dispatch_via_asgi(
                     )
                 )
             )
-        await send_text(encode_frame(ResponseEndFrame(id=frame.id)))
+        await _send_frame(encode_frame(ResponseEndFrame(id=frame.id)))
         raise
 
 
@@ -466,6 +482,16 @@ async def serve_tunnel(
                         delay_s = _INITIAL_RECONNECT_DELAY_S
                 else:
                     close_code = _websocket_close_code(exc)
+                    if isinstance(exc, ProtocolError) and http_status is None:
+                        # Some ingress responses are malformed enough that
+                        # websockets exposes only ProtocolError("invalid status
+                        # code") instead of InvalidStatus(response). It is
+                        # still a pre-upgrade, retryable handshake failure.
+                        _logger.info(
+                            "runner tunnel handshake rejected before upgrade: %s; retrying",
+                            exc,
+                        )
+                        retry_reason = f"WebSocket handshake rejected ({exc}); retrying"
                     if close_code in _FATAL_SERVER_CLOSE_CODES:
                         raise RuntimeError(
                             f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
@@ -599,9 +625,13 @@ def _websocket_http_status(exc: BaseException) -> int | None:
     :returns: HTTP status code, e.g. ``401``, or ``None`` when the
         exception is not an HTTP upgrade rejection.
     """
-    response = getattr(exc, "response", None)
-    status_code = getattr(response, "status_code", None)
-    return status_code if isinstance(status_code, int) else None
+    candidates = (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None))
+    for candidate in candidates:
+        response = getattr(candidate, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+    return None
 
 
 def _websocket_auth_redirect_url(exc: BaseException) -> str | None:
@@ -1087,6 +1117,8 @@ async def _dispatch_ws_via_asgi(
     # First receive() must return websocket.connect per ASGI WS spec.
     connect_event_consumed = False
     close_seen: tuple[int, str] | None = None
+    local_close_sent = False
+    send_lock = asyncio.Lock()
 
     async def receive() -> Message:
         nonlocal connect_event_consumed, close_seen
@@ -1115,58 +1147,58 @@ async def _dispatch_ws_via_asgi(
         raise RuntimeError(f"runner ws-channel {channel.ch_id!r}: unknown tag {tag!r}")
 
     async def send(event: Message) -> None:
-        ev_type = event.get("type")
-        if ev_type == "websocket.accept":
-            channel.accepted = True
-            return
-        if ev_type == "websocket.send":
-            text = event.get("text")
-            data = event.get("bytes")
-            if text is not None:
-                await channel.send_text(
-                    encode_frame(WSFrame(ch_id=channel.ch_id, data=text, encoding="utf-8"))
-                )
-            elif data is not None:
-                await channel.send_text(
-                    encode_frame(
-                        WSFrame(
-                            ch_id=channel.ch_id,
-                            data=base64.b64encode(bytes(data)).decode("ascii"),
-                            encoding="base64",
+        nonlocal local_close_sent
+        async with send_lock:
+            ev_type = event.get("type")
+            if ev_type == "websocket.accept":
+                if close_seen is None and not local_close_sent:
+                    channel.accepted = True
+                return
+            if close_seen is not None or local_close_sent:
+                return
+            if ev_type == "websocket.send":
+                text = event.get("text")
+                data = event.get("bytes")
+                if text is not None:
+                    await channel.send_text(
+                        encode_frame(WSFrame(ch_id=channel.ch_id, data=text, encoding="utf-8"))
+                    )
+                elif data is not None:
+                    await channel.send_text(
+                        encode_frame(
+                            WSFrame(
+                                ch_id=channel.ch_id,
+                                data=base64.b64encode(bytes(data)).decode("ascii"),
+                                encoding="base64",
+                            )
                         )
                     )
+                return
+            if ev_type == "websocket.close":
+                code = event.get("code", 1000)
+                reason = event.get("reason", "") or ""
+                local_close_sent = True
+                await channel.send_text(
+                    encode_frame(WSCloseFrame(ch_id=channel.ch_id, code=code, reason=reason))
                 )
-            return
-        if ev_type == "websocket.close":
-            code = event.get("code", 1000)
-            reason = event.get("reason", "") or ""
-            await channel.send_text(
-                encode_frame(WSCloseFrame(ch_id=channel.ch_id, code=code, reason=reason))
-            )
-            return
+                return
 
     try:
         await app(scope, receive, send)
     except asyncio.CancelledError:
         # Tunnel teardown: try to inform the peer once, then re-raise.
         with contextlib.suppress(Exception):
-            await channel.send_text(
-                encode_frame(
-                    WSCloseFrame(ch_id=channel.ch_id, code=1001, reason="runner shutdown")
-                )
-            )
+            await send({"type": "websocket.close", "code": 1001, "reason": "runner shutdown"})
         raise
     except Exception as exc:  # noqa: BLE001 -- log + surface as close
         _logger.warning("runner ws-attach dispatch %s failed: %r", channel.ch_id, exc)
         with contextlib.suppress(Exception):
-            await channel.send_text(
-                encode_frame(
-                    WSCloseFrame(
-                        ch_id=channel.ch_id,
-                        code=1011,
-                        reason="runner dispatch failed",
-                    )
-                )
+            await send(
+                {
+                    "type": "websocket.close",
+                    "code": 1011,
+                    "reason": "runner dispatch failed",
+                }
             )
 
 

@@ -109,6 +109,7 @@ class RunnerSession:
         sender task. Request-side code may run on another loop, so it
         enqueues writes here instead of calling ``ws.send_text``
         directly.
+    :param send_lock: Owner-loop lock serializing tunnel sends with close.
     :param connected_at: Unix epoch float of connect time.
     :param last_frame_at: Unix epoch float of the most recent frame
         from this runner. Updated on every receive — feeds the
@@ -132,12 +133,15 @@ class RunnerSession:
     hello: HelloFrame
     loop: asyncio.AbstractEventLoop
     outbound_queue: asyncio.Queue[str | None]
+    send_lock: asyncio.Lock
     connected_at: float
     last_frame_at: float
     owner: str | None
     host_id: str | None
     host_generation: int | None
     connected_sequence: int = 0
+    writer_closing: bool = False
+    writer_closed: bool = False
     in_flight: dict[str, RequestState] = field(default_factory=dict)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
     # 8-char hex channel ids; values hold the inbound queue consumed
@@ -309,6 +313,7 @@ class TunnelRegistry:
             hello=hello,
             loop=loop,
             outbound_queue=asyncio.Queue(),
+            send_lock=asyncio.Lock(),
             connected_at=now,
             last_frame_at=now,
             owner=owner,
@@ -844,6 +849,8 @@ class TunnelRegistry:
             with self._lock:
                 if self._sessions.get(session.runner_id) is not session:
                     error = ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
+                elif session.writer_closing:
+                    error = ConnectionError(f"runner {session.runner_id!r} tunnel is closing")
                 else:
                     session.outbound_queue.put_nowait(data)
             if error is not None:
@@ -916,6 +923,31 @@ class TunnelRegistry:
             return runner_id in self._sessions
 
 
+async def close_session_websocket(
+    session: RunnerSession,
+    *,
+    code: int,
+    reason: str,
+) -> None:
+    """Close a runner tunnel after serializing it with queued sends.
+
+    :param session: Runner session whose owner loop owns the socket.
+    :param code: WebSocket close code, e.g. ``4003``.
+    :param reason: WebSocket close reason.
+    :returns: None after close has completed or was already requested.
+    """
+    session.writer_closing = True
+    session.outbound_queue.put_nowait(None)
+    async with session.send_lock:
+        if session.writer_closed:
+            return
+        close = getattr(session.ws, "close", None)
+        if close is not None:
+            with contextlib.suppress(Exception):
+                await close(code=code, reason=reason)
+        session.writer_closed = True
+
+
 def _retire_session_writer(session: RunnerSession, *, code: int, reason: str) -> None:
     """Stop a session's sender task and best-effort close its socket.
 
@@ -927,12 +959,8 @@ def _retire_session_writer(session: RunnerSession, *, code: int, reason: str) ->
 
     def _retire() -> None:
         """Run on the WebSocket owner loop."""
-        session.outbound_queue.put_nowait(None)
-        close = getattr(session.ws, "close", None)
-        if close is not None:
-            with contextlib.suppress(Exception):
-                task = asyncio.create_task(close(code=code, reason=reason))
-                task.add_done_callback(_discard_task_exception)
+        task = asyncio.create_task(close_session_websocket(session, code=code, reason=reason))
+        task.add_done_callback(_discard_task_exception)
 
     with contextlib.suppress(RuntimeError):
         _call_session_soon_threadsafe(session, _retire)
