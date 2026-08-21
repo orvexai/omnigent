@@ -35,7 +35,7 @@ def _digest_commit_task() -> dict:
 
 
 def _digest_commit_resources() -> list[dict]:
-    with (ROOT / "tekton/digest-commit-rbac.yaml").open() as handle:
+    with (ROOT / "tekton/omnigent-github-token.yaml").open() as handle:
         return [document for document in yaml.safe_load_all(handle) if document]
 
 
@@ -87,14 +87,14 @@ def test_gitops_commit_runs_only_after_build_and_migrations_succeed() -> None:
 def test_gitops_commit_is_unconditional_and_requires_credentials() -> None:
     script = _digest_commit_script()
     task = _digest_commit_task()
-    scaffolding = (ROOT / "tekton/digest-commit-rbac.yaml").read_text()
+    credentials = (ROOT / "tekton/omnigent-github-token.yaml").read_text()
 
     assert "env" not in task["taskSpec"]["steps"][0]
     assert "AUTO_DEPLOY_ENABLED" not in script
     assert "Auto-deploy disabled" not in script
-    assert "Missing ${credential} in Secret omnigent-gitops-write-credentials" in script
-    assert "create configmap omnigent-auto-deploy" not in scaffolding
-    assert "patch configmap omnigent-auto-deploy" not in scaffolding
+    assert "Missing token in Secret omnigent-gitops-write-credentials" in script
+    assert "VaultDynamicSecret" in credentials
+    assert "ExternalSecret" in credentials
 
 
 def test_gitops_commit_has_no_cluster_deployment_patch_path() -> None:
@@ -123,8 +123,7 @@ def test_gitops_commit_credentials_mount_is_outside_tekton_and_matches_script() 
     assert mount_path == "/workspace/gitops-credentials"
     assert not (mount_path == "/tekton" or mount_path.startswith("/tekton/"))
     assert f"CREDENTIAL_DIR={mount_path}" in script
-    assert "${CREDENTIAL_DIR}/id_ed25519" in script
-    assert "${CREDENTIAL_DIR}/known_hosts" in script
+    assert "${CREDENTIAL_DIR}/token" in script
     assert "/tekton/gitops-credentials" not in script
 
 

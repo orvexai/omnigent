@@ -228,13 +228,11 @@ spec:
               set -eu
 
               CREDENTIAL_DIR=/workspace/gitops-credentials
-              for credential in id_ed25519 known_hosts; do
-                if [ ! -s "${CREDENTIAL_DIR}/${credential}" ]; then
-                  echo "Missing ${credential} in Secret omnigent-gitops-write-credentials" >&2
-                  echo "Create the repo-scoped SSH Secret before enabling auto-deploy." >&2
-                  exit 1
-                fi
-              done
+              if [ ! -s "${CREDENTIAL_DIR}/token" ]; then
+                echo "Missing token in Secret omnigent-gitops-write-credentials" >&2
+                echo "The OpenBao-backed GitHub App credential must be Ready before auto-deploy." >&2
+                exit 1
+              fi
 
               IMAGE_DIGEST="$(params.image-digest)"
               if ! printf '%s\n' "$IMAGE_DIGEST" | grep -Eq '^sha256:[0-9a-fA-F]{64}$'; then
@@ -257,8 +255,16 @@ spec:
               WORK_DIR="$(mktemp -d /tmp/omnigent-gitops.XXXXXX)"
               trap 'rm -rf "$WORK_DIR"' EXIT
               GITOPS_DIR="${WORK_DIR}/my-idp"
-              export GIT_SSH_COMMAND="ssh -i ${CREDENTIAL_DIR}/id_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=${CREDENTIAL_DIR}/known_hosts -o StrictHostKeyChecking=yes"
-              git clone --branch main --single-branch git@github.com:orvexai/my-idp.git "$GITOPS_DIR"
+              export HOME="${WORK_DIR}/home"
+              export GIT_TERMINAL_PROMPT=0
+              mkdir -p "$HOME"
+              {
+                printf 'machine github.com\n'
+                printf 'login x-access-token\n'
+                printf 'password %s\n' "$(cat "${CREDENTIAL_DIR}/token")"
+              } > "${HOME}/.netrc"
+              chmod 600 "${HOME}/.netrc"
+              git clone --branch main --single-branch https://github.com/orvexai/my-idp.git "$GITOPS_DIR"
 
               TARGET_RELATIVE=platform/apps/omnigent/manifests/05-deployment.yaml
               TARGET_FILE="${GITOPS_DIR}/${TARGET_RELATIVE}"

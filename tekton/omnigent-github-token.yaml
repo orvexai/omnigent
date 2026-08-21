@@ -1,0 +1,71 @@
+---
+# Short-lived GitHub App token for the digest-only write to orvexai/my-idp.
+# The token is minted by OpenBao and refreshed before its one-hour expiry;
+# no private key or long-lived token is stored in Git or a Kubernetes Secret.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: omnigent-github-token
+  namespace: tekton-pipelines
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+  labels:
+    app.kubernetes.io/name: omnigent-github-token
+    app.kubernetes.io/component: ci-secrets
+    app.kubernetes.io/part-of: omnigent
+---
+apiVersion: generators.external-secrets.io/v1alpha1
+kind: VaultDynamicSecret
+metadata:
+  name: omnigent-github-token-generator
+  namespace: tekton-pipelines
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+  labels:
+    app.kubernetes.io/name: omnigent-github-token-generator
+    app.kubernetes.io/component: ci-secrets
+    app.kubernetes.io/part-of: omnigent
+spec:
+  path: "github/token/crew-write"
+  method: "GET"
+  resultType: "Data"
+  provider:
+    server: "http://openbao-active.openbao.svc:8200"
+    auth:
+      kubernetes:
+        mountPath: "kubernetes"
+        role: "omnigent-github-token"
+        serviceAccountRef:
+          name: omnigent-github-token
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: omnigent-gitops-write-credentials
+  namespace: tekton-pipelines
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+  labels:
+    app.kubernetes.io/name: omnigent-gitops-write-credentials
+    app.kubernetes.io/component: ci-secrets
+    app.kubernetes.io/part-of: omnigent
+  finalizers:
+    - externalsecrets.external-secrets.io/externalsecret-cleanup
+spec:
+  refreshInterval: 25m
+  target:
+    name: omnigent-gitops-write-credentials
+    creationPolicy: Owner
+    deletionPolicy: Retain
+    template:
+      engineVersion: v2
+      mergePolicy: Replace
+      type: Opaque
+      data:
+        token: "{{ .token }}"
+  dataFrom:
+    - sourceRef:
+        generatorRef:
+          apiVersion: generators.external-secrets.io/v1alpha1
+          kind: VaultDynamicSecret
+          name: omnigent-github-token-generator
