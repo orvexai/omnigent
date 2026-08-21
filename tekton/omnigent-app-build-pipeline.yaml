@@ -1,10 +1,13 @@
 ---
-# Tekton Pipeline: build the Omnigent server image and run migrations.
+# Tekton Pipeline: build the Omnigent server image, run migrations, and commit
+# the resulting digest to the GitOps repository.
 #
 # Dockerfile-based build (deploy/docker/Dockerfile, context = repo root) via
 # the shared buildah-with-args Task. Pushes to the in-cluster Harbor bypass
 # endpoint (repos-direct.*) — the Deployment still pulls through the
 # Cloudflare proxy (repos.eu-central-1.myidp.cloud), same split docmost uses.
+# The final task edits only the digest in my-idp; ArgoCD remains the only
+# component that applies the resulting manifest to the cluster.
 #
 # Built from the "web" branch only — that branch carries our own patches on
 # top of upstream and is kept current by a daily merge-from-upstream workflow
@@ -19,7 +22,7 @@ metadata:
     app.kubernetes.io/component: ci-cd
     app.kubernetes.io/part-of: omnigent
 spec:
-  description: Build and push the Omnigent server image, then run database migrations.
+  description: Build and push the Omnigent server image, run database migrations, and commit the digest to GitOps.
   params:
     - name: repo-url
       type: string
@@ -59,6 +62,8 @@ spec:
           value: $(params.revision)
         - name: deleteExisting
           value: "true"
+        - name: depth
+          value: "0"
     - name: build-and-push
       runAfter:
         - clone-repo
@@ -171,3 +176,188 @@ spec:
               kubectl logs --namespace omnigent "${JOB}" || true
               kubectl delete --namespace omnigent "${JOB}" --ignore-not-found || true
               exit "$status"
+    - name: commit-gitops-digest
+      # A regular task (not finally) only starts when both prerequisites have
+      # succeeded. The target repository is different from the source repo
+      # watched by trigger.yaml, so this commit cannot recurse into this build.
+      runAfter:
+        - build-and-push
+        - run-migrations
+      params:
+        - name: image-digest
+          value: $(tasks.build-and-push.results.IMAGE_DIGEST)
+        - name: image-namespace
+          value: $(params.image-namespace)
+        - name: image-name
+          value: $(params.image-name)
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        description: Commit the successfully migrated image digest to my-idp without changing cluster state.
+        params:
+          - name: image-digest
+            type: string
+          - name: image-namespace
+            type: string
+          - name: image-name
+            type: string
+        workspaces:
+          - name: source
+        volumes:
+          # The Secret is optional so the documented kill switch still lets
+          # builds and migrations finish before credentials are installed.
+          - name: gitops-credentials
+            secret:
+              secretName: omnigent-gitops-write-credentials
+              optional: true
+              defaultMode: 0400
+        steps:
+          - name: commit
+            image: alpine/git:2.47.2
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+            env:
+              - name: AUTO_DEPLOY_ENABLED
+                valueFrom:
+                  configMapKeyRef:
+                    name: omnigent-auto-deploy
+                    key: enabled
+                    optional: true
+            volumeMounts:
+              - name: gitops-credentials
+                mountPath: /tekton/gitops-credentials
+                readOnly: true
+            script: |
+              #!/bin/sh
+              set -eu
+
+              # Change this ConfigMap key to "false" to keep the build and
+              # migration gate running while skipping only the GitOps commit.
+              if [ "${AUTO_DEPLOY_ENABLED:-false}" != "true" ]; then
+                echo "Auto-deploy disabled; build and migrations succeeded, so no GitOps commit will be made."
+                exit 0
+              fi
+
+              CREDENTIAL_DIR=/tekton/gitops-credentials
+              for credential in id_ed25519 known_hosts; do
+                if [ ! -s "${CREDENTIAL_DIR}/${credential}" ]; then
+                  echo "Missing ${credential} in Secret omnigent-gitops-write-credentials" >&2
+                  echo "Create the repo-scoped SSH Secret before enabling auto-deploy." >&2
+                  exit 1
+                fi
+              done
+
+              IMAGE_DIGEST="$(params.image-digest)"
+              if ! printf '%s\n' "$IMAGE_DIGEST" | grep -Eq '^sha256:[0-9a-fA-F]{64}$'; then
+                echo "Build returned an invalid image digest: ${IMAGE_DIGEST}" >&2
+                exit 1
+              fi
+
+              SOURCE_DIR="$(workspaces.source.path)"
+              SOURCE_HEAD="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+              if ! SOURCE_PARENT="$(git -C "$SOURCE_DIR" rev-parse "${SOURCE_HEAD}^1")"; then
+                echo "Cannot inspect the source parent; refusing to guess whether schema changed." >&2
+                exit 1
+              fi
+              NEW_ALEMBIC_REVISIONS="$(git -C "$SOURCE_DIR" diff --diff-filter=A --name-only "$SOURCE_PARENT" "$SOURCE_HEAD" -- 'omnigent/db/migrations/versions/*.py')"
+              ADDED_ALEMBIC_REVISION_FILES="$(git -C "$SOURCE_DIR" diff --diff-filter=ACMR --unified=0 "$SOURCE_PARENT" "$SOURCE_HEAD" -- 'omnigent/db/migrations/versions/*.py' | awk '/^diff --git / { file=$4; sub(/^b\//, "", file) } /^\+[^+].*revision[[:space:]]*=/ { print file }' | sort -u)"
+              if [ -n "$ADDED_ALEMBIC_REVISION_FILES" ]; then
+                NEW_ALEMBIC_REVISIONS="$ADDED_ALEMBIC_REVISION_FILES"
+              fi
+
+              WORK_DIR="$(mktemp -d /tmp/omnigent-gitops.XXXXXX)"
+              trap 'rm -rf "$WORK_DIR"' EXIT
+              GITOPS_DIR="${WORK_DIR}/my-idp"
+              export GIT_SSH_COMMAND="ssh -i ${CREDENTIAL_DIR}/id_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=${CREDENTIAL_DIR}/known_hosts -o StrictHostKeyChecking=yes"
+              git clone --branch main --single-branch git@github.com:orvexai/my-idp.git "$GITOPS_DIR"
+
+              TARGET_RELATIVE=platform/apps/omnigent/manifests/05-deployment.yaml
+              TARGET_FILE="${GITOPS_DIR}/${TARGET_RELATIVE}"
+              TARGET_IMAGE="repos.eu-central-1.myidp.cloud/$(params.image-namespace)/$(params.image-name)"
+              TARGET_IMAGE_RE='repos[.]eu-central-1[.]myidp[.]cloud/$(params.image-namespace)/$(params.image-name)'
+              IMAGE_LINE_RE="^[[:space:]]*image:[[:space:]]*${TARGET_IMAGE_RE}@sha256:[0-9a-fA-F]{64}([[:space:]]*(#.*)?)?$"
+              prepare_commit() {
+              if [ ! -f "$TARGET_FILE" ]; then
+                echo "GitOps manifest not found: ${TARGET_FILE}" >&2
+                exit 1
+              fi
+              TARGET_LINE_COUNT="$(grep -E -c "$IMAGE_LINE_RE" "$TARGET_FILE" || true)"
+              if [ "$TARGET_LINE_COUNT" -ne 1 ]; then
+                echo "Expected exactly one digest-pinned ${TARGET_IMAGE} image line; found ${TARGET_LINE_COUNT}." >&2
+                echo "Refusing to edit an unexpected GitOps manifest." >&2
+                exit 1
+              fi
+
+              TARGET_LINE_NUMBER="$(grep -E -n "$IMAGE_LINE_RE" "$TARGET_FILE" | cut -d: -f1)"
+              OLD_TARGET_LINE="$(git -C "$GITOPS_DIR" show "HEAD:${TARGET_RELATIVE}" | sed -n "${TARGET_LINE_NUMBER}p")"
+              CURRENT_TARGET_LINE="$(sed -n "${TARGET_LINE_NUMBER}p" "$TARGET_FILE")"
+              # Keep the target's comment, but remove stale wording that says
+              # the digest is manually deployed now that Tekton commits it.
+              if printf '%s\n' "$CURRENT_TARGET_LINE" | grep -Eqi '#.*(manual|manually)'; then
+                sed -i -E "${TARGET_LINE_NUMBER}s|[[:space:]]+#.*$| # auto-deployed by the omnigent Tekton pipeline|" "$TARGET_FILE"
+              fi
+              sed -i -E "${TARGET_LINE_NUMBER}s|@sha256:[0-9a-fA-F]{64}|@${IMAGE_DIGEST}|" "$TARGET_FILE"
+
+              UPDATED_TARGET_LINE="$(sed -n "${TARGET_LINE_NUMBER}p" "$TARGET_FILE")"
+              UPDATED_LINE_RE="^[[:space:]]*image:[[:space:]]*${TARGET_IMAGE_RE}@${IMAGE_DIGEST}([[:space:]]*(#.*)?)?$"
+              if ! grep -Eq "$UPDATED_LINE_RE" "$TARGET_FILE"; then
+                echo "Digest edit did not produce the expected proxy-registry image line." >&2
+                exit 1
+              fi
+              NORMALIZED_OLD_LINE="$(printf '%s\n' "$OLD_TARGET_LINE" | sed -E 's/@sha256:[0-9a-fA-F]{64}/@sha256:<digest>/; s/[[:space:]]+#.*$/ # <comment>/')"
+              NORMALIZED_UPDATED_LINE="$(printf '%s\n' "$UPDATED_TARGET_LINE" | sed -E 's/@sha256:[0-9a-fA-F]{64}/@sha256:<digest>/; s/[[:space:]]+#.*$/ # <comment>/')"
+              if [ "$NORMALIZED_OLD_LINE" != "$NORMALIZED_UPDATED_LINE" ]; then
+                echo "The GitOps edit changed more than the digest or its stale manual comment." >&2
+                exit 1
+              fi
+
+              if git -C "$GITOPS_DIR" diff --quiet -- "$TARGET_RELATIVE"; then
+                echo "GitOps already pins ${TARGET_IMAGE}@${IMAGE_DIGEST}; nothing to commit."
+                exit 0
+              fi
+              git -C "$GITOPS_DIR" add -- "$TARGET_RELATIVE"
+              if [ "$(git -C "$GITOPS_DIR" diff --cached --name-only)" != "$TARGET_RELATIVE" ]; then
+                echo "Refusing to commit files outside the Omnigent deployment manifest." >&2
+                exit 1
+              fi
+              git -C "$GITOPS_DIR" config user.name "omnigent-ci"
+              git -C "$GITOPS_DIR" config user.email "omnigent-ci@orvex.ai"
+              if [ -n "$NEW_ALEMBIC_REVISIONS" ]; then
+                git -C "$GITOPS_DIR" commit -F - <<EOF
+              chore(omnigent): auto-deploy ${IMAGE_DIGEST}
+
+              SCHEMA CHANGE: new Alembic revision file(s) were introduced in ${SOURCE_HEAD}:
+              ${NEW_ALEMBIC_REVISIONS}
+              A plain digest revert is unsafe across this migration; roll forward to a compatible image instead.
+              EOF
+              else
+                git -C "$GITOPS_DIR" commit -m "chore(omnigent): auto-deploy ${IMAGE_DIGEST}"
+              fi
+              }
+              prepare_commit
+
+              MAX_PUSH_ATTEMPTS=5
+              attempt=1
+              while [ "$attempt" -le "$MAX_PUSH_ATTEMPTS" ]; do
+                if git -C "$GITOPS_DIR" push origin HEAD:main; then
+                  echo "Committed ${IMAGE_DIGEST} to orvexai/my-idp main on attempt ${attempt}."
+                  exit 0
+                fi
+                if [ "$attempt" -eq "$MAX_PUSH_ATTEMPTS" ]; then
+                  echo "GitOps push failed after ${MAX_PUSH_ATTEMPTS} bounded attempts; refusing to overwrite main." >&2
+                  exit 1
+                fi
+                echo "GitOps main moved during push; fetching and rebasing our single digest commit (attempt ${attempt})." >&2
+                git -C "$GITOPS_DIR" fetch origin main
+                if ! git -C "$GITOPS_DIR" rebase origin/main; then
+                  echo "GitOps rebase conflicted; aborting it and retrying from the newest main without dropping remote work." >&2
+                  git -C "$GITOPS_DIR" rebase --abort || true
+                  git -C "$GITOPS_DIR" reset --hard origin/main
+                  prepare_commit
+                fi
+                attempt=$((attempt + 1))
+              done
+              exit 1

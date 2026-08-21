@@ -1,0 +1,46 @@
+---
+# GitOps digest commit control and credential contract.
+#
+# There is deliberately no Role, ClusterRole, or RoleBinding here. The
+# commit task does not call kubectl and must not receive deployment patch
+# permissions. Its only write credential is the repository-scoped SSH key
+# mounted from the Secret below; ArgoCD remains the only cluster writer.
+#
+# Before the first auto-deploy:
+#   1. Create a new ed25519 key pair for this integration (do not reuse a
+#      personal key).
+#   2. Add only its public key to github.com/orvexai/my-idp as a Deploy key
+#      with "Allow write access" enabled. Do not grant it organization or
+#      other-repository access.
+#   3. Verify GitHub's official SSH host key and create/update this Secret:
+#
+#      kubectl -n tekton-pipelines create secret generic \
+#        omnigent-gitops-write-credentials \
+#        --from-file=id_ed25519=/secure/path/my-idp-deploy-key \
+#        --from-file=known_hosts=/secure/path/github-known-hosts \
+#        --dry-run=client -o yaml | kubectl apply -f -
+#
+#      The Secret must contain exactly the private key and the verified
+#      known_hosts file; no credential value belongs in Git.
+#   4. Create the operator-owned kill switch (it is intentionally not
+#      Kustomize-managed, so ArgoCD cannot undo an emergency disable):
+#
+#      kubectl -n tekton-pipelines create configmap omnigent-auto-deploy \
+#        --from-literal=enabled=false
+#
+#      Patch `enabled` to "true" only after the Secret and GitHub deploy key
+#      have been tested. Patch it back to "false" to stop only the commit:
+#
+#      kubectl -n tekton-pipelines patch configmap omnigent-auto-deploy \
+#        --type merge -p '{"data":{"enabled":"false"}}'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: omnigent-gitops-write-credentials
+  namespace: tekton-pipelines
+  labels:
+    app.kubernetes.io/part-of: omnigent
+    app.kubernetes.io/component: ci-cd
+type: Opaque
+# Data is intentionally absent. The operator creates it with the command
+# above; committing a placeholder credential would be unsafe.

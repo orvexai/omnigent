@@ -26,6 +26,19 @@ def _task_script(name: str) -> str:
     return "\n".join(step.get("script", "") for step in task_spec.get("steps", []))
 
 
+def _digest_commit_script() -> str:
+    return _task_script("commit-gitops-digest")
+
+
+def _digest_commit_task() -> dict:
+    return _task("commit-gitops-digest")
+
+
+def _digest_commit_resources() -> list[dict]:
+    with (ROOT / "tekton/digest-commit-rbac.yaml").open() as handle:
+        return [document for document in yaml.safe_load_all(handle) if document]
+
+
 def _job_manifest() -> dict:
     script = _task_script("run-migrations")
     heredoc = script.split("<<EOF\n", 1)[1].split("\nEOF\n", 1)[0]
@@ -56,6 +69,93 @@ def test_migration_task_runs_after_build_without_rollout() -> None:
         for task in pipeline["spec"].get("tasks", []) + pipeline["spec"].get("finally", [])
     }
     assert "rollout-restart" not in task_names
+
+
+def test_gitops_commit_runs_only_after_build_and_migrations_succeed() -> None:
+    pipeline = _pipeline()["spec"]
+    commit = _task("commit-gitops-digest")
+
+    assert commit["runAfter"] == ["build-and-push", "run-migrations"]
+    assert commit in pipeline["tasks"]
+    assert commit not in pipeline.get("finally", [])
+    assert commit["params"][0] == {
+        "name": "image-digest",
+        "value": "$(tasks.build-and-push.results.IMAGE_DIGEST)",
+    }
+
+
+def test_gitops_commit_kill_switch_skips_only_the_commit() -> None:
+    script = _digest_commit_script()
+    task = _digest_commit_task()
+    scaffolding = (ROOT / "tekton/digest-commit-rbac.yaml").read_text()
+
+    assert task["taskSpec"]["steps"][0]["env"] == [
+        {
+            "name": "AUTO_DEPLOY_ENABLED",
+            "valueFrom": {
+                "configMapKeyRef": {
+                    "name": "omnigent-auto-deploy",
+                    "key": "enabled",
+                    "optional": True,
+                }
+            },
+        }
+    ]
+    assert 'if [ "${AUTO_DEPLOY_ENABLED:-false}" != "true" ]; then' in script
+    assert "build and migrations succeeded" in script
+    assert 'echo "Auto-deploy disabled' in script
+    assert "create configmap omnigent-auto-deploy" in scaffolding
+    assert "--from-literal=enabled=false" in scaffolding
+    assert "patch configmap omnigent-auto-deploy" in scaffolding
+
+
+def test_gitops_commit_has_no_cluster_deployment_patch_path() -> None:
+    script = _digest_commit_script()
+    resources = _digest_commit_resources()
+
+    assert "kubectl" not in script
+    assert not any(
+        resource["kind"] in {"Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding"}
+        for resource in resources
+    )
+    assert "gitops-credentials" in script
+    assert "omnigent-gitops-write-credentials" in script
+
+
+def test_gitops_digest_edit_preserves_proxy_registry_and_only_changes_digest() -> None:
+    script = _digest_commit_script()
+
+    assert (
+        'TARGET_IMAGE="repos.eu-central-1.myidp.cloud/$(params.image-namespace)/$(params.image-name)"'
+        in script
+    )
+    assert "repos-direct.eu-central-1.myidp.cloud" not in script
+    assert "TARGET_RELATIVE=platform/apps/omnigent/manifests/05-deployment.yaml" in script
+    assert "@sha256:[0-9a-fA-F]{64}" in script
+    assert "s|@sha256:[0-9a-fA-F]{64}|@${IMAGE_DIGEST}|" in script
+    assert "NORMALIZED_OLD_LINE" in script
+    assert "NORMALIZED_UPDATED_LINE" in script
+
+
+def test_gitops_commit_marks_schema_changes_and_rejects_plain_revert() -> None:
+    script = _digest_commit_script()
+
+    assert "diff --diff-filter=A --name-only" in script
+    assert "omnigent/db/migrations/versions/*.py" in script
+    assert "SCHEMA CHANGE: new Alembic revision" in script
+    assert "plain digest revert is unsafe" in script
+    assert "roll forward to a compatible image" in script
+
+
+def test_gitops_commit_rebases_with_bounded_non_force_pushes() -> None:
+    script = _digest_commit_script()
+
+    assert "MAX_PUSH_ATTEMPTS=5" in script
+    assert 'git -C "$GITOPS_DIR" fetch origin main' in script
+    assert 'git -C "$GITOPS_DIR" rebase origin/main' in script
+    assert 'git -C "$GITOPS_DIR" push origin HEAD:main' in script
+    assert "--force" not in script
+    assert "--force-with-lease" not in script
 
 
 def test_job_image_is_digest_pinned() -> None:

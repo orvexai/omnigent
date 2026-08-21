@@ -20,6 +20,7 @@ kind: Kustomization
 namespace: tekton-pipelines
 
 resources:
+  - digest-commit-rbac.yaml
   - migrate-rbac.yaml
   - omnigent-app-build-pipeline.yaml
   - trigger.yaml
