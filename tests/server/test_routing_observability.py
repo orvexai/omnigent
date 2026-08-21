@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -161,9 +162,14 @@ async def test_wrong_replica_handler_counts_and_stats_endpoint_has_no_identifier
     )
     response = await handler(
         request,
-        OmnigentError("runner is on another replica", code=ErrorCode.WRONG_REPLICA),
+        OmnigentError(
+            "runner is on another replica",
+            code=ErrorCode.WRONG_REPLICA,
+            owner_addr="pod-b:8000",
+        ),
     )
     assert response.status_code == 400
+    assert request.state.omnigent_owner_addr == "pod-b:8000"
     assert app.state.routing_stats.snapshot()["wrong_replica_total"] == 1
     assert not any(
         record.message.startswith("wrong_replica routing failure:") for record in caplog.records
@@ -180,3 +186,94 @@ async def test_wrong_replica_handler_counts_and_stats_endpoint_has_no_identifier
     assert exposed.json() == app.state.routing_stats.snapshot()
     assert "conv-secret" not in exposed.text
     assert "session_id" not in exposed.text
+
+
+@pytest.mark.asyncio
+async def test_runner_unavailable_warns_without_traceback_and_preserves_response(
+    app, caplog
+) -> None:
+    handler = app.exception_handlers[OmnigentError]
+    request = Request(
+        {
+            "type": "http",
+            "app": app,
+            "method": "GET",
+            "scheme": "http",
+            "path": "/v1/sessions/conv-offline/resources/files",
+            "query_string": b"",
+            "headers": [],
+            "state": {},
+        }
+    )
+    error = OmnigentError("runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    response = await handler(request, error)
+
+    assert response.status_code == 503
+    assert response.body == (
+        b'{"error":{"code":"runner_unavailable","message":"runner is offline"}}'
+    )
+    records = [record for record in caplog.records if record.name == "omnigent.server.app"]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].message == "Runner unavailable: runner is offline"
+    assert records[0].exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_internal_error_remains_error_with_traceback(app, caplog) -> None:
+    handler = app.exception_handlers[OmnigentError]
+    request = Request(
+        {
+            "type": "http",
+            "app": app,
+            "method": "GET",
+            "scheme": "http",
+            "path": "/v1/sessions/conv-error",
+            "query_string": b"",
+            "headers": [],
+            "state": {},
+        }
+    )
+    error = OmnigentError("database exploded")
+
+    response = await handler(request, error)
+
+    assert response.status_code == 500
+    records = [record for record in caplog.records if record.name == "omnigent.server.app"]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert records[0].message == "Internal error: database exploded"
+    assert records[0].exc_info is not None
+    assert records[0].exc_info[1] is error
+
+
+@pytest.mark.asyncio
+async def test_capability_mismatch_503_remains_error_with_traceback(app, caplog) -> None:
+    handler = app.exception_handlers[OmnigentError]
+    request = Request(
+        {
+            "type": "http",
+            "app": app,
+            "method": "GET",
+            "scheme": "http",
+            "path": "/v1/sessions/conv-capability",
+            "query_string": b"",
+            "headers": [],
+            "state": {},
+        }
+    )
+    error = OmnigentError(
+        "runner does not support the requested harness",
+        code=ErrorCode.RUNNER_CAPABILITY_MISMATCH,
+    )
+
+    response = await handler(request, error)
+
+    assert response.status_code == 503
+    records = [record for record in caplog.records if record.name == "omnigent.server.app"]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert records[0].message == "Internal error: runner does not support the requested harness"
+    assert records[0].exc_info is not None
+    assert records[0].exc_info[1] is error

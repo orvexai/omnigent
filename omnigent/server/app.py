@@ -1610,7 +1610,11 @@ def create_app(
             if exc.owner_addr is not None:
                 request.state.omnigent_owner_addr = exc.owner_addr
             app.state.routing_stats.record_wrong_replica()
-        if exc.http_status >= 500:
+        # Classify by semantic code: offline runners are expected; other 5xx
+        # codes, including capability mismatches, remain actionable faults.
+        if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+            _logger.warning("Runner unavailable: %s", exc.message)
+        elif exc.http_status >= 500:
             _logger.error("Internal error: %s", exc.message, exc_info=exc)
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
