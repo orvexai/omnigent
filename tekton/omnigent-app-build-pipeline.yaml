@@ -228,7 +228,7 @@ spec:
                     optional: true
             volumeMounts:
               - name: gitops-credentials
-                mountPath: /tekton/gitops-credentials
+                mountPath: /workspace/gitops-credentials
                 readOnly: true
             script: |
               #!/bin/sh
@@ -241,7 +241,7 @@ spec:
                 exit 0
               fi
 
-              CREDENTIAL_DIR=/tekton/gitops-credentials
+              CREDENTIAL_DIR=/workspace/gitops-credentials
               for credential in id_ed25519 known_hosts; do
                 if [ ! -s "${CREDENTIAL_DIR}/${credential}" ]; then
                   echo "Missing ${credential} in Secret omnigent-gitops-write-credentials" >&2

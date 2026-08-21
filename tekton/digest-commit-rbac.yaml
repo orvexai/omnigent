@@ -22,6 +22,8 @@
 #
 #      The Secret must contain exactly the private key and the verified
 #      known_hosts file; no credential value belongs in Git.
+#      The pipeline mounts these files at /workspace/gitops-credentials,
+#      outside Tekton's reserved /tekton/ bookkeeping directory.
 #   4. Create the operator-owned kill switch (it is intentionally not
 #      Kustomize-managed, so ArgoCD cannot undo an emergency disable):
 #

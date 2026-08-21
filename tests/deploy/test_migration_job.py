@@ -122,6 +122,24 @@ def test_gitops_commit_has_no_cluster_deployment_patch_path() -> None:
     assert "omnigent-gitops-write-credentials" in script
 
 
+def test_gitops_commit_credentials_mount_is_outside_tekton_and_matches_script() -> None:
+    task = _digest_commit_task()
+    step = task["taskSpec"]["steps"][0]
+    mounts = step["volumeMounts"]
+    script = _digest_commit_script()
+
+    assert len(mounts) == 1
+    mount = mounts[0]
+    mount_path = mount["mountPath"]
+    assert mount["name"] == "gitops-credentials"
+    assert mount_path == "/workspace/gitops-credentials"
+    assert not (mount_path == "/tekton" or mount_path.startswith("/tekton/"))
+    assert f"CREDENTIAL_DIR={mount_path}" in script
+    assert "${CREDENTIAL_DIR}/id_ed25519" in script
+    assert "${CREDENTIAL_DIR}/known_hosts" in script
+    assert "/tekton/gitops-credentials" not in script
+
+
 def test_gitops_digest_edit_preserves_proxy_registry_and_only_changes_digest() -> None:
     script = _digest_commit_script()
 
