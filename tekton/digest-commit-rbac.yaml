@@ -24,17 +24,8 @@
 #      known_hosts file; no credential value belongs in Git.
 #      The pipeline mounts these files at /workspace/gitops-credentials,
 #      outside Tekton's reserved /tekton/ bookkeeping directory.
-#   4. Create the operator-owned kill switch (it is intentionally not
-#      Kustomize-managed, so ArgoCD cannot undo an emergency disable):
-#
-#      kubectl -n tekton-pipelines create configmap omnigent-auto-deploy \
-#        --from-literal=enabled=false
-#
-#      Patch `enabled` to "true" only after the Secret and GitHub deploy key
-#      have been tested. Patch it back to "false" to stop only the commit:
-#
-#      kubectl -n tekton-pipelines patch configmap omnigent-auto-deploy \
-#        --type merge -p '{"data":{"enabled":"false"}}'
+#   4. The commit task is always active after build and migration success;
+#      missing credentials fail the task before any GitOps mutation.
 apiVersion: v1
 kind: Secret
 metadata:

@@ -84,29 +84,17 @@ def test_gitops_commit_runs_only_after_build_and_migrations_succeed() -> None:
     }
 
 
-def test_gitops_commit_kill_switch_skips_only_the_commit() -> None:
+def test_gitops_commit_is_unconditional_and_requires_credentials() -> None:
     script = _digest_commit_script()
     task = _digest_commit_task()
     scaffolding = (ROOT / "tekton/digest-commit-rbac.yaml").read_text()
 
-    assert task["taskSpec"]["steps"][0]["env"] == [
-        {
-            "name": "AUTO_DEPLOY_ENABLED",
-            "valueFrom": {
-                "configMapKeyRef": {
-                    "name": "omnigent-auto-deploy",
-                    "key": "enabled",
-                    "optional": True,
-                }
-            },
-        }
-    ]
-    assert 'if [ "${AUTO_DEPLOY_ENABLED:-false}" != "true" ]; then' in script
-    assert "build and migrations succeeded" in script
-    assert 'echo "Auto-deploy disabled' in script
-    assert "create configmap omnigent-auto-deploy" in scaffolding
-    assert "--from-literal=enabled=false" in scaffolding
-    assert "patch configmap omnigent-auto-deploy" in scaffolding
+    assert "env" not in task["taskSpec"]["steps"][0]
+    assert "AUTO_DEPLOY_ENABLED" not in script
+    assert "Auto-deploy disabled" not in script
+    assert "Missing ${credential} in Secret omnigent-gitops-write-credentials" in script
+    assert "create configmap omnigent-auto-deploy" not in scaffolding
+    assert "patch configmap omnigent-auto-deploy" not in scaffolding
 
 
 def test_gitops_commit_has_no_cluster_deployment_patch_path() -> None:
