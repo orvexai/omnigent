@@ -3657,6 +3657,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         raw_runner_id: str,
         *,
         user_id: str | None = None,
+        pod_addr: str | None = None,
     ) -> str:
         """
         Accept the test runner id without a real tunnel registry.
@@ -3664,8 +3665,10 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         :param _runner_router: Ignored runner router placeholder.
         :param raw_runner_id: Requested runner id, e.g. ``"runner_recovered"``.
         :param user_id: Optional authenticated user id, e.g. ``"alice@example.com"``.
+        :param pod_addr: Replica address supplied by the PATCH route.
         :returns: The trimmed runner id.
         """
+        del pod_addr
         return raw_runner_id.strip()
 
     async def _get_runner_client(

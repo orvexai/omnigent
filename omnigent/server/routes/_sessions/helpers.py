@@ -8789,6 +8789,7 @@ def _registered_runner_id(
     raw_runner_id: str,
     *,
     user_id: str | None = None,
+    pod_addr: str | None = None,
 ) -> str:
     """
     Validate a runner id from ``PATCH /v1/sessions/{id}``.
@@ -8804,6 +8805,10 @@ def _registered_runner_id(
     :param user_id: Authenticated caller, e.g.
         ``"alice@example.com"``. ``None`` skips the ownership
         check (single-user / no-auth mode).
+    :param pod_addr: Address of the replica validating the bind, e.g.
+        ``"10.20.30.41:8000"``. When supplied, a durable owner on a
+        different replica is reported as ``WRONG_REPLICA`` so the
+        owner-forwarding middleware can replay the PATCH there.
     :returns: Trimmed registered runner id.
     :raises OmnigentError: If the id is empty, the router is
         unavailable, the runner is not registered, or the caller
@@ -8819,6 +8824,16 @@ def _registered_runner_id(
         raise OmnigentError(
             "runner router is not configured",
             code=ErrorCode.INTERNAL_ERROR,
+        )
+    owner_lookup = getattr(runner_router, "runner_owner_addr", None)
+    owner_addr = (
+        owner_lookup(runner_id) if pod_addr is not None and callable(owner_lookup) else None
+    )
+    if isinstance(owner_addr, str) and owner_addr != pod_addr:
+        raise OmnigentError(
+            f"runner {runner_id!r} is owned by another replica",
+            code=ErrorCode.WRONG_REPLICA,
+            owner_addr=owner_addr,
         )
     if not runner_router.runner_is_online(runner_id):
         raise OmnigentError(

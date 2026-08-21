@@ -1850,6 +1850,7 @@ def register_core_routes(
                     runner_router,
                     body.runner_id,
                     user_id=user_id,
+                    pod_addr=getattr(request.app.state, "pod_addr", None),
                 )
                 try:
                     await asyncio.to_thread(

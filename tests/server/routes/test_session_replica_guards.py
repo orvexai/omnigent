@@ -43,6 +43,29 @@ class _RemoteRouter:
         return "pod-b:8000"
 
 
+class _LocalRouter:
+    """The runner is registered on the replica handling the bind."""
+
+    def runner_is_online(self, runner_id: str) -> bool:
+        del runner_id
+        return True
+
+    def runner_owner_addr(self, runner_id: str) -> str:
+        del runner_id
+        return "pod-a:8000"
+
+
+class _UnknownRouter:
+    """The runner has no local registration or durable owner."""
+
+    def runner_is_online(self, runner_id: str) -> bool:
+        del runner_id
+        return False
+
+    def runner_owner_addr(self, runner_id: str) -> None:
+        del runner_id
+
+
 class _ConversationStore:
     def __init__(self, conversation: Conversation) -> None:
         self.conversation = conversation
@@ -89,6 +112,43 @@ def _app(router: _RemoteRouter) -> SimpleNamespace:
             runner_router=router,
         )
     )
+
+
+def test_runner_bind_remote_owner_is_classified_for_forwarding() -> None:
+    """A remote durable owner becomes a forwardable wrong-replica error."""
+    with pytest.raises(OmnigentError) as exc_info:
+        helpers._registered_runner_id(
+            _RemoteRouter(),
+            " runner_replica ",
+            pod_addr="pod-a:8000",
+        )
+
+    assert exc_info.value.code == ErrorCode.WRONG_REPLICA
+    assert exc_info.value.owner_addr == "pod-b:8000"
+
+
+def test_runner_bind_local_owner_preserves_success() -> None:
+    """A locally owned live runner still returns its trimmed id."""
+    assert (
+        helpers._registered_runner_id(
+            _LocalRouter(),
+            " runner_local ",
+            pod_addr="pod-a:8000",
+        )
+        == "runner_local"
+    )
+
+
+def test_runner_bind_unknown_runner_preserves_invalid_input() -> None:
+    """An unknown runner remains the existing 400-class validation error."""
+    with pytest.raises(OmnigentError) as exc_info:
+        helpers._registered_runner_id(
+            _UnknownRouter(),
+            "runner_unknown",
+            pod_addr="pod-a:8000",
+        )
+
+    assert exc_info.value.code == ErrorCode.INVALID_INPUT
 
 
 def _endpoint(router: APIRouter, suffix: str) -> Any:
