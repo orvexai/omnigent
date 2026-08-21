@@ -1609,29 +1609,7 @@ def create_app(
         if exc.code == ErrorCode.WRONG_REPLICA:
             if exc.owner_addr is not None:
                 request.state.omnigent_owner_addr = exc.owner_addr
-            owner_addr = getattr(request.state, "omnigent_owner_addr", None)
-            owner_resolvable = bool(owner_addr)
-            forward_attempted = bool(getattr(request.state, "omnigent_forward_attempted", False))
             app.state.routing_stats.record_wrong_replica()
-            _logger.warning(
-                "wrong_replica routing failure: owner_addr=%s owner_resolvable=%s "
-                "forward_attempted=%s path=%s session_id=%s host_id=%s",
-                owner_addr,
-                owner_resolvable,
-                forward_attempted,
-                request.url.path,
-                request.path_params.get("session_id"),
-                request.path_params.get("host_id"),
-                extra={
-                    "routing": {
-                        "path": request.url.path,
-                        "session_id": request.path_params.get("session_id"),
-                        "host_id": request.path_params.get("host_id"),
-                        "owner_resolvable": owner_resolvable,
-                        "forward_attempted": forward_attempted,
-                    }
-                },
-            )
         if exc.http_status >= 500:
             _logger.error("Internal error: %s", exc.message, exc_info=exc)
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):

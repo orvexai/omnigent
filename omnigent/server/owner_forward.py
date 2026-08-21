@@ -289,7 +289,8 @@ class OwnerForwardMiddleware:
         )
         if owner_url is None or self._client is None:
             _logger.warning(
-                "owner forwarding failed before request: owner_addr=%s owner_url=%s "
+                "wrong_replica routing failure: owner forwarding failed before request: "
+                "owner_addr=%s owner_url=%s "
                 "local_server_port=%s client=%s",
                 owner_addr,
                 owner_url,
@@ -329,7 +330,8 @@ class OwnerForwardMiddleware:
             # original classified response so the caller can retry through
             # ingress and ownership can be resolved again.
             _logger.warning(
-                "owner forwarding transport failure: owner_addr=%s owner_url=%s "
+                "wrong_replica routing failure: owner forwarding transport failure: "
+                "owner_addr=%s owner_url=%s "
                 "response_started=%s error=%s",
                 owner_addr,
                 owner_url,
@@ -394,14 +396,16 @@ class OwnerForwardMiddleware:
             return False
         if not isinstance(owner_addr, str):
             _logger.warning(
-                "owner forwarding skipped: reason=missing_owner_address owner_addr=%s path=%s",
+                "wrong_replica routing failure: owner forwarding skipped: "
+                "reason=missing_owner_address owner_addr=%s path=%s",
                 owner_addr,
                 scope.get("path"),
             )
             return False
         if self._same_address(owner_addr, self._pod_addr):
             _logger.warning(
-                "owner forwarding skipped: reason=owner_is_local owner_addr=%s "
+                "wrong_replica routing failure: owner forwarding skipped: "
+                "reason=owner_is_local owner_addr=%s "
                 "local_addr=%s path=%s",
                 owner_addr,
                 self._pod_addr,
@@ -412,7 +416,8 @@ class OwnerForwardMiddleware:
         # suppress its own replay; it can never select an owner or add trust.
         if _header(scope, _FORWARDED_BY_HEADER) is not None:
             _logger.warning(
-                "owner forwarding skipped: reason=already_forwarded owner_addr=%s path=%s",
+                "wrong_replica routing failure: owner forwarding skipped: "
+                "reason=already_forwarded owner_addr=%s path=%s",
                 owner_addr,
                 scope.get("path"),
             )
